@@ -105,6 +105,24 @@ function createDigitCollectionService(options = {}) {
     return map[normalizedProfile] || normalizedProfile || 'Digits';
   }
 
+  function titleCaseLabel(value = '') {
+    const text = String(value || '').trim();
+    if (!text) return text;
+    return text
+      .split(/\s+/)
+      .map((word) => word.charAt(0).toUpperCase() + word.slice(1))
+      .join(' ');
+  }
+
+  function formatPlanStepLabel(expectation = {}) {
+    const stepIndex = expectation?.plan_step_index;
+    const totalSteps = expectation?.plan_total_steps;
+    if (!Number.isFinite(stepIndex) || !Number.isFinite(totalSteps) || totalSteps <= 0) return '';
+    const label = buildExpectedLabel(expectation);
+    const stepLabel = titleCaseLabel(label);
+    return `Step ${stepIndex}/${totalSteps}: ${stepLabel}`;
+  }
+
   function labelForClosing(profile = 'generic') {
     const normalizedProfile = normalizeProfileId(profile) || 'generic';
     const map = {
@@ -1347,7 +1365,12 @@ function createDigitCollectionService(options = {}) {
     }
 
     const stepLabel = payload.profile || 'digits';
-    webhookService.addLiveEvent(callSid, `🔢 Collect digits (${stepLabel}) step ${payload.plan_step_index}/${payload.plan_total_steps}`, { force: true });
+    const stepTitle = formatPlanStepLabel(payload);
+    if (stepTitle) {
+      webhookService.addLiveEvent(callSid, `🧭 ${stepTitle} — awaiting input`, { force: true });
+    } else {
+      webhookService.addLiveEvent(callSid, `🔢 Collect digits (${stepLabel}) step ${payload.plan_step_index}/${payload.plan_total_steps}`, { force: true });
+    }
 
     await flushBufferedDigits(callSid, gptService, interactionCount, 'dtmf', { allowCallEnd: true });
     const currentExpectation = digitCollectionManager.expectations.get(callSid);
@@ -1537,6 +1560,8 @@ function createDigitCollectionService(options = {}) {
     const expectation = digitCollectionManager.expectations.get(callSid);
     const shouldEndCall = allowCallEnd && expectation?.end_call_on_success !== false;
     const expectedLabel = expectation ? buildExpectedLabel(expectation) : 'the code';
+    const stepTitle = formatPlanStepLabel(expectation);
+    const stepPrefix = stepTitle ? `${stepTitle} — ` : '';
     const payload = {
       profile: collection.profile,
       raw_digits: collection.digits,
@@ -1578,12 +1603,12 @@ function createDigitCollectionService(options = {}) {
     if (collection.reason === 'incomplete') {
       const progressMax = expectation?.max_digits || '';
       const progress = progressMax ? ` (${collection.len}/${progressMax})` : '';
-      webhookService.addLiveEvent(callSid, `🔢 ${liveLabel} progress: ${liveMasked}${progress}`, { force: true });
+      webhookService.addLiveEvent(callSid, `🔢 ${stepPrefix}${liveLabel} progress: ${liveMasked}${progress}`, { force: true });
     } else if (collection.accepted) {
-      webhookService.addLiveEvent(callSid, `✅ ${liveLabel} captured: ${liveMasked}`, { force: true });
+      webhookService.addLiveEvent(callSid, `✅ ${stepPrefix}${liveLabel} captured: ${liveMasked}`, { force: true });
     } else {
       const hint = collection.reason ? ` (${collection.reason.replace(/_/g, ' ')})` : '';
-      webhookService.addLiveEvent(callSid, `⚠️ ${liveLabel} invalid${hint}: ${liveMasked}`, { force: true });
+      webhookService.addLiveEvent(callSid, `⚠️ ${stepPrefix}${liveLabel} invalid${hint}: ${liveMasked}`, { force: true });
     }
 
     if (!collection.accepted && collection.reason === 'incomplete') {
@@ -1614,6 +1639,9 @@ function createDigitCollectionService(options = {}) {
       clearDigitTimeout(callSid);
       clearDigitFallbackState(callSid);
       digitCollectionManager.expectations.delete(callSid);
+      if (stepTitle) {
+        webhookService.addLiveEvent(callSid, `✅ ${stepTitle} validated`, { force: true });
+      }
       const profile = String(collection.profile || '').toLowerCase();
       switch (profile) {
         case 'extension':

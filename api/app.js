@@ -1619,6 +1619,9 @@ app.ws('/connection', (ws, req) => {
           streamSid = msg.start.streamSid;
           callSid = msg.start.callSid;
           callStartTime = new Date();
+          if (digitService?.isFallbackActive?.(callSid)) {
+            digitService.clearDigitFallbackState(callSid);
+          }
           if (pendingStreams.has(callSid)) {
             clearTimeout(pendingStreams.get(callSid));
             pendingStreams.delete(callSid);
@@ -1965,7 +1968,15 @@ app.ws('/connection', (ws, req) => {
           }
         } else if (event === 'stop') {
           console.log(`Adaptive call stream ${streamSid} ended`.red);
-          
+
+          if (digitService?.isFallbackActive?.(callSid)) {
+            console.log(`📟 Stream stopped during Gather fallback for ${callSid}; preserving call state.`);
+            activeCalls.delete(callSid);
+            clearCallEndLock(callSid);
+            clearSilenceTimer(callSid);
+            return;
+          }
+
           await handleCallEnd(callSid, callStartTime);
           
           // Clean up
@@ -4893,7 +4904,6 @@ app.post('/webhook/twilio-gather', async (req, res) => {
     }
     console.log(`Gather webhook hit: callSid=${callSid} digits="${Digits || ''}"`);
 
-    const callConfig = callConfigurations.get(callSid);
     const expectation = digitService?.getExpectation(callSid);
     if (!expectation) {
       console.warn(`Gather webhook had no expectation; reconnecting stream for ${callSid}`);
@@ -4906,6 +4916,40 @@ app.post('/webhook/twilio-gather', async (req, res) => {
       return;
     }
 
+    const host = resolveHost(req);
+    const respondWithGather = (exp, promptText = '', followupText = '') => {
+      try {
+        const twiml = digitService.buildTwilioGatherTwiml(
+          callSid,
+          exp,
+          { prompt: promptText, followup: followupText },
+          host
+        );
+        res.type('text/xml');
+        res.end(twiml);
+        return true;
+      } catch (err) {
+        console.error('Twilio gather build error:', err);
+        return false;
+      }
+    };
+    const respondWithStream = () => {
+      const twiml = buildTwilioStreamTwiml(host);
+      res.type('text/xml');
+      res.end(twiml);
+    };
+    const respondWithHangup = (message) => {
+      const response = new VoiceResponse();
+      if (message) {
+        response.say(message);
+      }
+      response.hangup();
+      res.type('text/xml');
+      res.end(response.toString());
+    };
+
+    digitService.clearDigitTimeout(callSid);
+
     const digits = String(Digits || '').trim();
     if (digits) {
       const expectation = digitService.getExpectation(callSid);
@@ -4917,7 +4961,6 @@ app.post('/webhook/twilio-gather', async (req, res) => {
       const collection = digitService.recordDigits(callSid, digits, { timestamp: Date.now() });
       await digitService.handleCollectionResult(callSid, collection, null, 0, 'gather', { allowCallEnd: true, deferCallEnd: true });
 
-      const host = resolveHost(req);
       if (collection.accepted) {
         const nextExpectation = digitService.getExpectation(callSid);
         if (nextExpectation?.plan_id) {
@@ -4925,35 +4968,38 @@ app.post('/webhook/twilio-gather', async (req, res) => {
           const stepPrompt = nextExpectation.plan_total_steps
             ? `Step ${nextExpectation.plan_step_index} of ${nextExpectation.plan_total_steps}. ${basePrompt}`
             : basePrompt;
-          queuePendingDigitAction(callSid, { type: 'reprompt', text: stepPrompt, scheduleTimeout: true });
+          clearPendingDigitReprompts(callSid);
+          digitService.clearDigitTimeout(callSid);
+          digitService.markDigitPrompted(callSid, null, 0, 'gather', { prompt_text: stepPrompt });
+          if (respondWithGather(nextExpectation, stepPrompt)) {
+            return;
+          }
         } else if (shouldEndOnSuccess) {
           clearPendingDigitReprompts(callSid);
           const profile = expectation?.profile || collection.profile;
           const completionMessage = digitService?.buildClosingMessage
             ? digitService.buildClosingMessage(profile)
             : CLOSING_MESSAGE;
-          queuePendingDigitAction(callSid, { type: 'end', text: completionMessage, reason: 'otp_verified' });
+          respondWithHangup(completionMessage);
+          return;
         }
-        digitService.clearDigitFallbackState(callSid);
-        const twiml = buildTwilioStreamTwiml(host);
-        res.type('text/xml');
-        res.end(twiml);
+
+        queuePendingDigitAction(callSid, {
+          type: 'reprompt',
+          text: 'Thanks. One moment please.',
+          scheduleTimeout: false
+        });
+        respondWithStream();
         return;
       }
 
       if (collection.fallback) {
         const failureMessage = expectation?.failure_message || CALL_END_MESSAGES.failure;
         clearPendingDigitReprompts(callSid);
-        queuePendingDigitAction(callSid, { type: 'end', text: failureMessage, reason: 'digit_collection_failed' });
-        digitService.clearDigitFallbackState(callSid);
-        const twiml = buildTwilioStreamTwiml(host);
-        res.type('text/xml');
-        res.end(twiml);
+        respondWithHangup(failureMessage);
         return;
       }
 
-      const hasPendingReprompt = Array.isArray(callConfig?.pending_digit_actions)
-        && callConfig.pending_digit_actions.some((action) => action?.type === 'reprompt');
       let reprompt = expectation?.reprompt_invalid || expectation?.reprompt_message || '';
       if (collection.reason === 'incomplete' || collection.reason === 'too_short') {
         reprompt = expectation?.reprompt_incomplete || expectation?.reprompt_invalid || expectation?.reprompt_message || '';
@@ -4961,43 +5007,38 @@ app.post('/webhook/twilio-gather', async (req, res) => {
       if (!reprompt) {
         reprompt = expectation ? digitService.buildDigitPrompt(expectation) : 'Please enter the digits again.';
       }
-      if (!hasPendingReprompt) {
-        queuePendingDigitAction(callSid, { type: 'reprompt', text: reprompt, scheduleTimeout: true });
+      clearPendingDigitReprompts(callSid);
+      digitService.clearDigitTimeout(callSid);
+      digitService.markDigitPrompted(callSid, null, 0, 'gather', { prompt_text: reprompt });
+      if (respondWithGather(expectation, reprompt)) {
+        return;
       }
-      digitService.clearDigitFallbackState(callSid);
-      const twiml = buildTwilioStreamTwiml(host);
-      res.type('text/xml');
-      res.end(twiml);
+      respondWithStream();
       return;
     }
 
     expectation.retries = (expectation.retries || 0) + 1;
     digitService.expectations.set(callSid, expectation);
 
-    const host = resolveHost(req);
     if (expectation.retries > expectation.max_retries) {
       const timeoutMessage = expectation.timeout_failure_message || CALL_END_MESSAGES.no_response;
       clearPendingDigitReprompts(callSid);
-      queuePendingDigitAction(callSid, { type: 'end', text: timeoutMessage, reason: 'digit_collection_timeout' });
       digitService.clearDigitFallbackState(callSid);
       digitService.clearDigitPlan(callSid);
-      const twiml = buildTwilioStreamTwiml(host);
-      res.type('text/xml');
-      res.end(twiml);
+      respondWithHangup(timeoutMessage);
       return;
     }
 
-    const hasPendingReprompt = Array.isArray(callConfig?.pending_digit_actions)
-      && callConfig.pending_digit_actions.some((action) => action?.type === 'reprompt');
     const timeoutPrompt = expectation.reprompt_timeout
       || expectation.reprompt_message
       || 'I did not receive any input. Please enter the code using your keypad.';
-    if (!hasPendingReprompt) {
-      queuePendingDigitAction(callSid, { type: 'reprompt', text: timeoutPrompt, scheduleTimeout: true });
+    clearPendingDigitReprompts(callSid);
+    digitService.clearDigitTimeout(callSid);
+    digitService.markDigitPrompted(callSid, null, 0, 'gather', { prompt_text: timeoutPrompt });
+    if (respondWithGather(expectation, timeoutPrompt)) {
+      return;
     }
-    const twiml = buildTwilioStreamTwiml(host);
-    res.type('text/xml');
-    res.end(twiml);
+    respondWithStream();
   } catch (error) {
     console.error('Twilio gather webhook error:', error);
     res.status(500).send('Error');

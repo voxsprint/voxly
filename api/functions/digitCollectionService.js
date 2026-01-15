@@ -55,8 +55,7 @@ function createDigitCollectionService(options = {}) {
     'survey',
     'policy_number',
     'invoice_number',
-    'confirmation_code',
-    'order_number'
+    'confirmation_code'
   ]);
 
   function normalizeProfileId(profile) {
@@ -80,6 +79,7 @@ function createDigitCollectionService(options = {}) {
     const map = {
       verification: 'OTP',
       otp: 'OTP',
+      pin: 'PIN',
       ssn: 'SSN',
       dob: 'DOB',
       routing_number: 'Routing',
@@ -88,6 +88,7 @@ function createDigitCollectionService(options = {}) {
       tax_id: 'Tax ID',
       ein: 'EIN',
       claim_number: 'Claim',
+      order_number: 'Order',
       reservation_number: 'Reservation',
       ticket_number: 'Ticket',
       case_number: 'Case',
@@ -189,6 +190,8 @@ function createDigitCollectionService(options = {}) {
         return 'employer ID';
       case 'claim_number':
         return 'claim number';
+      case 'order_number':
+        return 'order number';
       case 'reservation_number':
         return 'reservation number';
       case 'ticket_number':
@@ -258,6 +261,7 @@ function createDigitCollectionService(options = {}) {
   const DIGIT_PROFILE_DEFAULTS = {
     verification: { min_digits: 4, max_digits: 8, timeout_s: 20, max_retries: 2, min_collect_delay_ms: 1500, end_call_on_success: true },
     otp: { min_digits: 4, max_digits: 8, timeout_s: 20, max_retries: 2, min_collect_delay_ms: 1500, end_call_on_success: true },
+    pin: { min_digits: 4, max_digits: 8, timeout_s: 15, max_retries: 2, min_collect_delay_ms: 1200, end_call_on_success: true },
     ssn: { min_digits: 9, max_digits: 9, timeout_s: 15, max_retries: 2, min_collect_delay_ms: 1200, end_call_on_success: false },
     dob: { min_digits: 6, max_digits: 8, timeout_s: 15, max_retries: 2, min_collect_delay_ms: 1200, end_call_on_success: false },
     routing_number: { min_digits: 9, max_digits: 9, timeout_s: 15, max_retries: 2, min_collect_delay_ms: 1200, end_call_on_success: false },
@@ -267,6 +271,7 @@ function createDigitCollectionService(options = {}) {
     tax_id: { min_digits: 9, max_digits: 9, timeout_s: 15, max_retries: 2, min_collect_delay_ms: 1200, end_call_on_success: false },
     ein: { min_digits: 9, max_digits: 9, timeout_s: 15, max_retries: 2, min_collect_delay_ms: 1200, end_call_on_success: false },
     claim_number: { min_digits: 4, max_digits: 12, timeout_s: 15, max_retries: 2, min_collect_delay_ms: 1200, end_call_on_success: false },
+    order_number: { min_digits: 4, max_digits: 16, timeout_s: 15, max_retries: 2, min_collect_delay_ms: 1200, end_call_on_success: false },
     reservation_number: { min_digits: 4, max_digits: 12, timeout_s: 15, max_retries: 2, min_collect_delay_ms: 1200, end_call_on_success: false },
     ticket_number: { min_digits: 4, max_digits: 12, timeout_s: 15, max_retries: 2, min_collect_delay_ms: 1200, end_call_on_success: false },
     case_number: { min_digits: 4, max_digits: 12, timeout_s: 15, max_retries: 2, min_collect_delay_ms: 1200, end_call_on_success: false },
@@ -1027,7 +1032,13 @@ function createDigitCollectionService(options = {}) {
   }
 
   function buildExpectationFromConfig(callConfig = {}) {
-    const rawProfile = String(callConfig.collection_profile || '').trim().toLowerCase();
+    const rawProfile = String(
+      callConfig.collection_profile
+        || callConfig.digit_profile_id
+        || callConfig.digitProfileId
+        || callConfig.digit_profile
+        || ''
+    ).trim().toLowerCase();
     if (!rawProfile) return null;
     if (REMOVED_DIGIT_PROFILES.has(rawProfile)) return null;
     const profile = normalizeProfileId(rawProfile);
@@ -1088,10 +1099,19 @@ function createDigitCollectionService(options = {}) {
     return null;
   }
 
+  const MIN_INFER_CONFIDENCE = 0.65;
+
   function inferDigitExpectationFromText(text = '', callConfig = {}) {
     const lower = String(text || '').toLowerCase();
     const tpl = callConfig.template_policy || {};
     const contains = (re) => re.test(lower);
+    const explicitProfile = normalizeProfileId(
+      callConfig.collection_profile
+        || callConfig.digit_profile_id
+        || callConfig.digitProfileId
+        || callConfig.digit_profile
+        || ''
+    );
     const numberHint = (re) => {
       const m = lower.match(re);
       return m ? parseInt(m[1], 10) : null;
@@ -1102,13 +1122,17 @@ function createDigitCollectionService(options = {}) {
     const explicitCodeCount = numberHint(/\b(\d{1,2})\s*[- ]?code\b/);
     const explicitLen = explicitDigitCount || explicitCodeCount;
     const explicitCommand = hasPress || hasEnter;
-    const hasStrongOtpSignals = contains(/\b(otp|one[-\s]?time|passcode|pin|password)\b/);
+    const hasStrongOtpSignals = contains(/\b(otp|one[-\s]?time|passcode|password)\b/);
     const hasOtpDeliveryPhrase = contains(/\b(text message code|sms code|texted code)\b/);
     const hasCodeSignals = contains(/\b(code|security code|auth(?:entication)? code)\b/);
     const hasOtpDelivery = contains(/\b(text message|sms|texted)\b/);
     const hasDigitWord = contains(/\bdigit(s)?\b/);
     const hasOtpDeliveryDigits = hasOtpDelivery && (hasDigitWord || explicitLen);
     const hasActionOrCount = explicitCommand || explicitLen;
+
+    if (explicitProfile) {
+      return null;
+    }
 
     if (tpl.requires_otp) {
       const len = tpl.expected_length || otpLength;
@@ -1144,7 +1168,56 @@ function createDigitCollectionService(options = {}) {
       };
     }
 
-    // OTP / verification should take precedence over other numeric labels
+    const buildProfileExpectation = (profile, overrides = {}, reason = 'keyword', confidence = 0.7) => {
+      const defaults = getDigitProfileDefaults(profile);
+      return {
+        profile,
+        min_digits: overrides.min_digits || defaults.min_digits || 1,
+        max_digits: overrides.max_digits || defaults.max_digits || overrides.min_digits || defaults.min_digits || 1,
+        force_exact_length: overrides.force_exact_length || false,
+        prompt: '',
+        end_call_on_success: typeof overrides.end_call_on_success === 'boolean'
+          ? overrides.end_call_on_success
+          : (profile === 'verification' || profile === 'otp'),
+        max_retries: overrides.max_retries || defaults.max_retries || 2,
+        confidence,
+        reason,
+        allow_terminator: tpl.allow_terminator === true,
+        terminator_char: tpl.terminator_char || '#'
+      };
+    };
+
+    const exactKeywordProfiles = [
+      { profile: 'verification', regex: /\b(otp|one[-\s]?time|one[-\s]?time password|verification code|passcode)\b/, reason: 'otp_exact_keyword', confidence: 0.9 },
+      { profile: 'pin', regex: /\bpin\b/, min: 4, max: 8, reason: 'pin_keyword', confidence: 0.85 },
+      { profile: 'routing_number', regex: /\brouting number\b/, min: 9, max: 9, exact: 9, reason: 'routing_keyword', confidence: 0.8 },
+      { profile: 'account_number', regex: /\b(bank account|bank acct)\b/, min: 6, max: 17, reason: 'account_number_keyword', confidence: 0.75 },
+      { profile: 'ssn', regex: /\b(ssn|social security)\b/, min: 9, max: 9, exact: 9, reason: 'ssn_keyword', confidence: 0.85 },
+      { profile: 'dob', regex: /\b(date of birth|dob|birth date)\b/, min: 6, max: 8, reason: 'dob_keyword', confidence: 0.75 },
+      { profile: 'phone', regex: /\b(phone number|callback number|call back number)\b/, min: 10, max: 10, exact: 10, reason: 'phone_keyword', confidence: 0.7 },
+      { profile: 'tax_id', regex: /\b(tax id|tax identification|tin)\b/, min: 9, max: 9, exact: 9, reason: 'tax_id_keyword', confidence: 0.7 },
+      { profile: 'ein', regex: /\b(ein|employer identification)\b/, min: 9, max: 9, exact: 9, reason: 'ein_keyword', confidence: 0.7 },
+      { profile: 'claim_number', regex: /\b(claim number|claim)\b/, min: 4, max: 12, reason: 'claim_keyword', confidence: 0.7 },
+      { profile: 'reservation_number', regex: /\b(reservation number|reservation)\b/, min: 4, max: 12, reason: 'reservation_keyword', confidence: 0.7 },
+      { profile: 'ticket_number', regex: /\b(ticket number|ticket id|ticket)\b/, min: 4, max: 12, reason: 'ticket_keyword', confidence: 0.7 },
+      { profile: 'case_number', regex: /\b(case number|case id|case)\b/, min: 4, max: 12, reason: 'case_keyword', confidence: 0.7 },
+      { profile: 'order_number', regex: /\b(order number|order id|order)\b/, min: 4, max: 16, reason: 'order_keyword', confidence: 0.7 },
+      { profile: 'extension', regex: /\b(extension|ext\.?)\b/, min: 2, max: 6, reason: 'extension_keyword', confidence: 0.7 }
+    ];
+
+    for (const entry of exactKeywordProfiles) {
+      if (!contains(entry.regex)) continue;
+      const useLen = entry.profile === 'verification' ? (explicitLen || otpLength) : null;
+      const confidence = hasActionOrCount ? entry.confidence : 0.55;
+      return buildProfileExpectation(entry.profile, {
+        min_digits: useLen || entry.min,
+        max_digits: useLen || entry.max,
+        force_exact_length: useLen || entry.exact || false,
+        end_call_on_success: entry.profile === 'verification'
+      }, entry.reason, confidence);
+    }
+
+    // OTP / verification keyword fallback (requires action verb or explicit length)
     const hasOtpSignals = (hasStrongOtpSignals || hasOtpDeliveryPhrase || hasCodeSignals || hasOtpDeliveryDigits)
       && hasActionOrCount;
 
@@ -1165,50 +1238,42 @@ function createDigitCollectionService(options = {}) {
       };
     }
 
-    // Specific deterministic profiles (requires action verb)
-    const specificExpectation = (() => {
-      if (contains(/\brouting number\b/)) return { profile: 'routing_number', min_digits: 9, max_digits: 9, force_exact_length: 9, prompt: '', end_call_on_success: false, max_retries: 2, confidence: 0.7, reason: 'routing_keyword', allow_terminator: tpl.allow_terminator === true, terminator_char: tpl.terminator_char || '#' };
-      if (contains(/\b(bank account|bank acct)\b/)) return { profile: 'account_number', min_digits: 6, max_digits: 17, prompt: '', end_call_on_success: false, max_retries: 2, confidence: 0.6, reason: 'account_number_keyword', allow_terminator: tpl.allow_terminator === true, terminator_char: tpl.terminator_char || '#' };
-      if (contains(/\b(ssn|social security)\b/)) return { profile: 'ssn', min_digits: 9, max_digits: 9, force_exact_length: 9, prompt: '', end_call_on_success: false, max_retries: 2, confidence: 0.8, reason: 'ssn_keyword', allow_terminator: tpl.allow_terminator === true, terminator_char: tpl.terminator_char || '#' };
-      if (contains(/\b(date of birth|dob|birth date)\b/)) return { profile: 'dob', min_digits: 6, max_digits: 8, prompt: '', end_call_on_success: false, max_retries: 2, confidence: 0.7, reason: 'dob_keyword', allow_terminator: tpl.allow_terminator === true, terminator_char: tpl.terminator_char || '#' };
-      if (contains(/\b(phone number|callback number|call back number)\b/)) return { profile: 'phone', min_digits: 10, max_digits: 10, force_exact_length: 10, prompt: '', end_call_on_success: false, max_retries: 2, confidence: 0.65, reason: 'phone_keyword', allow_terminator: tpl.allow_terminator === true, terminator_char: tpl.terminator_char || '#' };
-      if (contains(/\b(tax id|tax identification|tin)\b/)) return { profile: 'tax_id', min_digits: 9, max_digits: 9, force_exact_length: 9, prompt: '', end_call_on_success: false, max_retries: 2, confidence: 0.65, reason: 'tax_id_keyword', allow_terminator: tpl.allow_terminator === true, terminator_char: tpl.terminator_char || '#' };
-      if (contains(/\b(ein|employer identification)\b/)) return { profile: 'ein', min_digits: 9, max_digits: 9, force_exact_length: 9, prompt: '', end_call_on_success: false, max_retries: 2, confidence: 0.65, reason: 'ein_keyword', allow_terminator: tpl.allow_terminator === true, terminator_char: tpl.terminator_char || '#' };
-      if (contains(/\b(claim number|claim)\b/)) return { profile: 'claim_number', min_digits: 4, max_digits: 12, prompt: '', end_call_on_success: false, max_retries: 2, confidence: 0.6, reason: 'claim_keyword', allow_terminator: tpl.allow_terminator === true, terminator_char: tpl.terminator_char || '#' };
-      if (contains(/\b(reservation number|reservation)\b/)) return { profile: 'reservation_number', min_digits: 4, max_digits: 12, prompt: '', end_call_on_success: false, max_retries: 2, confidence: 0.6, reason: 'reservation_keyword', allow_terminator: tpl.allow_terminator === true, terminator_char: tpl.terminator_char || '#' };
-      if (contains(/\b(ticket number|ticket id|ticket)\b/)) return { profile: 'ticket_number', min_digits: 4, max_digits: 12, prompt: '', end_call_on_success: false, max_retries: 2, confidence: 0.6, reason: 'ticket_keyword', allow_terminator: tpl.allow_terminator === true, terminator_char: tpl.terminator_char || '#' };
-      if (contains(/\b(case number|case id|case)\b/)) return { profile: 'case_number', min_digits: 4, max_digits: 12, prompt: '', end_call_on_success: false, max_retries: 2, confidence: 0.6, reason: 'case_keyword', allow_terminator: tpl.allow_terminator === true, terminator_char: tpl.terminator_char || '#' };
-      return null;
-    })();
+    const weightedProfiles = [
+      { profile: 'account', keywords: [/account\b/, /\bnumber\b/], weight: 0.3, min: 6, max: 12, reason: 'account_weighted' },
+      { profile: 'claim_number', keywords: [/claim\b/], weight: 0.25, min: 4, max: 12, reason: 'claim_weighted' },
+      { profile: 'reservation_number', keywords: [/reservation\b/], weight: 0.25, min: 4, max: 12, reason: 'reservation_weighted' },
+      { profile: 'ticket_number', keywords: [/ticket\b/], weight: 0.25, min: 4, max: 12, reason: 'ticket_weighted' },
+      { profile: 'case_number', keywords: [/case\b/], weight: 0.25, min: 4, max: 12, reason: 'case_weighted' },
+      { profile: 'order_number', keywords: [/order\b/], weight: 0.25, min: 4, max: 16, reason: 'order_weighted' }
+    ];
 
-    if (specificExpectation) {
-      if (!explicitCommand) {
-        return null;
+    let best = null;
+    let second = null;
+    for (const entry of weightedProfiles) {
+      let score = 0;
+      entry.keywords.forEach((kw) => {
+        if (kw.test(lower)) score += entry.weight;
+      });
+      if (!score) continue;
+      const candidate = { ...entry, score };
+      if (!best || candidate.score > best.score) {
+        second = best;
+        best = candidate;
+      } else if (!second || candidate.score > second.score) {
+        second = candidate;
       }
-      return specificExpectation;
     }
 
-    // If no explicit digit command words, avoid guessing
-    if (!explicitCommand) {
-      return null;
-    }
-
-    // Priority 3: generic account (only when account+number present)
-    if (contains(/\b(account|customer|member)\b/) && contains(/\bnumber\b/)) {
-      return {
-        profile: 'account',
-        min_digits: 6,
-        max_digits: 12,
-        confirmation_style: 'last4',
-        speak_confirmation: false,
-        prompt: '',
-        end_call_on_success: false,
-        max_retries: 2,
-        confidence: 0.55,
-        reason: 'account_keyword',
-        allow_terminator: tpl.allow_terminator === true,
-        terminator_char: tpl.terminator_char || '#'
-      };
+    if (best && hasActionOrCount) {
+      const minScore = 0.5;
+      const gap = best.score - (second?.score || 0);
+      if (best.score >= minScore && gap >= 0.15) {
+        return buildProfileExpectation(best.profile, {
+          min_digits: best.min,
+          max_digits: best.max,
+          end_call_on_success: false
+        }, best.reason, 0.6 + Math.min(0.2, best.score));
+      }
     }
 
     return null;
@@ -1231,7 +1296,7 @@ function createDigitCollectionService(options = {}) {
     }
 
     const inferred = inferDigitExpectationFromText(text, callConfig);
-    if (inferred) {
+    if (inferred && (inferred.confidence || 0) >= MIN_INFER_CONFIDENCE) {
       return {
         mode: 'dtmf',
         reason: inferred.reason || 'prompt_signal',
@@ -1406,25 +1471,48 @@ function createDigitCollectionService(options = {}) {
     clearDigitFallbackState(callSid);
 
     const callConfig = callConfigurations.get(callSid);
+    const normalizedSteps = steps.map((step) => {
+      const normalized = { ...step };
+      if (!normalized.profile) {
+        const hint = [step.prompt, step.label, step.name].filter(Boolean).join(' ');
+        if (hint) {
+          const inferred = inferDigitExpectationFromText(hint, callConfig);
+          if (inferred && (inferred.confidence || 0) >= MIN_INFER_CONFIDENCE) {
+            normalized.profile = inferred.profile;
+            if (typeof normalized.min_digits !== 'number' && typeof inferred.min_digits === 'number') {
+              normalized.min_digits = inferred.min_digits;
+            }
+            if (typeof normalized.max_digits !== 'number' && typeof inferred.max_digits === 'number') {
+              normalized.max_digits = inferred.max_digits;
+            }
+            if (typeof normalized.force_exact_length !== 'number' && typeof inferred.force_exact_length === 'number') {
+              normalized.force_exact_length = inferred.force_exact_length;
+            }
+          }
+        }
+      }
+      return normalized;
+    });
+    const stepsToUse = normalizedSteps;
     const lockedExpectation = resolveLockedExpectation(callConfig);
     if (lockedExpectation?.profile) {
-      const mismatched = steps.some((step) => step.profile && String(step.profile).toLowerCase() !== lockedExpectation.profile);
-      if (mismatched || steps.length > 1) {
+      const mismatched = stepsToUse.some((step) => step.profile && String(step.profile).toLowerCase() !== lockedExpectation.profile);
+      if (mismatched || stepsToUse.length > 1) {
         webhookService.addLiveEvent(callSid, `🔒 Digit profile locked to ${lockedExpectation.profile} (plan rejected)`, { force: true });
         return { error: 'profile_locked', expected: lockedExpectation.profile };
       }
-      if (steps.length === 1 && !steps[0].profile) {
-        steps[0].profile = lockedExpectation.profile;
+      if (stepsToUse.length === 1 && !stepsToUse[0].profile) {
+        stepsToUse[0].profile = lockedExpectation.profile;
       }
     }
 
-    const lastStep = steps[steps.length - 1] || {};
+    const lastStep = stepsToUse[stepsToUse.length - 1] || {};
     const planEndOnSuccess = typeof args.end_call_on_success === 'boolean'
       ? args.end_call_on_success
       : (typeof lastStep.end_call_on_success === 'boolean' ? lastStep.end_call_on_success : true);
     const plan = {
       id: `plan_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`,
-      steps,
+      steps: stepsToUse,
       index: 0,
       active: true,
       end_call_on_success: planEndOnSuccess,
@@ -1434,12 +1522,12 @@ function createDigitCollectionService(options = {}) {
 
     digitCollectionPlans.set(callSid, plan);
     await db.updateCallState(callSid, 'digit_collection_plan_started', {
-      steps: steps.map((step) => step.profile || 'generic'),
-      total_steps: steps.length
+      steps: stepsToUse.map((step) => step.profile || 'generic'),
+      total_steps: stepsToUse.length
     }).catch(() => {});
 
     await startNextDigitPlanStep(callSid, plan, gptService, 0);
-    return { status: 'started', steps: steps.length };
+    return { status: 'started', steps: stepsToUse.length };
   }
 
   async function handleCollectionResult(callSid, collection, gptService = null, interactionCount = 0, source = 'dtmf', options = {}) {

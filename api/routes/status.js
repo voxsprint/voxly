@@ -1,4 +1,5 @@
 const axios = require('axios');
+const config = require('../config');
 // Keep status logs readable with emoji prefixes; avoid duplication
 if (!console.__emojiWrapped) {
   const baseLog = console.log.bind(console);
@@ -24,30 +25,55 @@ class EnhancedWebhookService {
     this.statusOrder = ['queued', 'initiated', 'ringing', 'answered', 'in-progress', 'completed', 'voicemail', 'busy', 'no-answer', 'failed', 'canceled'];
     this.liveConsoleByCallSid = new Map();
     this.liveConsoleEditTimers = new Map();
-    this.liveConsoleDebounceMs = 900;
+    const debounce = Number(config.liveConsole?.editDebounceMs);
+    this.liveConsoleDebounceMs = Number.isFinite(debounce) && debounce >= 0 ? debounce : 700;
     this.liveConsoleMaxEvents = 5;
     this.liveConsoleMaxPreviewChars = 200;
     this.waveformFrames = [
-      '▁▂▃▄▅▆▇▆▅',
-      '▂▃▄▅▆▇▆▅▄',
+      '▁▁▁▁▁▁▁▁▁',
+      '▁▁▁▁▂▁▁▁▁',
+      '▁▁▁▂▂▂▁▁▁',
+      '▁▁▂▂▃▂▂▁▁',
+      '▁▁▂▃▃▃▂▁▁',
+      '▁▂▃▃▄▃▃▂▁',
+      '▁▂▃▄▅▄▃▂▁',
+      '▂▃▄▅▅▅▄▃▂',
+      '▂▃▄▅▆▅▄▃▂',
+      '▃▄▅▆▆▆▅▄▃',
       '▃▄▅▆▇▆▅▄▃',
-      '▄▅▆▇▆▅▄▃▂',
-      '▅▆▇▆▅▄▃▂▁',
-      '▆▇▆▅▄▃▂▁▂',
-      '▇▆▅▄▃▂▁▂▃',
-      '▆▅▄▃▂▁▂▃▄',
-      '▅▄▃▂▁▂▃▄▅',
-      '▄▃▂▁▂▃▄▅▆',
-      '▃▂▁▂▃▄▅▆▇',
-      '▂▁▂▃▄▅▆▇▆',
-      '▁▂▃▄▅▆▇▆▅',
-      '▂▃▄▅▆▇▆▅▄',
-      '▃▄▅▆▇▆▅▄▃',
-      '▄▅▆▇▆▅▄▃▂'
+      '▄▅▆▇▇▇▆▅▄',
+      '▄▅▆▇█▇▆▅▄',
+      '▅▆▇███▇▆▅',
+      '▆▇█████▇▆',
+      '▆▇██████▇',
+      '▇███████▇',
+      '▇████████',
+      '█████████',
+      '▇████████',
+      '▆▇██████▇',
+      '▆▇█████▇▆',
+      '▅▆▇███▇▆▅',
+      '▄▅▆▇█▇▆▅▄'
     ];
-    this.waveformFlat = '▁▁▁▁▁▁▁▁▁';
-    this.waveformThinking = ['·  ', '·· ', '···', '·· ', '·  '];
-    this.waveformInterrupted = ['▇▁▇▁▇▁▇', '▁▇▁▇▁▇▁'];
+    this.waveformUserFrames = [
+      '▁▁▁▁▁▁▁▁▁',
+      '▁▁▁▂▁▂▁▁▁',
+      '▁▁▂▃▂▃▂▁▁',
+      '▁▂▃▄▃▄▃▂▁',
+      '▂▃▄▅▄▅▄▃▂',
+      '▃▄▅▆▅▆▅▄▃',
+      '▄▅▆▇▆▇▆▅▄',
+      '▅▆▇█▇█▇▆▅',
+      '▄▅▆▇▆▇▆▅▄',
+      '▃▄▅▆▅▆▅▄▃',
+      '▂▃▄▅▄▅▄▃▂',
+      '▁▂▃▄▃▄▃▂▁',
+      '▁▁▂▃▂▃▂▁▁',
+      '▁▁▁▂▁▂▁▁▁'
+    ];
+    this.waveformListeningFrames = ['▁▁▁▁▁▁▁▁▁', '▁▁▁▂▁▁▁▂▁', '▁▁▂▁▁▂▁▁▂', '▁▂▁▁▂▁▁▂▁'];
+    this.waveformThinkingFrames = ['·   ', '··  ', '··· ', ' ···', '  ··', '   ·'];
+    this.waveformInterruptedFrames = ['▇▁▇▁▇▁▇', '▁▇▁▇▁▇▁', '▇▁▇▁▇▁▇', '█▁█▁█▁█'];
     this.lastSentimentAt = new Map();
     this.sentimentCooldownMs = 10000;
     this.mediaSeen = new Map();
@@ -1182,6 +1208,11 @@ class EnhancedWebhookService {
     return map[phaseKey] || phaseKey || '—';
   }
 
+  getLiveConsolePhaseKey(callSid) {
+    const entry = this.liveConsoleByCallSid.get(callSid);
+    return entry?.phaseKey || null;
+  }
+
   markCallActivity(callSid) {
     if (!callSid) return;
     this.callActivityAt.set(callSid, Date.now());
@@ -1221,10 +1252,29 @@ class EnhancedWebhookService {
     return Math.max(0, Math.min(1, level));
   }
 
-  pickWaveformIndex(level) {
+  pickWaveformIndex(level, frames = null) {
     if (!Number.isFinite(level)) return 0;
-    const idx = Math.round(level * (this.waveformFrames.length - 1));
-    return Math.max(0, Math.min(this.waveformFrames.length - 1, idx));
+    const list = Array.isArray(frames) && frames.length ? frames : this.waveformFrames;
+    const idx = Math.round(level * (list.length - 1));
+    return Math.max(0, Math.min(list.length - 1, idx));
+  }
+
+  getWaveformFramesForPhase(phaseKey) {
+    switch (phaseKey) {
+      case 'agent_speaking':
+        return this.waveformFrames;
+      case 'user_speaking':
+        return this.waveformUserFrames;
+      case 'listening':
+        return this.waveformListeningFrames;
+      case 'thinking':
+      case 'agent_responding':
+        return this.waveformThinkingFrames;
+      case 'interrupted':
+        return this.waveformInterruptedFrames;
+      default:
+        return null;
+    }
   }
 
   consoleButtons(callSid, entry) {
@@ -1282,14 +1332,13 @@ class EnhancedWebhookService {
     const phase = this.getConsolePhaseLabel(phaseKey);
     entry.phase = phase;
     entry.phaseKey = phaseKey;
-    if (phaseKey === 'agent_speaking' || phaseKey === 'user_speaking') {
+    const frames = this.getWaveformFramesForPhase(phaseKey);
+    if (frames && frames.length) {
       const level = this.clampLevel(options.level);
       entry.waveformLevel = level ?? entry.waveformLevel ?? 0;
       entry.waveformIndex = Number.isFinite(level)
-        ? this.pickWaveformIndex(level)
-        : (entry.waveformIndex + 1) % this.waveformFrames.length;
-    } else if (phaseKey === 'interrupted') {
-      entry.waveformIndex = (entry.waveformIndex + 1) % this.waveformInterrupted.length;
+        ? this.pickWaveformIndex(level, frames)
+        : (entry.waveformIndex + 1) % frames.length;
     } else {
       entry.waveformIndex = 0;
       entry.waveformLevel = 0;
@@ -1398,18 +1447,11 @@ class EnhancedWebhookService {
     const events = entry.lastEvents.slice(-this.liveConsoleMaxEvents);
     while (events.length < this.liveConsoleMaxEvents) events.unshift('—');
     const phaseKey = entry.phaseKey || '';
-    const speakingWaveform = this.waveformFrames[entry.waveformIndex] || this.waveformFrames[0];
-    const thinkingWaveform = this.waveformThinking[entry.waveformIndex % this.waveformThinking.length] || '·';
-    const interruptedWaveform = this.waveformInterrupted[entry.waveformIndex % this.waveformInterrupted.length] || this.waveformInterrupted[0];
+    const frames = this.getWaveformFramesForPhase(phaseKey);
     let phaseLine = entry.phase;
-    if (phaseKey === 'agent_speaking' || phaseKey === 'user_speaking') {
-      phaseLine = `${entry.phase} ${speakingWaveform}`;
-    } else if (phaseKey === 'listening') {
-      phaseLine = `${entry.phase} ${this.waveformFlat}`;
-    } else if (phaseKey === 'thinking') {
-      phaseLine = `${entry.phase} ${thinkingWaveform}`;
-    } else if (phaseKey === 'interrupted') {
-      phaseLine = `${entry.phase} ${interruptedWaveform}`;
+    if (frames && frames.length) {
+      const frame = frames[entry.waveformIndex % frames.length] || frames[0];
+      phaseLine = `${entry.phase} ${frame}`;
     }
     const sentimentLine = entry.sentimentFlag ? `Mood: ${entry.sentimentFlag}` : null;
     const recentBlock = events.length ? events.map((e) => `• ${e}`).join('\n') : '• (no events yet)';

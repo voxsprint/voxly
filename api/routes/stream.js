@@ -2,13 +2,14 @@ const EventEmitter = require('events');
 const uuid = require('uuid');
 
 class StreamService extends EventEmitter {
-  constructor(websocket) {
+  constructor(websocket, options = {}) {
     super();
     this.ws = websocket;
     this.expectedAudioIndex = 0;
     this.audioBuffer = {};
     this.streamSid = '';
-    this.audioTickIntervalMs = 250;
+    const interval = Number(options.audioTickIntervalMs);
+    this.audioTickIntervalMs = Number.isFinite(interval) && interval > 0 ? interval : 160;
     this.audioTickTimer = null;
   }
 
@@ -60,25 +61,40 @@ class StreamService extends EventEmitter {
   }
 
   estimateAudioStats (base64 = '') {
-    if (!base64) return { durationMs: 0, level: null };
+    if (!base64) return { durationMs: 0, level: null, levels: [] };
     let buffer;
     try {
       buffer = Buffer.from(base64, 'base64');
     } catch (_) {
-      return { durationMs: 0, level: null };
+      return { durationMs: 0, level: null, levels: [] };
     }
     const length = buffer.length;
-    if (!length) return { durationMs: 0, level: null };
+    if (!length) return { durationMs: 0, level: null, levels: [] };
     const durationMs = Math.round((length / 8000) * 1000);
-    const step = Math.max(1, Math.floor(length / 800));
-    let sum = 0;
-    let count = 0;
-    for (let i = 0; i < length; i += step) {
-      sum += Math.abs(buffer[i] - 128);
-      count += 1;
+    const maxFrames = 48;
+    const frames = Math.min(maxFrames, Math.max(1, Math.ceil(durationMs / this.audioTickIntervalMs)));
+    const bytesPerFrame = Math.max(1, Math.floor(length / frames));
+    const levels = new Array(frames).fill(0);
+    let total = 0;
+    let totalCount = 0;
+    for (let frame = 0; frame < frames; frame += 1) {
+      const start = frame * bytesPerFrame;
+      const end = frame === frames - 1 ? length : Math.min(length, start + bytesPerFrame);
+      const span = Math.max(1, end - start);
+      const step = Math.max(1, Math.floor(span / 120));
+      let sum = 0;
+      let count = 0;
+      for (let i = start; i < end; i += step) {
+        sum += Math.abs(buffer[i] - 128);
+        count += 1;
+      }
+      const level = count ? Math.max(0, Math.min(1, sum / (count * 128))) : 0;
+      levels[frame] = level;
+      total += sum;
+      totalCount += count;
     }
-    const level = count ? Math.max(0, Math.min(1, sum / (count * 128))) : null;
-    return { durationMs, level };
+    const level = totalCount ? Math.max(0, Math.min(1, total / (totalCount * 128))) : null;
+    return { durationMs, level, levels };
   }
 
   startAudioTicks (audio) {
@@ -86,9 +102,10 @@ class StreamService extends EventEmitter {
       clearInterval(this.audioTickTimer);
       this.audioTickTimer = null;
     }
-    const { durationMs, level } = this.estimateAudioStats(audio);
-    this.emit('audiotick', { level, progress: 0, durationMs });
-    if (!durationMs || durationMs <= this.audioTickIntervalMs) {
+    const { durationMs, level, levels } = this.estimateAudioStats(audio);
+    const totalFrames = levels?.length || 0;
+    this.emit('audiotick', { level, progress: 0, durationMs, frameIndex: 0, frames: totalFrames });
+    if (!durationMs || durationMs <= this.audioTickIntervalMs || !totalFrames) {
       return;
     }
     const start = Date.now();
@@ -99,7 +116,16 @@ class StreamService extends EventEmitter {
         this.audioTickTimer = null;
         return;
       }
-      this.emit('audiotick', { level, progress: elapsed / durationMs, durationMs });
+      const progress = elapsed / durationMs;
+      const idx = Math.min(totalFrames - 1, Math.floor(progress * totalFrames));
+      const frameLevel = Number.isFinite(levels[idx]) ? levels[idx] : level;
+      this.emit('audiotick', {
+        level: frameLevel,
+        progress,
+        durationMs,
+        frameIndex: idx,
+        frames: totalFrames
+      });
     }, this.audioTickIntervalMs);
   }
 }

@@ -19,9 +19,11 @@ class EnhancedDatabase {
                 console.log('Connected to enhanced SQLite database');
                 this.createEnhancedTables().then(() => {
                     this.initializeSMSTables().then(() => {
+                        this.initializeEmailTables().then(() => {
                         this.isInitialized = true;
                         console.log('✅ Enhanced database initialization complete');
                         resolve();
+                        }).catch(reject);
                     }).catch(reject);
                 }).catch(reject);
             });
@@ -1324,6 +1326,204 @@ class EnhancedDatabase {
        });
    }
 
+   // Create Email tables
+   async initializeEmailTables() {
+       return new Promise((resolve, reject) => {
+           const createEmailMessagesTable = `CREATE TABLE IF NOT EXISTS email_messages (
+               id INTEGER PRIMARY KEY AUTOINCREMENT,
+               message_id TEXT UNIQUE NOT NULL,
+               to_email TEXT NOT NULL,
+               from_email TEXT,
+               subject TEXT,
+               html TEXT,
+               text TEXT,
+               template_id TEXT,
+               variables_json TEXT,
+               variables_hash TEXT,
+               metadata_json TEXT,
+               status TEXT DEFAULT 'queued',
+               provider TEXT,
+               provider_message_id TEXT,
+               provider_response TEXT,
+               failure_reason TEXT,
+               tenant_id TEXT,
+               bulk_job_id TEXT,
+               scheduled_at DATETIME,
+               last_attempt_at DATETIME,
+               next_attempt_at DATETIME,
+               retry_count INTEGER DEFAULT 0,
+               max_retries INTEGER DEFAULT 5,
+               created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+               updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+               sent_at DATETIME,
+               delivered_at DATETIME,
+               failed_at DATETIME,
+               suppressed_reason TEXT
+           )`;
+
+           const createEmailEventsTable = `CREATE TABLE IF NOT EXISTS email_events (
+               id INTEGER PRIMARY KEY AUTOINCREMENT,
+               message_id TEXT NOT NULL,
+               event_type TEXT NOT NULL,
+               provider TEXT,
+               timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+               metadata TEXT
+           )`;
+
+           const createEmailBulkJobsTable = `CREATE TABLE IF NOT EXISTS email_bulk_jobs (
+               job_id TEXT PRIMARY KEY,
+               status TEXT DEFAULT 'queued',
+               total INTEGER DEFAULT 0,
+               queued INTEGER DEFAULT 0,
+               sending INTEGER DEFAULT 0,
+               sent INTEGER DEFAULT 0,
+               failed INTEGER DEFAULT 0,
+               delivered INTEGER DEFAULT 0,
+               bounced INTEGER DEFAULT 0,
+               complained INTEGER DEFAULT 0,
+               suppressed INTEGER DEFAULT 0,
+               tenant_id TEXT,
+               template_id TEXT,
+               created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+               updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+               completed_at DATETIME
+           )`;
+
+           const createEmailSuppressionTable = `CREATE TABLE IF NOT EXISTS email_suppression (
+               email TEXT PRIMARY KEY,
+               reason TEXT,
+               source TEXT,
+               created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+               updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+           )`;
+
+           const createEmailIdempotencyTable = `CREATE TABLE IF NOT EXISTS email_idempotency (
+               idempotency_key TEXT PRIMARY KEY,
+               message_id TEXT,
+               bulk_job_id TEXT,
+               request_hash TEXT,
+               created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+           )`;
+
+           const createEmailDlqTable = `CREATE TABLE IF NOT EXISTS email_dlq (
+               id INTEGER PRIMARY KEY AUTOINCREMENT,
+               message_id TEXT NOT NULL,
+               reason TEXT,
+               payload TEXT,
+               created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+           )`;
+
+           const createEmailTemplatesTable = `CREATE TABLE IF NOT EXISTS email_templates (
+               template_id TEXT PRIMARY KEY,
+               subject TEXT,
+               html TEXT,
+               text TEXT,
+               required_vars TEXT,
+               created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+               updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+           )`;
+
+           const createEmailMetricsTable = `CREATE TABLE IF NOT EXISTS email_metrics (
+               id INTEGER PRIMARY KEY AUTOINCREMENT,
+               date TEXT NOT NULL,
+               metric_type TEXT NOT NULL,
+               total_count INTEGER DEFAULT 0,
+               created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+               updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+               UNIQUE(date, metric_type)
+           )`;
+
+           const indexes = [
+               'CREATE INDEX IF NOT EXISTS idx_email_messages_status ON email_messages(status)',
+               'CREATE INDEX IF NOT EXISTS idx_email_messages_to_email ON email_messages(to_email)',
+               'CREATE INDEX IF NOT EXISTS idx_email_messages_bulk_job_id ON email_messages(bulk_job_id)',
+               'CREATE INDEX IF NOT EXISTS idx_email_messages_provider_message_id ON email_messages(provider_message_id)',
+               'CREATE INDEX IF NOT EXISTS idx_email_messages_created_at ON email_messages(created_at)',
+               'CREATE INDEX IF NOT EXISTS idx_email_events_message_id ON email_events(message_id)',
+               'CREATE INDEX IF NOT EXISTS idx_email_events_type ON email_events(event_type)',
+               'CREATE INDEX IF NOT EXISTS idx_email_events_timestamp ON email_events(timestamp)',
+               'CREATE INDEX IF NOT EXISTS idx_email_bulk_status ON email_bulk_jobs(status)',
+               'CREATE INDEX IF NOT EXISTS idx_email_bulk_tenant ON email_bulk_jobs(tenant_id)',
+               'CREATE INDEX IF NOT EXISTS idx_email_suppression_email ON email_suppression(email)'
+           ];
+
+           this.db.serialize(() => {
+               this.db.run(createEmailMessagesTable, (err) => {
+                   if (err) {
+                       console.error('Error creating email_messages table:', err);
+                       reject(err);
+                       return;
+                   }
+               });
+               this.db.run(createEmailEventsTable, (err) => {
+                   if (err) {
+                       console.error('Error creating email_events table:', err);
+                       reject(err);
+                       return;
+                   }
+               });
+               this.db.run(createEmailBulkJobsTable, (err) => {
+                   if (err) {
+                       console.error('Error creating email_bulk_jobs table:', err);
+                       reject(err);
+                       return;
+                   }
+               });
+               this.db.run(createEmailSuppressionTable, (err) => {
+                   if (err) {
+                       console.error('Error creating email_suppression table:', err);
+                       reject(err);
+                       return;
+                   }
+               });
+               this.db.run(createEmailIdempotencyTable, (err) => {
+                   if (err) {
+                       console.error('Error creating email_idempotency table:', err);
+                       reject(err);
+                       return;
+                   }
+               });
+               this.db.run(createEmailDlqTable, (err) => {
+                   if (err) {
+                       console.error('Error creating email_dlq table:', err);
+                       reject(err);
+                       return;
+                   }
+               });
+               this.db.run(createEmailTemplatesTable, (err) => {
+                   if (err) {
+                       console.error('Error creating email_templates table:', err);
+                       reject(err);
+                       return;
+                   }
+               });
+               this.db.run(createEmailMetricsTable, (err) => {
+                   if (err) {
+                       console.error('Error creating email_metrics table:', err);
+                       reject(err);
+                       return;
+                   }
+               });
+
+               let indexErrors = null;
+               indexes.forEach((stmt) => {
+                   this.db.run(stmt, (err) => {
+                       if (err) {
+                           indexErrors = err;
+                           console.error('Error creating email index:', err);
+                       }
+                   });
+               });
+               if (indexErrors) {
+                   reject(indexErrors);
+                   return;
+               }
+               console.log('✅ Email tables created successfully');
+               resolve();
+           });
+       });
+   }
+
    // Save SMS message
    async saveSMSMessage(messageData) {
        return new Promise((resolve, reject) => {
@@ -1508,6 +1708,397 @@ class EnhancedDatabase {
                    reject(err);
                } else {
                    resolve(rows || []);
+               }
+           });
+       });
+   }
+
+   // Save Email message
+   async saveEmailMessage(messageData) {
+       return new Promise((resolve, reject) => {
+           const sql = `INSERT INTO email_messages (
+               message_id, to_email, from_email, subject, html, text,
+               template_id, variables_json, variables_hash, metadata_json,
+               status, provider, tenant_id, bulk_job_id, scheduled_at, max_retries
+           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`;
+           this.db.run(sql, [
+               messageData.message_id,
+               messageData.to_email,
+               messageData.from_email || null,
+               messageData.subject || null,
+               messageData.html || null,
+               messageData.text || null,
+               messageData.template_id || null,
+               messageData.variables_json || null,
+               messageData.variables_hash || null,
+               messageData.metadata_json || null,
+               messageData.status || 'queued',
+               messageData.provider || null,
+               messageData.tenant_id || null,
+               messageData.bulk_job_id || null,
+               messageData.scheduled_at || null,
+               messageData.max_retries || 5
+           ], function (err) {
+               if (err) {
+                   console.error('Error saving email message:', err);
+                   reject(err);
+               } else {
+                   resolve(this.lastID);
+               }
+           });
+       });
+   }
+
+   async getEmailMessage(messageId) {
+       return new Promise((resolve, reject) => {
+           const sql = `SELECT * FROM email_messages WHERE message_id = ?`;
+           this.db.get(sql, [messageId], (err, row) => {
+               if (err) {
+                   console.error('Error fetching email message:', err);
+                   reject(err);
+               } else {
+                   resolve(row || null);
+               }
+           });
+       });
+   }
+
+   async getEmailMessageByProviderId(providerMessageId) {
+       return new Promise((resolve, reject) => {
+           const sql = `SELECT * FROM email_messages WHERE provider_message_id = ?`;
+           this.db.get(sql, [providerMessageId], (err, row) => {
+               if (err) {
+                   console.error('Error fetching email message by provider id:', err);
+                   reject(err);
+               } else {
+                   resolve(row || null);
+               }
+           });
+       });
+   }
+
+   async getEmailMessageByProviderId(providerMessageId) {
+       return new Promise((resolve, reject) => {
+           const sql = `SELECT * FROM email_messages WHERE provider_message_id = ?`;
+           this.db.get(sql, [providerMessageId], (err, row) => {
+               if (err) {
+                   console.error('Error fetching email message by provider id:', err);
+                   reject(err);
+               } else {
+                   resolve(row || null);
+               }
+           });
+       });
+   }
+
+   async listEmailEvents(messageId) {
+       return new Promise((resolve, reject) => {
+           const sql = `SELECT * FROM email_events WHERE message_id = ? ORDER BY timestamp ASC`;
+           this.db.all(sql, [messageId], (err, rows) => {
+               if (err) {
+                   console.error('Error fetching email events:', err);
+                   reject(err);
+               } else {
+                   resolve(rows || []);
+               }
+           });
+       });
+   }
+
+   async addEmailEvent(messageId, eventType, metadata = null, provider = null) {
+       return new Promise((resolve, reject) => {
+           const sql = `INSERT INTO email_events (message_id, event_type, provider, metadata)
+               VALUES (?, ?, ?, ?)`;
+           this.db.run(sql, [
+               messageId,
+               eventType,
+               provider || null,
+               metadata ? JSON.stringify(metadata) : null
+           ], function (err) {
+               if (err) {
+                   console.error('Error adding email event:', err);
+                   reject(err);
+               } else {
+                   resolve(this.lastID);
+               }
+           });
+       });
+   }
+
+   async updateEmailMessageStatus(messageId, updates = {}) {
+       return new Promise((resolve, reject) => {
+           const fields = [];
+           const params = [];
+           const setField = (name, value) => {
+               fields.push(`${name} = ?`);
+               params.push(value);
+           };
+           if (updates.status) setField('status', updates.status);
+           if (Object.prototype.hasOwnProperty.call(updates, 'failure_reason')) setField('failure_reason', updates.failure_reason);
+           if (Object.prototype.hasOwnProperty.call(updates, 'provider_message_id')) setField('provider_message_id', updates.provider_message_id);
+           if (Object.prototype.hasOwnProperty.call(updates, 'provider_response')) setField('provider_response', updates.provider_response);
+           if (Object.prototype.hasOwnProperty.call(updates, 'last_attempt_at')) setField('last_attempt_at', updates.last_attempt_at);
+           if (Object.prototype.hasOwnProperty.call(updates, 'next_attempt_at')) setField('next_attempt_at', updates.next_attempt_at);
+           if (Object.prototype.hasOwnProperty.call(updates, 'retry_count')) setField('retry_count', updates.retry_count);
+           if (Object.prototype.hasOwnProperty.call(updates, 'sent_at')) setField('sent_at', updates.sent_at);
+           if (Object.prototype.hasOwnProperty.call(updates, 'delivered_at')) setField('delivered_at', updates.delivered_at);
+           if (Object.prototype.hasOwnProperty.call(updates, 'failed_at')) setField('failed_at', updates.failed_at);
+           if (Object.prototype.hasOwnProperty.call(updates, 'suppressed_reason')) setField('suppressed_reason', updates.suppressed_reason);
+           fields.push('updated_at = CURRENT_TIMESTAMP');
+           params.push(messageId);
+           const sql = `UPDATE email_messages SET ${fields.join(', ')} WHERE message_id = ?`;
+           this.db.run(sql, params, function (err) {
+               if (err) {
+                   console.error('Error updating email message:', err);
+                   reject(err);
+               } else {
+                   resolve(this.changes);
+               }
+           });
+       });
+   }
+
+   async getPendingEmailMessages(limit = 10) {
+       return new Promise((resolve, reject) => {
+           const sql = `SELECT * FROM email_messages
+               WHERE status IN ('queued', 'retry')
+               AND (scheduled_at IS NULL OR scheduled_at <= CURRENT_TIMESTAMP)
+               AND (next_attempt_at IS NULL OR next_attempt_at <= CURRENT_TIMESTAMP)
+               ORDER BY created_at ASC
+               LIMIT ?`;
+           this.db.all(sql, [limit], (err, rows) => {
+               if (err) {
+                   console.error('Error fetching pending email messages:', err);
+                   reject(err);
+               } else {
+                   resolve(rows || []);
+               }
+           });
+       });
+   }
+
+   async createEmailBulkJob(jobData) {
+       return new Promise((resolve, reject) => {
+           const sql = `INSERT INTO email_bulk_jobs (
+               job_id, status, total, queued, sending, sent, failed, delivered, bounced, complained, suppressed, tenant_id, template_id
+           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`;
+           this.db.run(sql, [
+               jobData.job_id,
+               jobData.status || 'queued',
+               jobData.total || 0,
+               jobData.queued || 0,
+               jobData.sending || 0,
+               jobData.sent || 0,
+               jobData.failed || 0,
+               jobData.delivered || 0,
+               jobData.bounced || 0,
+               jobData.complained || 0,
+               jobData.suppressed || 0,
+               jobData.tenant_id || null,
+               jobData.template_id || null
+           ], function (err) {
+               if (err) {
+                   console.error('Error creating email bulk job:', err);
+                   reject(err);
+               } else {
+                   resolve(this.lastID);
+               }
+           });
+       });
+   }
+
+   async updateEmailBulkJob(jobId, updates = {}) {
+       return new Promise((resolve, reject) => {
+           const fields = [];
+           const params = [];
+           const setField = (name, value) => {
+               fields.push(`${name} = ?`);
+               params.push(value);
+           };
+           Object.entries(updates).forEach(([key, value]) => {
+               setField(key, value);
+           });
+           fields.push('updated_at = CURRENT_TIMESTAMP');
+           params.push(jobId);
+           const sql = `UPDATE email_bulk_jobs SET ${fields.join(', ')} WHERE job_id = ?`;
+           this.db.run(sql, params, function (err) {
+               if (err) {
+                   console.error('Error updating email bulk job:', err);
+                   reject(err);
+               } else {
+                   resolve(this.changes);
+               }
+           });
+       });
+   }
+
+   async getEmailBulkJob(jobId) {
+       return new Promise((resolve, reject) => {
+           const sql = `SELECT * FROM email_bulk_jobs WHERE job_id = ?`;
+           this.db.get(sql, [jobId], (err, row) => {
+               if (err) {
+                   console.error('Error fetching email bulk job:', err);
+                   reject(err);
+               } else {
+                   resolve(row || null);
+               }
+           });
+       });
+   }
+
+   async getEmailTemplate(templateId) {
+       return new Promise((resolve, reject) => {
+           const sql = `SELECT * FROM email_templates WHERE template_id = ?`;
+           this.db.get(sql, [templateId], (err, row) => {
+               if (err) {
+                   console.error('Error fetching email template:', err);
+                   reject(err);
+               } else {
+                   resolve(row || null);
+               }
+           });
+       });
+   }
+
+   async saveEmailIdempotency(idempotencyKey, messageId, bulkJobId, requestHash) {
+       return new Promise((resolve, reject) => {
+           const sql = `INSERT OR IGNORE INTO email_idempotency (idempotency_key, message_id, bulk_job_id, request_hash)
+               VALUES (?, ?, ?, ?)`;
+           this.db.run(sql, [idempotencyKey, messageId || null, bulkJobId || null, requestHash || null], function (err) {
+               if (err) {
+                   console.error('Error saving email idempotency:', err);
+                   reject(err);
+               } else {
+                   resolve(true);
+               }
+           });
+       });
+   }
+
+   async getEmailIdempotency(idempotencyKey) {
+       return new Promise((resolve, reject) => {
+           const sql = `SELECT * FROM email_idempotency WHERE idempotency_key = ?`;
+           this.db.get(sql, [idempotencyKey], (err, row) => {
+               if (err) {
+                   console.error('Error fetching email idempotency:', err);
+                   reject(err);
+               } else {
+                   resolve(row || null);
+               }
+           });
+       });
+   }
+
+   async isEmailSuppressed(email) {
+       return new Promise((resolve, reject) => {
+           const sql = `SELECT reason FROM email_suppression WHERE email = ?`;
+           this.db.get(sql, [email], (err, row) => {
+               if (err) {
+                   console.error('Error checking email suppression:', err);
+                   reject(err);
+               } else {
+                   resolve(row || null);
+               }
+           });
+       });
+   }
+
+   async setEmailSuppression(email, reason = null, source = null) {
+       return new Promise((resolve, reject) => {
+           const sql = `INSERT INTO email_suppression (email, reason, source, created_at, updated_at)
+               VALUES (?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+               ON CONFLICT(email) DO UPDATE SET
+               reason = excluded.reason,
+               source = excluded.source,
+               updated_at = CURRENT_TIMESTAMP`;
+           this.db.run(sql, [email, reason, source], function (err) {
+               if (err) {
+                   console.error('Error setting email suppression:', err);
+                   reject(err);
+               } else {
+                   resolve(true);
+               }
+           });
+       });
+   }
+
+   async clearEmailSuppression(email) {
+       return new Promise((resolve, reject) => {
+           const sql = `DELETE FROM email_suppression WHERE email = ?`;
+           this.db.run(sql, [email], function (err) {
+               if (err) {
+                   console.error('Error clearing email suppression:', err);
+                   reject(err);
+               } else {
+                   resolve(true);
+               }
+           });
+       });
+   }
+
+   async insertEmailDlq(messageId, reason, payload = null) {
+       return new Promise((resolve, reject) => {
+           const sql = `INSERT INTO email_dlq (message_id, reason, payload)
+               VALUES (?, ?, ?)`;
+           this.db.run(sql, [messageId, reason || null, payload ? JSON.stringify(payload) : null], function (err) {
+               if (err) {
+                   console.error('Error inserting email DLQ:', err);
+                   reject(err);
+               } else {
+                   resolve(this.lastID);
+               }
+           });
+       });
+   }
+
+   async incrementEmailMetric(metricType) {
+       return new Promise((resolve, reject) => {
+           const date = new Date().toISOString().slice(0, 10);
+           const sqlSelect = 'SELECT total_count FROM email_metrics WHERE date = ? AND metric_type = ?';
+           this.db.get(sqlSelect, [date, metricType], (err, row) => {
+               if (err) {
+                   console.error('Email metrics select error:', err);
+                   reject(err);
+                   return;
+               }
+               if (row) {
+                   const sqlUpdate = `UPDATE email_metrics 
+                       SET total_count = total_count + 1, updated_at = CURRENT_TIMESTAMP
+                       WHERE date = ? AND metric_type = ?`;
+                   this.db.run(sqlUpdate, [date, metricType], function (updateErr) {
+                       if (updateErr) {
+                           console.error('Email metrics update error:', updateErr);
+                           reject(updateErr);
+                       } else {
+                           resolve(true);
+                       }
+                   });
+               } else {
+                   const sqlInsert = `INSERT INTO email_metrics (date, metric_type, total_count)
+                       VALUES (?, ?, 1)`;
+                   this.db.run(sqlInsert, [date, metricType], function (insertErr) {
+                       if (insertErr) {
+                           console.error('Email metrics insert error:', insertErr);
+                           reject(insertErr);
+                       } else {
+                           resolve(true);
+                       }
+                   });
+               }
+           });
+       });
+   }
+
+   async getEmailMetricCount(metricType) {
+       return new Promise((resolve, reject) => {
+           const date = new Date().toISOString().slice(0, 10);
+           const sql = `SELECT total_count FROM email_metrics WHERE date = ? AND metric_type = ?`;
+           this.db.get(sql, [date, metricType], (err, row) => {
+               if (err) {
+                   console.error('Email metrics fetch error:', err);
+                   reject(err);
+               } else {
+                   resolve(row ? row.total_count : 0);
                }
            });
        });

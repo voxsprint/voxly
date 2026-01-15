@@ -13,6 +13,7 @@ const { TranscriptionService } = require('./routes/transcription');
 const { TextToSpeechService } = require('./routes/tts');
 const { recordingService } = require('./routes/recording');
 const { EnhancedSmsService } = require('./routes/sms.js');
+const { EmailService } = require('./routes/email');
 const Database = require('./db/db');
 const { webhookService } = require('./routes/status');
 const DynamicFunctionEngine = require('./functions/DynamicFunctionEngine');
@@ -24,6 +25,16 @@ const apiPackage = require('./package.json');
 
 const twilio = require('twilio');
 const VoiceResponse = twilio.twiml.VoiceResponse;
+
+const liveConsoleAudioTickMs = Number.isFinite(Number(config.liveConsole?.audioTickMs))
+  ? Number(config.liveConsole?.audioTickMs)
+  : 160;
+const liveConsoleUserLevelThreshold = Number.isFinite(Number(config.liveConsole?.userLevelThreshold))
+  ? Number(config.liveConsole?.userLevelThreshold)
+  : 0.08;
+const liveConsoleUserHoldMs = Number.isFinite(Number(config.liveConsole?.userHoldMs))
+  ? Number(config.liveConsole?.userHoldMs)
+  : 450;
 
 // Console helpers with clean emoji prefixes (idempotent, minimal noise)
 if (!console.__emojiWrapped) {
@@ -44,6 +55,7 @@ let db;
 let digitService;
 const functionEngine = new DynamicFunctionEngine();
 let smsService = new EnhancedSmsService();
+let emailService;
 
 function stableStringify(value) {
   if (value === null || typeof value !== 'object') {
@@ -98,6 +110,96 @@ function isCaptureActive(callSid) {
   return callConfig?.digit_intent?.mode === 'dtmf' && callConfig?.digit_capture_active === true;
 }
 
+function resolveVoiceModel(callConfig) {
+  const model = callConfig?.voice_model;
+  if (model && typeof model === 'string' && model.trim()) {
+    return model.trim();
+  }
+  return null;
+}
+
+function resolveTwilioSayVoice(callConfig) {
+  const model = resolveVoiceModel(callConfig);
+  if (!model) return null;
+  const normalized = model.toLowerCase();
+  if (['alice', 'man', 'woman'].includes(normalized)) {
+    return model;
+  }
+  if (model.startsWith('Polly.')) {
+    return model;
+  }
+  return null;
+}
+
+function queuePendingDigitAction(callSid, action = {}) {
+  if (!callSid) return false;
+  const callConfig = callConfigurations.get(callSid);
+  if (!callConfig) return false;
+  if (!Array.isArray(callConfig.pending_digit_actions)) {
+    callConfig.pending_digit_actions = [];
+  }
+  callConfig.pending_digit_actions.push({
+    type: action.type,
+    text: action.text || '',
+    reason: action.reason || null,
+    scheduleTimeout: action.scheduleTimeout === true
+  });
+  callConfigurations.set(callSid, callConfig);
+  return true;
+}
+
+function popPendingDigitActions(callSid) {
+  const callConfig = callConfigurations.get(callSid);
+  if (!callConfig || !Array.isArray(callConfig.pending_digit_actions) || !callConfig.pending_digit_actions.length) {
+    return [];
+  }
+  const actions = callConfig.pending_digit_actions.slice(0);
+  callConfig.pending_digit_actions = [];
+  callConfigurations.set(callSid, callConfig);
+  return actions;
+}
+
+function clearPendingDigitReprompts(callSid) {
+  const callConfig = callConfigurations.get(callSid);
+  if (!callConfig || !Array.isArray(callConfig.pending_digit_actions) || !callConfig.pending_digit_actions.length) {
+    return;
+  }
+  callConfig.pending_digit_actions = callConfig.pending_digit_actions.filter((action) => action?.type !== 'reprompt');
+  callConfigurations.set(callSid, callConfig);
+}
+
+async function handlePendingDigitActions(callSid, actions = [], gptService, interactionCount = 0) {
+  if (!callSid || !actions.length) return false;
+  for (const action of actions) {
+    if (!action) continue;
+    if (action.type === 'end') {
+      const reason = action.reason || 'digits_collected';
+      const message = action.text || CLOSING_MESSAGE;
+      await speakAndEndCall(callSid, message, reason);
+      return true;
+    }
+    if (action.type === 'reprompt' && gptService && action.text) {
+      const personalityInfo = gptService?.personalityEngine?.getCurrentPersonality?.();
+      gptService.emit('gptreply', {
+        partialResponseIndex: null,
+        partialResponse: action.text,
+        personalityInfo,
+        adaptationHistory: gptService?.personalityChanges?.slice(-3) || []
+      }, interactionCount);
+      if (digitService) {
+        digitService.markDigitPrompted(callSid, gptService, interactionCount, 'dtmf', {
+          allowCallEnd: true,
+          prompt_text: action.text
+        });
+        if (action.scheduleTimeout) {
+          digitService.scheduleDigitTimeout(callSid, gptService, interactionCount + 1);
+        }
+      }
+    }
+  }
+  return true;
+}
+
 function scheduleSilenceTimer(callSid, timeoutMs = 30000) {
   if (!callSid) return;
   if (callEndLocks.has(callSid)) {
@@ -136,6 +238,124 @@ function estimateAudioLevelFromBase64(base64 = '') {
   return Math.max(0, Math.min(1, level));
 }
 
+function estimateAudioLevelFromBuffer(buffer, options = {}) {
+  if (!Buffer.isBuffer(buffer) || !buffer.length) return null;
+  const encoding = String(options.encoding || '').toLowerCase();
+  if (['pcm', 'linear', 'linear16', 'l16'].includes(encoding)) {
+    const minStep = 2;
+    let step = Math.max(minStep, Math.floor(buffer.length / 800));
+    if (step % 2 !== 0) {
+      step += 1;
+    }
+    let sum = 0;
+    let count = 0;
+    for (let i = 0; i + 1 < buffer.length; i += step) {
+      sum += Math.abs(buffer.readInt16LE(i));
+      count += 1;
+    }
+    if (!count) return null;
+    const level = sum / (count * 32768);
+    return Math.max(0, Math.min(1, level));
+  }
+  const step = Math.max(1, Math.floor(buffer.length / 800));
+  let sum = 0;
+  let count = 0;
+  for (let i = 0; i < buffer.length; i += step) {
+    sum += Math.abs(buffer[i] - 128);
+    count += 1;
+  }
+  if (!count) return null;
+  const level = sum / (count * 128);
+  return Math.max(0, Math.min(1, level));
+}
+
+function clampLevel(level) {
+  if (!Number.isFinite(level)) return null;
+  return Math.max(0, Math.min(1, level));
+}
+
+function shouldSampleUserAudioLevel(callSid, now = Date.now()) {
+  const state = userAudioStates.get(callSid);
+  if (!state) return true;
+  return now - state.lastTickAt >= liveConsoleAudioTickMs;
+}
+
+function updateUserAudioLevel(callSid, level, now = Date.now()) {
+  if (!callSid) return;
+  const normalized = clampLevel(level);
+  if (!Number.isFinite(normalized)) return;
+  let state = userAudioStates.get(callSid);
+  if (!state) {
+    state = { lastTickAt: 0, lastAboveAt: 0, speaking: false };
+  }
+  if (now - state.lastTickAt < liveConsoleAudioTickMs) {
+    return;
+  }
+  state.lastTickAt = now;
+  const currentPhase = webhookService.getLiveConsolePhaseKey?.(callSid);
+  if (normalized >= liveConsoleUserLevelThreshold) {
+    state.speaking = true;
+    state.lastAboveAt = now;
+    userAudioStates.set(callSid, state);
+    const nextPhase = (currentPhase === 'agent_speaking' || currentPhase === 'agent_responding')
+      ? 'interrupted'
+      : 'user_speaking';
+    webhookService.setLiveCallPhase(callSid, nextPhase, { level: normalized, logEvent: false }).catch(() => {});
+    return;
+  }
+
+  if (state.speaking) {
+    if (now - state.lastAboveAt >= liveConsoleUserHoldMs) {
+      state.speaking = false;
+      userAudioStates.set(callSid, state);
+      if (currentPhase !== 'agent_speaking' && currentPhase !== 'agent_responding') {
+        webhookService.setLiveCallPhase(callSid, 'listening', { level: 0, logEvent: false }).catch(() => {});
+      }
+      return;
+    }
+    userAudioStates.set(callSid, state);
+    if (currentPhase === 'user_speaking' || currentPhase === 'interrupted') {
+      webhookService.setLiveCallPhase(callSid, currentPhase, { level: normalized, logEvent: false }).catch(() => {});
+    }
+  } else {
+    userAudioStates.set(callSid, state);
+  }
+}
+
+function estimateAudioLevelsFromBase64(base64 = '', options = {}) {
+  if (!base64) return { durationMs: 0, levels: [], intervalMs: options.intervalMs || 160 };
+  let buffer;
+  try {
+    buffer = Buffer.from(base64, 'base64');
+  } catch (_) {
+    return { durationMs: 0, levels: [], intervalMs: options.intervalMs || 160 };
+  }
+  const length = buffer.length;
+  if (!length) return { durationMs: 0, levels: [], intervalMs: options.intervalMs || 160 };
+  const durationMs = Math.round((length / 8000) * 1000);
+  const intervalMs = Math.max(80, Number(options.intervalMs) || 160);
+  const maxFrames = Number(options.maxFrames) || 48;
+  const frames = Math.min(maxFrames, Math.max(1, Math.ceil(durationMs / intervalMs)));
+  const bytesPerFrame = Math.max(1, Math.floor(length / frames));
+  const levels = new Array(frames).fill(0);
+  for (let frame = 0; frame < frames; frame += 1) {
+    const start = frame * bytesPerFrame;
+    const end = frame === frames - 1 ? length : Math.min(length, start + bytesPerFrame);
+    const span = Math.max(1, end - start);
+    const step = Math.max(1, Math.floor(span / 120));
+    let sum = 0;
+    let count = 0;
+    for (let i = start; i < end; i += step) {
+      sum += Math.abs(buffer[i] - 128);
+      count += 1;
+    }
+    const level = count ? Math.max(0, Math.min(1, sum / (count * 128))) : 0;
+    levels[frame] = level;
+  }
+  const effectiveInterval = frames ? Math.max(80, Math.floor(durationMs / frames)) : intervalMs;
+  return { durationMs, levels, intervalMs: effectiveInterval };
+}
+
 function estimateAudioDurationMsFromBase64(base64 = '') {
   if (!base64) return 0;
   let buffer;
@@ -165,10 +385,11 @@ function clearSpeechTicks(callSid) {
   }
 }
 
-function scheduleSpeechTicks(callSid, phaseKey, durationMs, level = null) {
+function scheduleSpeechTicks(callSid, phaseKey, durationMs, level = null, options = {}) {
   if (!callSid) return;
   clearSpeechTicks(callSid);
-  const intervalMs = 250;
+  const intervalMs = Math.max(80, Number(options.intervalMs) || 200);
+  const levels = Array.isArray(options.levels) ? options.levels : null;
   const safeDuration = Math.max(0, Number(durationMs) || 0);
   if (!safeDuration || safeDuration <= intervalMs) {
     webhookService.setLiveCallPhase(callSid, phaseKey, { level, logEvent: false }).catch(() => {});
@@ -182,16 +403,24 @@ function scheduleSpeechTicks(callSid, phaseKey, durationMs, level = null) {
       clearSpeechTicks(callSid);
       return;
     }
-    webhookService.setLiveCallPhase(callSid, phaseKey, { level, logEvent: false }).catch(() => {});
+    let nextLevel = level;
+    if (levels?.length) {
+      const idx = Math.min(levels.length - 1, Math.floor((elapsed / safeDuration) * levels.length));
+      if (Number.isFinite(levels[idx])) {
+        nextLevel = levels[idx];
+      }
+    }
+    webhookService.setLiveCallPhase(callSid, phaseKey, { level: nextLevel, logEvent: false }).catch(() => {});
   }, intervalMs);
   speechTickTimers.set(callSid, timer);
 }
 
 function scheduleSpeechTicksFromAudio(callSid, phaseKey, base64Audio = '') {
   if (!base64Audio) return;
-  const durationMs = estimateAudioDurationMsFromBase64(base64Audio);
-  const level = estimateAudioLevelFromBase64(base64Audio);
-  scheduleSpeechTicks(callSid, phaseKey, durationMs, level);
+  const { durationMs, levels, intervalMs } = estimateAudioLevelsFromBase64(base64Audio, { intervalMs: liveConsoleAudioTickMs, maxFrames: 48 });
+  const fallbackLevel = estimateAudioLevelFromBase64(base64Audio);
+  const startLevel = Number.isFinite(levels?.[0]) ? levels[0] : fallbackLevel;
+  scheduleSpeechTicks(callSid, phaseKey, durationMs, startLevel, { levels, intervalMs });
 }
 
 async function applyInitialDigitIntent(callSid, callConfig, gptService = null, interactionCount = 0) {
@@ -396,6 +625,7 @@ const normalFlowBuffers = new Map();
 const normalFlowProcessing = new Set();
 const normalFlowLastInput = new Map();
 const speechTickTimers = new Map();
+const userAudioStates = new Map();
 
 function enqueueGptTask(callSid, task) {
   if (!callSid || typeof task !== 'function') {
@@ -1036,10 +1266,11 @@ async function speakAndEndCall(callSid, message, reason = 'completed') {
 
   const delayMs = estimateSpeechDurationMs(text);
 
-    if (provider === 'aws') {
+  if (provider === 'aws') {
       try {
         const ttsAdapter = getAwsTtsAdapter();
-        const { key } = await ttsAdapter.synthesizeToS3(text);
+        const voiceId = resolveVoiceModel(callConfig);
+        const { key } = await ttsAdapter.synthesizeToS3(text, voiceId ? { voiceId } : {});
         const contactId = callConfig?.provider_metadata?.contact_id;
         if (contactId) {
           const awsAdapter = getAwsConnectAdapter();
@@ -1061,7 +1292,12 @@ async function speakAndEndCall(callSid, message, reason = 'completed') {
       const authToken = config.twilio.authToken;
       if (accountSid && authToken) {
         const response = new VoiceResponse();
-        response.say(text);
+        const sayVoice = resolveTwilioSayVoice(callConfig);
+        if (sayVoice) {
+          response.say({ voice: sayVoice }, text);
+        } else {
+          response.say(text);
+        }
         response.hangup();
         const client = twilio(accountSid, authToken);
         await client.calls(callSid).update({ twiml: response.toString() });
@@ -1160,7 +1396,8 @@ async function ensureAwsSession(callSid) {
 
     try {
       const ttsAdapter = getAwsTtsAdapter();
-      const { key } = await ttsAdapter.synthesizeToS3(gptReply.partialResponse);
+      const voiceId = resolveVoiceModel(callConfig);
+      const { key } = await ttsAdapter.synthesizeToS3(gptReply.partialResponse, voiceId ? { voiceId } : {});
       const contactId = callConfig?.provider_metadata?.contact_id;
       if (contactId) {
         const awsAdapter = getAwsConnectAdapter();
@@ -1184,7 +1421,8 @@ async function ensureAwsSession(callSid) {
     const firstMessage = callConfig.first_message
       || (initialExpectation ? digitService.buildDigitPrompt(initialExpectation) : 'Hello!');
     const ttsAdapter = getAwsTtsAdapter();
-    const { key } = await ttsAdapter.synthesizeToS3(firstMessage);
+    const voiceId = resolveVoiceModel(callConfig);
+    const { key } = await ttsAdapter.synthesizeToS3(firstMessage, voiceId ? { voiceId } : {});
     const contactId = callConfig?.provider_metadata?.contact_id;
       if (contactId) {
         const awsAdapter = getAwsConnectAdapter();
@@ -1224,6 +1462,7 @@ async function startServer() {
     if (smsService?.setDb) {
       smsService.setDb(db);
     }
+    emailService = new EmailService({ db, config });
 
     // Start webhook service after database is ready
     console.log('Starting enhanced webhook service...');
@@ -1240,6 +1479,7 @@ async function startServer() {
       getCurrentProvider: () => currentProvider,
       speakAndEndCall,
       clearSilenceTimer,
+      queuePendingDigitAction,
       callEndMessages: CALL_END_MESSAGES,
       closingMessage: CLOSING_MESSAGE,
       settings: DIGIT_SETTINGS
@@ -1283,7 +1523,7 @@ app.ws('/connection', (ws, req) => {
     let functionSystem = null;
 
     let gptService;
-    const streamService = new StreamService(ws);
+    const streamService = new StreamService(ws, { audioTickIntervalMs: liveConsoleAudioTickMs });
     const transcriptionService = new TranscriptionService();
     const ttsService = new TextToSpeechService({});
     // Prewarm TTS to reduce first-synthesis delay (silent)
@@ -1333,6 +1573,10 @@ app.ws('/connection', (ws, req) => {
           // Get call configuration and function system
           callConfig = callConfigurations.get(callSid);
           functionSystem = callFunctionSystems.get(callSid);
+          const resolvedVoiceModel = resolveVoiceModel(callConfig);
+          if (resolvedVoiceModel) {
+            ttsService.voiceModel = resolvedVoiceModel;
+          }
           
           if (callConfig && functionSystem) {
             console.log(`Using adaptive configuration for ${functionSystem.context.industry} industry`);
@@ -1438,13 +1682,20 @@ app.ws('/connection', (ws, req) => {
             interactionCount: 0
           });
 
-          const skipGreeting = callConfig?.initial_prompt_played === true;
+          const pendingDigitActions = popPendingDigitActions(callSid);
+          const skipGreeting = callConfig?.initial_prompt_played === true
+            || callConfig?.digit_capture_active === true
+            || digitService?.hasExpectation(callSid)
+            || pendingDigitActions.length > 0;
 
           // Initialize call with recording
           try {
             if (skipGreeting) {
               isInitialized = true;
               console.log(`Stream reconnected for ${callSid} (skipping greeting)`);
+              if (pendingDigitActions.length) {
+                await handlePendingDigitActions(callSid, pendingDigitActions, gptService, interactionCount);
+              }
             } else {
             await recordingService(ttsService, callSid);
             
@@ -1485,6 +1736,9 @@ app.ws('/connection', (ws, req) => {
             scheduleSilenceTimer(callSid);
             
             isInitialized = true;
+            if (pendingDigitActions.length) {
+              await handlePendingDigitActions(callSid, pendingDigitActions, gptService, interactionCount);
+            }
             console.log('Adaptive call initialization complete');
             }
             
@@ -1493,6 +1747,9 @@ app.ws('/connection', (ws, req) => {
             if (skipGreeting) {
               isInitialized = true;
               console.log(`Stream reconnected for ${callSid} (skipping greeting)`);
+              if (pendingDigitActions.length) {
+                await handlePendingDigitActions(callSid, pendingDigitActions, gptService, interactionCount);
+              }
             } else {
             
             const initialExpectation = digitService?.getExpectation(callSid);
@@ -1544,6 +1801,11 @@ app.ws('/connection', (ws, req) => {
 
         } else if (event === 'media') {
           if (isInitialized && transcriptionService) {
+            const now = Date.now();
+            if (shouldSampleUserAudioLevel(callSid, now)) {
+              const level = estimateAudioLevelFromBase64(msg?.media?.payload || '');
+              updateUserAudioLevel(callSid, level, now);
+            }
             transcriptionService.send(msg.media.payload);
           }
         } else if (event === 'mark') {
@@ -1733,7 +1995,6 @@ app.ws('/connection', (ws, req) => {
     ttsService.on('speech', (responseIndex, audio, label, icount) => {
       const level = estimateAudioLevelFromBase64(audio);
       webhookService.setLiveCallPhase(callSid, 'agent_speaking', { level }).catch(() => {});
-      scheduleSpeechTicksFromAudio(callSid, 'agent_speaking', audio);
       if (digitService?.hasExpectation(callSid)) {
         digitService.updatePromptDelay(callSid, estimateAudioDurationMsFromBase64(audio));
       }
@@ -2052,6 +2313,10 @@ app.ws('/aws/stream', (ws, req) => {
     }
 
     const callConfig = callConfigurations.get(callSid);
+    const resolvedVoiceModel = resolveVoiceModel(callConfig);
+    if (resolvedVoiceModel) {
+      ttsService.voiceModel = resolvedVoiceModel;
+    }
     if (!callConfig) {
       ws.close();
       return;
@@ -4447,6 +4712,43 @@ app.post('/webhook/sms-status', async (req, res) => {
     }
 });
 
+// Email webhook endpoints
+app.post('/webhook/email', async (req, res) => {
+    try {
+        if (!emailService) {
+            return res.status(500).json({ success: false, error: 'Email service not initialized' });
+        }
+        const result = await emailService.handleProviderEvent(req.body || {});
+        res.json({ success: true, ...result });
+    } catch (error) {
+        console.error('❌ Email webhook error:', error);
+        res.status(500).json({ success: false, error: 'Email webhook processing failed', details: error.message });
+    }
+});
+
+app.get('/webhook/email-unsubscribe', async (req, res) => {
+    try {
+        const email = String(req.query?.email || '').trim().toLowerCase();
+        const messageId = String(req.query?.message_id || '').trim();
+        if (!email) {
+            return res.status(400).send('Missing email');
+        }
+        await db.setEmailSuppression(email, 'unsubscribe', 'link');
+        if (messageId) {
+            await db.addEmailEvent(messageId, 'complained', { reason: 'unsubscribe' });
+            await db.updateEmailMessageStatus(messageId, {
+                status: 'complained',
+                failure_reason: 'unsubscribe',
+                failed_at: new Date().toISOString()
+            });
+        }
+        res.send('Unsubscribed');
+    } catch (error) {
+        console.error('❌ Email unsubscribe error:', error);
+        res.status(500).send('Unsubscribe failed');
+    }
+});
+
 // Twilio Gather fallback handler (DTMF)
 app.post('/webhook/twilio-gather', async (req, res) => {
   try {
@@ -4458,6 +4760,7 @@ app.post('/webhook/twilio-gather', async (req, res) => {
     }
     console.log(`Gather webhook hit: callSid=${callSid} digits="${Digits || ''}"`);
 
+    const callConfig = callConfigurations.get(callSid);
     const expectation = digitService?.getExpectation(callSid);
     if (!expectation) {
       console.warn(`Gather webhook had no expectation; reconnecting stream for ${callSid}`);
@@ -4473,73 +4776,172 @@ app.post('/webhook/twilio-gather', async (req, res) => {
     const digits = String(Digits || '').trim();
     if (digits) {
       const expectation = digitService.getExpectation(callSid);
+      const shouldEndOnSuccess = expectation?.end_call_on_success !== false;
       const display = expectation?.profile === 'verification'
         ? digitService.formatOtpForDisplay(digits, 'progress', expectation?.max_digits)
         : `Keypad (Gather): ${digits}`;
       webhookService.addLiveEvent(callSid, `🔢 ${display}`, { force: true });
       const collection = digitService.recordDigits(callSid, digits, { timestamp: Date.now() });
-      await digitService.handleCollectionResult(callSid, collection, null, 0, 'gather', { allowCallEnd: true });
+      await digitService.handleCollectionResult(callSid, collection, null, 0, 'gather', { allowCallEnd: true, deferCallEnd: true });
 
+      const host = resolveHost(req);
       if (collection.accepted) {
         const nextExpectation = digitService.getExpectation(callSid);
         if (nextExpectation?.plan_id) {
-          const host = resolveHost(req);
-          const prompt = `Thanks. ${digitService.buildDigitPrompt(nextExpectation)}`;
-          const twiml = digitService.buildTwilioGatherTwiml(callSid, nextExpectation, { prompt }, host);
-          res.type('text/xml');
-          res.end(twiml);
-          return;
+          const basePrompt = nextExpectation.prompt || digitService.buildDigitPrompt(nextExpectation);
+          const stepPrompt = nextExpectation.plan_total_steps
+            ? `Step ${nextExpectation.plan_step_index} of ${nextExpectation.plan_total_steps}. ${basePrompt}`
+            : basePrompt;
+          queuePendingDigitAction(callSid, { type: 'reprompt', text: stepPrompt, scheduleTimeout: true });
+        } else if (shouldEndOnSuccess) {
+          clearPendingDigitReprompts(callSid);
+          queuePendingDigitAction(callSid, { type: 'end', text: CLOSING_MESSAGE, reason: 'otp_verified' });
         }
-        // Keep stream alive; digit service will end call after processing
-        const response = new VoiceResponse();
-        const host = resolveHost(req);
-        response.say('Thanks, continuing.');
-        response.connect().stream({ url: `wss://${host}/connection`, track: TWILIO_STREAM_TRACK });
         digitService.clearDigitFallbackState(callSid);
+        const twiml = buildTwilioStreamTwiml(host);
         res.type('text/xml');
-        res.end(response.toString());
+        res.end(twiml);
         return;
       }
 
-      const response = new VoiceResponse();
       if (collection.fallback) {
-        response.say(CALL_END_MESSAGES.failure);
-        response.hangup();
-      } else {
-        response.say('That did not go through. Please try again.');
-        const host = resolveHost(req);
-        response.connect().stream({ url: `wss://${host}/connection`, track: TWILIO_STREAM_TRACK });
+        const failureMessage = expectation?.failure_message || CALL_END_MESSAGES.failure;
+        clearPendingDigitReprompts(callSid);
+        queuePendingDigitAction(callSid, { type: 'end', text: failureMessage, reason: 'digit_collection_failed' });
+        digitService.clearDigitFallbackState(callSid);
+        const twiml = buildTwilioStreamTwiml(host);
+        res.type('text/xml');
+        res.end(twiml);
+        return;
+      }
+
+      const hasPendingReprompt = Array.isArray(callConfig?.pending_digit_actions)
+        && callConfig.pending_digit_actions.some((action) => action?.type === 'reprompt');
+      let reprompt = expectation?.reprompt_invalid || expectation?.reprompt_message || '';
+      if (collection.reason === 'incomplete' || collection.reason === 'too_short') {
+        reprompt = expectation?.reprompt_incomplete || expectation?.reprompt_invalid || expectation?.reprompt_message || '';
+      }
+      if (!reprompt) {
+        reprompt = expectation ? digitService.buildDigitPrompt(expectation) : 'Please enter the digits again.';
+      }
+      if (!hasPendingReprompt) {
+        queuePendingDigitAction(callSid, { type: 'reprompt', text: reprompt, scheduleTimeout: true });
       }
       digitService.clearDigitFallbackState(callSid);
+      const twiml = buildTwilioStreamTwiml(host);
       res.type('text/xml');
-      res.end(response.toString());
+      res.end(twiml);
       return;
     }
 
     expectation.retries = (expectation.retries || 0) + 1;
     digitService.expectations.set(callSid, expectation);
 
+    const host = resolveHost(req);
     if (expectation.retries > expectation.max_retries) {
-      const response = new VoiceResponse();
-      response.say(CALL_END_MESSAGES.no_response);
-      response.hangup();
+      const timeoutMessage = expectation.timeout_failure_message || CALL_END_MESSAGES.no_response;
+      clearPendingDigitReprompts(callSid);
+      queuePendingDigitAction(callSid, { type: 'end', text: timeoutMessage, reason: 'digit_collection_timeout' });
       digitService.clearDigitFallbackState(callSid);
       digitService.clearDigitPlan(callSid);
+      const twiml = buildTwilioStreamTwiml(host);
       res.type('text/xml');
-      res.end(response.toString());
+      res.end(twiml);
       return;
     }
 
-    const host = resolveHost(req);
-    const twiml = digitService.buildTwilioGatherTwiml(callSid, expectation, {
-      prompt: 'I did not receive any input. Please enter the code using your keypad.'
-    }, host);
+    const hasPendingReprompt = Array.isArray(callConfig?.pending_digit_actions)
+      && callConfig.pending_digit_actions.some((action) => action?.type === 'reprompt');
+    const timeoutPrompt = expectation.reprompt_timeout
+      || expectation.reprompt_message
+      || 'I did not receive any input. Please enter the code using your keypad.';
+    if (!hasPendingReprompt) {
+      queuePendingDigitAction(callSid, { type: 'reprompt', text: timeoutPrompt, scheduleTimeout: true });
+    }
+    const twiml = buildTwilioStreamTwiml(host);
     res.type('text/xml');
     res.end(twiml);
   } catch (error) {
     console.error('Twilio gather webhook error:', error);
     res.status(500).send('Error');
   }
+});
+
+// Email API endpoints
+app.post('/email/send', async (req, res) => {
+    try {
+        if (!emailService) {
+            return res.status(500).json({ success: false, error: 'Email service not initialized' });
+        }
+        const idempotencyKey = req.headers['idempotency-key'] || req.headers['Idempotency-Key'];
+        const result = await emailService.enqueueEmail(req.body || {}, { idempotencyKey });
+        res.json({
+            success: true,
+            message_id: result.message_id,
+            deduped: result.deduped || false,
+            suppressed: result.suppressed || false
+        });
+    } catch (error) {
+        const status = error.code === 'idempotency_conflict' ? 409 : 400;
+        res.status(status).json({ success: false, error: error.message, missing: error.missing });
+    }
+});
+
+app.post('/email/bulk', async (req, res) => {
+    try {
+        if (!emailService) {
+            return res.status(500).json({ success: false, error: 'Email service not initialized' });
+        }
+        const idempotencyKey = req.headers['idempotency-key'] || req.headers['Idempotency-Key'];
+        const result = await emailService.enqueueBulk(req.body || {}, { idempotencyKey });
+        res.json({
+            success: true,
+            bulk_job_id: result.bulk_job_id,
+            deduped: result.deduped || false
+        });
+    } catch (error) {
+        const status = error.code === 'idempotency_conflict' ? 409 : 400;
+        res.status(status).json({ success: false, error: error.message });
+    }
+});
+
+app.post('/email/preview', async (req, res) => {
+    try {
+        if (!emailService) {
+            return res.status(500).json({ success: false, error: 'Email service not initialized' });
+        }
+        const result = await emailService.previewTemplate(req.body || {});
+        res.json({ success: result.ok, ...result });
+    } catch (error) {
+        res.status(400).json({ success: false, error: error.message });
+    }
+});
+
+app.get('/email/messages/:id', async (req, res) => {
+    try {
+        const messageId = req.params.id;
+        const message = await db.getEmailMessage(messageId);
+        if (!message) {
+            return res.status(404).json({ success: false, error: 'Message not found' });
+        }
+        const events = await db.listEmailEvents(messageId);
+        res.json({ success: true, message, events });
+    } catch (error) {
+        res.status(500).json({ success: false, error: error.message });
+    }
+});
+
+app.get('/email/bulk/:jobId', async (req, res) => {
+    try {
+        const jobId = req.params.jobId;
+        const job = await db.getEmailBulkJob(jobId);
+        if (!job) {
+            return res.status(404).json({ success: false, error: 'Bulk job not found' });
+        }
+        res.json({ success: true, job });
+    } catch (error) {
+        res.status(500).json({ success: false, error: error.message });
+    }
 });
 
 // Send single SMS endpoint
@@ -5617,6 +6019,16 @@ setInterval(() => {
         console.error('❌ Scheduled SMS processing error:', error);
     });
 }, 60000); // Check every minute
+
+// Start email queue processor
+setInterval(() => {
+    if (!emailService) {
+        return;
+    }
+    emailService.processQueue({ limit: 10 }).catch(error => {
+        console.error('❌ Email queue processing error:', error);
+    });
+}, config.email?.queueIntervalMs || 5000);
 
 // Cleanup old conversations every hour
 setInterval(() => {

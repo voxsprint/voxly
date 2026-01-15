@@ -27,6 +27,11 @@ module.exports = (bot) => {
                 '🔎 /smsstatus <message_sid> — delivery status for a message (requires access)'
             ]);
 
+            const emailList = escapeList([
+                '📧 /email — send an email message (requires access)',
+                '📬 /emailstatus <message_id> — check email delivery (requires access)'
+            ]);
+
             const infoList = escapeList([
                 '🩺 /health or /ping — check bot & API health',
                 '📰 /digest — 24h notifications + recent calls digest',
@@ -59,6 +64,7 @@ module.exports = (bot) => {
                 emphasize('Ready to guide your AI calls with sparkling clarity.'),
                 section('Call Tools', callList),
                 section('SMS Tools', smsList),
+                section('Email Tools', emailList),
                 section('Navigation & Info', infoList),
                 section('Quick Usage Flow', quickUsage.map(line => `• ${line}`))
             ];
@@ -72,6 +78,8 @@ module.exports = (bot) => {
                     '📣 /bulksms — broadcast smart SMS',
                     '📥 /recentsms [limit] — list recent SMS messages',
                     '📊 /smsstats — view SMS health & delivery',
+                    '📦 /bulkemail — send bulk email',
+                    '📬 /emailbulk <job_id> — bulk email job status',
                     '🧪 /status — deep system status',
                     '🧪 /testapi — hit the API health endpoint',
                     '🧰 /templates — manage reusable prompts',
@@ -112,6 +120,8 @@ module.exports = (bot) => {
                         .text('📋 Menu', 'MENU')
                         .row()
                         .text('💬 SMS', 'SMS')
+                        .text('📧 Email', 'EMAIL')
+                        .row()
                         .text('📚 Guide', 'GUIDE');
 
                     if (isOwner) {

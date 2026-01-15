@@ -64,6 +64,8 @@ module.exports = (bot) => {
             .text('📋 Commands', 'HELP')
             .row()
             .text('💬 SMS', 'SMS')
+            .text('📧 Email', 'EMAIL')
+            .row()
             .text('🔄 Menu', 'MENU');
 
         await ctx.reply(guideText, {

@@ -22,11 +22,14 @@ module.exports = (bot) => {
             .text('📞 Call', 'CALL')
             .text('💬 SMS', 'SMS')
             .row()
+            .text('📧 Email', 'EMAIL')
             .text('⏰ Schedule', 'SCHEDULE_SMS')
-            .text('📜 SMS Status', 'SMS_STATUS_HELP')
             .row()
             .text('📋 Calls', 'CALLS')
             .text('🧾 Threads', 'SMS_CONVO_HELP')
+            .row()
+            .text('📜 SMS Status', 'SMS_STATUS_HELP')
+            .text('📨 Email Status', 'EMAIL_STATUS_HELP')
             .row()
             .text('📚 Guide', 'GUIDE')
             .text('🏥 Health', 'HEALTH')
@@ -35,8 +38,11 @@ module.exports = (bot) => {
 
             if (isOwner) {
                 kb.row()
-                    .text('📤 Bulk', 'BULK_SMS')
-                    .text('📊 Stats', 'SMS_STATS')
+                    .text('📤 Bulk SMS', 'BULK_SMS')
+                    .text('📧 Bulk Email', 'BULK_EMAIL')
+                    .row()
+                    .text('📊 SMS Stats', 'SMS_STATS')
+                    .text('📥 Recent', 'RECENT_SMS')
                     .row()
                     .text('👥 Users', 'USERS')
                     .text('➕ Add', 'ADDUSER')
@@ -45,11 +51,9 @@ module.exports = (bot) => {
                     .text('❌ Remove', 'REMOVE')
                     .row()
                     .text('🧰 Templates', 'TEMPLATES')
-                    .text('📥 Recent', 'RECENT_SMS')
-                    .row()
                     .text('☎️ Provider', 'PROVIDER_STATUS')
-                    .text('🔍 Status', 'STATUS')
                     .row()
+                    .text('🔍 Status', 'STATUS')
                     .text('🧪 Test API', 'TEST_API');
             }
 

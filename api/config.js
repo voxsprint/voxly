@@ -106,6 +106,35 @@ function loadPrivateKey(rawValue) {
 
 const vonagePrivateKey = loadPrivateKey(readEnv('VONAGE_PRIVATE_KEY'));
 const serverHostname = normalizeHostname(ensure('SERVER', ''));
+const liveConsoleAudioTickMs = Number(readEnv('LIVE_CONSOLE_AUDIO_TICK_MS') || '160');
+const liveConsoleEditDebounceMs = Number(readEnv('LIVE_CONSOLE_EDIT_DEBOUNCE_MS') || '700');
+const liveConsoleUserLevelThreshold = Number(readEnv('LIVE_CONSOLE_USER_LEVEL_THRESHOLD') || '0.08');
+const liveConsoleUserHoldMs = Number(readEnv('LIVE_CONSOLE_USER_HOLD_MS') || '450');
+const emailProvider = (readEnv('EMAIL_PROVIDER') || 'sendgrid').toLowerCase();
+const emailDefaultFrom = readEnv('EMAIL_DEFAULT_FROM') || '';
+const emailVerifiedDomains = (readEnv('EMAIL_VERIFIED_DOMAINS') || '')
+  .split(',')
+  .map((value) => value.trim().toLowerCase())
+  .filter(Boolean);
+const emailRateLimitProvider = Number(readEnv('EMAIL_RATE_LIMIT_PROVIDER_PER_MIN') || '120');
+const emailRateLimitTenant = Number(readEnv('EMAIL_RATE_LIMIT_TENANT_PER_MIN') || '120');
+const emailRateLimitDomain = Number(readEnv('EMAIL_RATE_LIMIT_DOMAIN_PER_MIN') || '120');
+const emailQueueIntervalMs = Number(readEnv('EMAIL_QUEUE_INTERVAL_MS') || '5000');
+const emailMaxRetries = Number(readEnv('EMAIL_MAX_RETRIES') || '5');
+const emailUnsubscribeUrl = readEnv('EMAIL_UNSUBSCRIBE_URL') || (serverHostname ? `https://${serverHostname}/webhook/email-unsubscribe` : '');
+const emailWarmupMaxPerDay = Number(readEnv('EMAIL_WARMUP_MAX_PER_DAY') || '0');
+const emailDkimEnabled = String(readEnv('EMAIL_DKIM_ENABLED') || 'true').toLowerCase() === 'true';
+const emailSpfEnabled = String(readEnv('EMAIL_SPF_ENABLED') || 'true').toLowerCase() === 'true';
+const emailDmarcPolicy = readEnv('EMAIL_DMARC_POLICY') || 'none';
+const sendgridApiKey = readEnv('SENDGRID_API_KEY');
+const sendgridBaseUrl = readEnv('SENDGRID_BASE_URL');
+const mailgunApiKey = readEnv('MAILGUN_API_KEY');
+const mailgunDomain = readEnv('MAILGUN_DOMAIN');
+const mailgunBaseUrl = readEnv('MAILGUN_BASE_URL');
+const sesRegion = readEnv('SES_REGION') || awsRegion;
+const sesAccessKeyId = readEnv('SES_ACCESS_KEY_ID') || readEnv('AWS_ACCESS_KEY_ID');
+const sesSecretAccessKey = readEnv('SES_SECRET_ACCESS_KEY') || readEnv('AWS_SECRET_ACCESS_KEY');
+const sesSessionToken = readEnv('SES_SESSION_TOKEN') || readEnv('AWS_SESSION_TOKEN');
 
 module.exports = {
   platform: {
@@ -197,6 +226,49 @@ module.exports = {
   },
   recording: {
     enabled: recordingEnabled,
+  },
+  liveConsole: {
+    audioTickMs: Number.isFinite(liveConsoleAudioTickMs) ? liveConsoleAudioTickMs : 160,
+    editDebounceMs: Number.isFinite(liveConsoleEditDebounceMs) ? liveConsoleEditDebounceMs : 700,
+    userLevelThreshold: Number.isFinite(liveConsoleUserLevelThreshold) ? liveConsoleUserLevelThreshold : 0.08,
+    userHoldMs: Number.isFinite(liveConsoleUserHoldMs) ? liveConsoleUserHoldMs : 450,
+  },
+  email: {
+    provider: emailProvider,
+    defaultFrom: emailDefaultFrom,
+    verifiedDomains: emailVerifiedDomains,
+    queueIntervalMs: Number.isFinite(emailQueueIntervalMs) ? emailQueueIntervalMs : 5000,
+    maxRetries: Number.isFinite(emailMaxRetries) ? emailMaxRetries : 5,
+    unsubscribeUrl: emailUnsubscribeUrl,
+    rateLimits: {
+      perProviderPerMinute: Number.isFinite(emailRateLimitProvider) ? emailRateLimitProvider : 120,
+      perTenantPerMinute: Number.isFinite(emailRateLimitTenant) ? emailRateLimitTenant : 120,
+      perDomainPerMinute: Number.isFinite(emailRateLimitDomain) ? emailRateLimitDomain : 120,
+    },
+    warmup: {
+      enabled: emailWarmupMaxPerDay > 0,
+      maxPerDay: emailWarmupMaxPerDay
+    },
+    deliverability: {
+      dkimEnabled: emailDkimEnabled,
+      spfEnabled: emailSpfEnabled,
+      dmarcPolicy: emailDmarcPolicy
+    },
+    sendgrid: {
+      apiKey: sendgridApiKey,
+      baseUrl: sendgridBaseUrl
+    },
+    mailgun: {
+      apiKey: mailgunApiKey,
+      domain: mailgunDomain,
+      baseUrl: mailgunBaseUrl
+    },
+    ses: {
+      region: sesRegion,
+      accessKeyId: sesAccessKeyId,
+      secretAccessKey: sesSecretAccessKey,
+      sessionToken: sesSessionToken
+    }
   },
   smsDefaults: {
     businessId: defaultSmsBusinessId,

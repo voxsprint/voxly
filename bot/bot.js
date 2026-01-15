@@ -176,6 +176,14 @@ async function validateTemplatesApiConnectivity() {
 const { getUser, isAdmin, expireInactiveUsers } = require('./db/db');
 const { callFlow, registerCallCommand } = require('./commands/call');
 const { smsFlow, bulkSmsFlow, scheduleSmsFlow, registerSmsCommands, getSmsStats } = require('./commands/sms');
+const {
+    emailFlow,
+    bulkEmailFlow,
+    registerEmailCommands,
+    sendEmailStatusCard,
+    sendEmailTimeline,
+    sendBulkStatusCard
+} = require('./commands/email');
 const { templatesFlow, registerTemplatesCommand } = require('./commands/templates');
 const { personaFlow, registerPersonaCommand } = require('./commands/persona');
 const {
@@ -203,6 +211,8 @@ bot.use(wrapConversation(removeUserFlow, "remove-conversation"));
 bot.use(wrapConversation(scheduleSmsFlow, "schedule-sms-conversation"));
 bot.use(wrapConversation(smsFlow, "sms-conversation"));
 bot.use(wrapConversation(bulkSmsFlow, "bulk-sms-conversation"));
+bot.use(wrapConversation(emailFlow, "email-conversation"));
+bot.use(wrapConversation(bulkEmailFlow, "bulk-email-conversation"));
 bot.use(wrapConversation(templatesFlow, "templates-conversation"));
 bot.use(wrapConversation(personaFlow, "persona-conversation"));
 
@@ -212,6 +222,7 @@ registerAddUserCommand(bot);
 registerPromoteCommand(bot);
 registerRemoveUserCommand(bot);
 registerSmsCommands(bot);
+registerEmailCommands(bot);
 registerTemplatesCommand(bot);
 registerUserListCommand(bot);
 registerPersonaCommand(bot);
@@ -608,21 +619,28 @@ bot.command('start', async (ctx) => {
           .text('📞 Call', 'CALL')
           .text('💬 SMS', 'SMS')
             .row()
+            .text('📧 Email', 'EMAIL')
             .text('⏰ Schedule', 'SCHEDULE_SMS')
-            .text('📋 Menu', 'MENU')
+            .row()
+            .text('📋 Calls', 'CALLS')
+            .text('🧾 Threads', 'SMS_CONVO_HELP')
             .row()
             .text('📜 SMS Status', 'SMS_STATUS_HELP')
-            .text('🧾 Threads', 'SMS_CONVO_HELP')
+            .text('📨 Email Status', 'EMAIL_STATUS_HELP')
             .row()
             .text('📚 Guide', 'GUIDE')
             .text('🏥 Health', 'HEALTH')
             .row()
-            .text('ℹ️ Help', 'HELP');
+            .text('ℹ️ Help', 'HELP')
+            .text('📋 Menu', 'MENU');
 
         if (isOwner) {
             kb.row()
-                .text('📤 Bulk', 'BULK_SMS')
-                .text('📊 Stats', 'SMS_STATS')
+                .text('📤 Bulk SMS', 'BULK_SMS')
+                .text('📧 Bulk Email', 'BULK_EMAIL')
+            .row()
+                .text('📊 SMS Stats', 'SMS_STATS')
+                .text('📥 Recent', 'RECENT_SMS')
             .row()
                 .text('👥 Users', 'USERS')
                 .text('➕ Add', 'ADDUSER')
@@ -630,8 +648,11 @@ bot.command('start', async (ctx) => {
                 .text('⬆️ Promote', 'PROMOTE')
                 .text('❌ Remove', 'REMOVE')
             .row()
+                .text('🧰 Templates', 'TEMPLATES')
                 .text('☎️ Provider', 'PROVIDER_STATUS')
-                .text('🔍 Status', 'STATUS');
+            .row()
+                .text('🔍 Status', 'STATUS')
+                .text('🧪 Test API', 'TEST_API');
         }
 
         const message = `${welcomeText}\n\n${userStats}\n\nUse the buttons below or type /help for available commands.`;
@@ -666,8 +687,8 @@ bot.on('callback_query:data', async (ctx) => {
 
         // Check admin permissions
         const isAdminUser = user.role === 'ADMIN';
-        const adminActions = ['ADDUSER', 'PROMOTE', 'REMOVE', 'USERS', 'STATUS', 'TEST_API', 'TEMPLATES', 'SMS_STATS', 'RECENT_SMS', 'PROVIDER_STATUS', 'BULK_SMS'];
-        const adminActionPrefixes = ['PROVIDER_SET:'];
+        const adminActions = ['ADDUSER', 'PROMOTE', 'REMOVE', 'USERS', 'STATUS', 'TEST_API', 'TEMPLATES', 'SMS_STATS', 'RECENT_SMS', 'PROVIDER_STATUS', 'BULK_SMS', 'BULK_EMAIL'];
+        const adminActionPrefixes = ['PROVIDER_SET:', 'EMAIL_BULK:'];
 
         const requiresAdmin = adminActions.includes(action) || adminActionPrefixes.some((prefix) => action.startsWith(prefix));
 
@@ -768,6 +789,42 @@ bot.on('callback_query:data', async (ctx) => {
             return;
         }
 
+        if (action.startsWith('EMAIL_STATUS:')) {
+            const [, messageId] = action.split(':');
+            await cancelActiveFlow(ctx, `callback:${action}`);
+            resetSession(ctx);
+            if (!messageId) {
+                await ctx.reply('❌ Missing email message id.');
+                return;
+            }
+            await sendEmailStatusCard(ctx, messageId);
+            return;
+        }
+
+        if (action.startsWith('EMAIL_TIMELINE:')) {
+            const [, messageId] = action.split(':');
+            await cancelActiveFlow(ctx, `callback:${action}`);
+            resetSession(ctx);
+            if (!messageId) {
+                await ctx.reply('❌ Missing email message id.');
+                return;
+            }
+            await sendEmailTimeline(ctx, messageId);
+            return;
+        }
+
+        if (action.startsWith('EMAIL_BULK:')) {
+            const [, jobId] = action.split(':');
+            await cancelActiveFlow(ctx, `callback:${action}`);
+            resetSession(ctx);
+            if (!jobId) {
+                await ctx.reply('❌ Missing bulk job id.');
+                return;
+            }
+            await sendBulkStatusCard(ctx, jobId);
+            return;
+        }
+
         // Handle conversation actions
         const conversations = {
             'CALL': 'call-conversation',
@@ -776,6 +833,8 @@ bot.on('callback_query:data', async (ctx) => {
             'REMOVE': 'remove-conversation',
             'SMS': 'sms-conversation',
             'BULK_SMS': 'bulk-sms-conversation',
+            'EMAIL': 'email-conversation',
+            'BULK_EMAIL': 'bulk-email-conversation',
             'SCHEDULE_SMS': 'schedule-sms-conversation',
             'TEMPLATES': 'templates-conversation'
         };
@@ -883,6 +942,10 @@ bot.on('callback_query:data', async (ctx) => {
                     await ctx.reply('Use /smsconversation <phone_number> to view a thread.\nExample: /smsconversation +1234567890');
                 }
                 break;
+
+            case 'EMAIL_STATUS_HELP':
+                await ctx.reply('Use /emailstatus <message_id> to check email status.\nExample: /emailstatus email_1234...');
+                break;
                 
             default:
                 console.log(`Unknown callback action: ${action}`);
@@ -910,7 +973,9 @@ async function executeHelpCommand(ctx) {
 • /start - Restart bot &amp; show main menu
 • /call - Start a new voice call
 • /sms - Send an SMS message
+• /email - Send an email message
 • /smsconversation &lt;phone&gt; - View SMS conversation
+• /emailstatus &lt;message_id&gt; - Check email delivery
 • /search &lt;term&gt; - Find calls by ID/phone/intent
 • /recent [limit] - List recent calls (max 50)
 • /health or /ping - Check bot &amp; API health
@@ -927,9 +992,11 @@ async function executeHelpCommand(ctx) {
 • /removeuser - Remove user access
 • /users - List all authorized users
 • /bulksms - Send bulk SMS messages
+• /bulkemail - Send bulk email messages
 • /schedulesms - Schedule SMS for later
 • /provider - View or switch call provider
 • /smsstats - View SMS statistics
+• /emailbulk - View bulk email job status
 • /templates - Manage call &amp; SMS templates
 • /status - Full system status check
 • /testapi - Test API connection`;
@@ -960,6 +1027,8 @@ async function executeHelpCommand(ctx) {
         .text('📋 Menu', 'MENU')
         .row()
         .text('💬 SMS', 'SMS')
+        .text('📧 Email', 'EMAIL')
+        .row()
         .text('📚 Guide', 'GUIDE');
         
         if (isOwner) {
@@ -1059,7 +1128,9 @@ Version: 2.0.0`;
         .text('📋 Commands', 'HELP')
         .row()
         .text('🔄 Menu', 'MENU')
-        .text('💬 SMS', 'SMS');
+        .text('💬 SMS', 'SMS')
+        .row()
+        .text('📧 Email', 'EMAIL');
 
     await ctx.reply(mainGuide, {
         parse_mode: 'Markdown',
@@ -1072,11 +1143,14 @@ async function executeMenuCommand(ctx, isAdminUser) {
         .text('📞 Call', 'CALL')
         .text('💬 SMS', 'SMS')
         .row()
+        .text('📧 Email', 'EMAIL')
         .text('⏰ Schedule', 'SCHEDULE_SMS')
-        .text('📜 SMS Status', 'SMS_STATUS_HELP')
         .row()
         .text('📋 Calls', 'CALLS')
         .text('🧾 Threads', 'SMS_CONVO_HELP')
+        .row()
+        .text('📜 SMS Status', 'SMS_STATUS_HELP')
+        .text('📨 Email Status', 'EMAIL_STATUS_HELP')
         .row()
         .text('📚 Guide', 'GUIDE')
         .text('🏥 Health', 'HEALTH')
@@ -1085,8 +1159,11 @@ async function executeMenuCommand(ctx, isAdminUser) {
 
     if (isAdminUser) {
         kb.row()
-            .text('📤 Bulk', 'BULK_SMS')
-            .text('📊 Stats', 'SMS_STATS')
+            .text('📤 Bulk SMS', 'BULK_SMS')
+            .text('📧 Bulk Email', 'BULK_EMAIL')
+            .row()
+            .text('📊 SMS Stats', 'SMS_STATS')
+            .text('📥 Recent', 'RECENT_SMS')
             .row()
             .text('👥 Users', 'USERS')
             .text('➕ Add', 'ADDUSER')
@@ -1095,11 +1172,9 @@ async function executeMenuCommand(ctx, isAdminUser) {
             .text('❌ Remove', 'REMOVE')
             .row()
             .text('🧰 Templates', 'TEMPLATES')
-            .text('📥 Recent', 'RECENT_SMS')
-            .row()
             .text('☎️ Provider', 'PROVIDER_STATUS')
-            .text('🔍 Status', 'STATUS')
             .row()
+            .text('🔍 Status', 'STATUS')
             .text('🧪 Test API', 'TEST_API');
     }
 
@@ -1457,15 +1532,19 @@ const TELEGRAM_COMMANDS = [
     { command: 'start', description: 'Start or restart the bot' },
     { command: 'call', description: 'Start outbound voice call' },
     { command: 'sms', description: 'Send SMS message' },
+    { command: 'email', description: 'Send an email message' },
     { command: 'search', description: 'Search calls' },
     { command: 'recent', description: 'List recent calls' },
     { command: 'smsconversation', description: 'View SMS conversation' },
+    { command: 'emailstatus', description: 'Check email status' },
     { command: 'guide', description: 'Show detailed usage guide' },
     { command: 'help', description: 'Show available commands' },
     { command: 'cancel', description: 'Cancel the current action' },
     { command: 'menu', description: 'Show quick action menu' },
     { command: 'health', description: 'Check bot and API health' },
     { command: 'bulksms', description: 'Send bulk SMS (admin only)' },
+    { command: 'bulkemail', description: 'Send bulk email (admin only)' },
+    { command: 'emailbulk', description: 'Bulk email status (admin only)' },
     { command: 'schedulesms', description: 'Schedule SMS message' },
     { command: 'provider', description: 'Manage call provider (admin only)' },
     { command: 'smsstats', description: 'SMS statistics (admin only)' },

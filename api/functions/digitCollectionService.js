@@ -31,6 +31,7 @@ function createDigitCollectionService(options = {}) {
     getCurrentProvider,
     speakAndEndCall,
     clearSilenceTimer,
+    queuePendingDigitAction,
     callEndMessages = {},
     closingMessage = 'Thank you for your time. Goodbye.',
     settings = {},
@@ -763,10 +764,14 @@ function createDigitCollectionService(options = {}) {
 
       if (!digitFallbackStates.get(callSid)?.active && typeof triggerTwilioGatherFallback === 'function') {
         try {
+          const fallbackPrompt = current?.reprompt_timeout || buildDigitPrompt(current);
           const usedFallback = await triggerTwilioGatherFallback(callSid, current, {
-            prompt: buildDigitPrompt(current)
+            prompt: queuePendingDigitAction ? '' : fallbackPrompt
           });
           if (usedFallback) {
+            if (queuePendingDigitAction && fallbackPrompt) {
+              queuePendingDigitAction(callSid, { type: 'reprompt', text: fallbackPrompt, scheduleTimeout: true });
+            }
             return;
           }
         } catch (err) {
@@ -782,7 +787,6 @@ function createDigitCollectionService(options = {}) {
         clearDigitTimeout(callSid);
         clearDigitFallbackState(callSid);
         clearDigitPlan(callSid);
-        clearDigitIntent(callSid, 'digit_collection_timeout');
         const finalTimeoutMessage = current.timeout_failure_message || callEndMessages.no_response;
         await speakAndEndCall(callSid, finalTimeoutMessage, 'digit_collection_timeout');
         return;
@@ -831,8 +835,11 @@ function createDigitCollectionService(options = {}) {
       action: actionUrl,
       method: 'POST'
     });
-    const prompt = options.prompt || buildDigitPrompt(expectation);
-    gather.say(prompt);
+    const hasPromptOverride = Object.prototype.hasOwnProperty.call(options, 'prompt');
+    const prompt = hasPromptOverride ? options.prompt : buildDigitPrompt(expectation);
+    if (prompt) {
+      gather.say(prompt);
+    }
     if (options.followup) {
       response.say(options.followup);
     }
@@ -1401,6 +1408,7 @@ function createDigitCollectionService(options = {}) {
   async function handleCollectionResult(callSid, collection, gptService = null, interactionCount = 0, source = 'dtmf', options = {}) {
     if (!collection) return;
     const allowCallEnd = options.allowCallEnd === true;
+    const deferCallEnd = options.deferCallEnd === true;
     const expectation = digitCollectionManager.expectations.get(callSid);
     const shouldEndCall = allowCallEnd && expectation?.end_call_on_success !== false;
     const expectedLabel = expectation ? buildExpectedLabel(expectation) : 'the code';
@@ -1649,12 +1657,15 @@ function createDigitCollectionService(options = {}) {
             completed_at: new Date().toISOString()
           }).catch(() => {});
           const planShouldEnd = allowCallEnd && plan.end_call_on_success !== false;
-          clearDigitIntent(callSid, 'digit_plan_completed');
           if (planShouldEnd) {
             const completionMessage = plan.completion_message || closingMessage;
+            if (deferCallEnd) {
+              return;
+            }
             await speakAndEndCall(callSid, completionMessage, 'digits_collected_plan');
             return;
           }
+          clearDigitIntent(callSid, 'digit_plan_completed');
           if (gptService) {
             const completionMessage = plan.completion_message || 'Thanks, I have all the digits I need.';
             emitReply(completionMessage);
@@ -1663,8 +1674,10 @@ function createDigitCollectionService(options = {}) {
         }
       }
 
-      clearDigitIntent(callSid);
       if (shouldEndCall) {
+        if (deferCallEnd) {
+          return;
+        }
         await speakAndEndCall(
           callSid,
           closingMessage,
@@ -1672,6 +1685,7 @@ function createDigitCollectionService(options = {}) {
         );
         return;
       }
+      clearDigitIntent(callSid);
       const confirmation = buildConfirmationMessage(expectation || {}, collection);
       if (confirmation) {
         emitReply(confirmation);
@@ -1698,7 +1712,9 @@ function createDigitCollectionService(options = {}) {
           return;
         }
         if (allowCallEnd) {
-          clearDigitIntent(callSid, 'digit_collection_failed');
+          if (deferCallEnd) {
+            return;
+          }
           await speakAndEndCall(callSid, failureMessage, 'digit_collection_failed');
           return;
         }

@@ -1684,8 +1684,6 @@ app.ws('/connection', (ws, req) => {
 
           const pendingDigitActions = popPendingDigitActions(callSid);
           const skipGreeting = callConfig?.initial_prompt_played === true
-            || callConfig?.digit_capture_active === true
-            || digitService?.hasExpectation(callSid)
             || pendingDigitActions.length > 0;
 
           // Initialize call with recording
@@ -1700,28 +1698,45 @@ app.ws('/connection', (ws, req) => {
             await recordingService(ttsService, callSid);
             
             const initialExpectation = digitService?.getExpectation(callSid);
+            const fallbackPrompt = 'One moment while I pull that up.';
             const firstMessage = (callConfig && callConfig.first_message)
               ? callConfig.first_message
-              : (initialExpectation ? digitService.buildDigitPrompt(initialExpectation) : 'Hello! what\'s your name and how can i help you today?');
+              : (initialExpectation ? digitService.buildDigitPrompt(initialExpectation) : fallbackPrompt);
             
             console.log(`First message (${functionSystem?.context.industry || 'default'}): ${firstMessage.substring(0, 50)}...`);
+            let promptUsed = firstMessage;
+            try {
+              await ttsService.generate({
+                partialResponseIndex: null,
+                partialResponse: firstMessage
+              }, 0);
+            } catch (ttsError) {
+              console.error('Initial TTS error:', ttsError);
+              try {
+                await ttsService.generate({
+                  partialResponseIndex: null,
+                  partialResponse: fallbackPrompt
+                }, 0);
+                promptUsed = fallbackPrompt;
+              } catch (fallbackError) {
+                console.error('Initial TTS fallback error:', fallbackError);
+                await speakAndEndCall(callSid, CALL_END_MESSAGES.error, 'tts_error');
+                isInitialized = true;
+                return;
+              }
+            }
             
             try {
               await db.addTranscript({
                 call_sid: callSid,
                 speaker: 'ai',
-                message: firstMessage,
+                message: promptUsed,
                 interaction_count: 0,
                 personality_used: 'default'
               });
             } catch (dbError) {
               console.error('Database error adding initial transcript:', dbError);
             }
-            
-            await ttsService.generate({
-              partialResponseIndex: null, 
-              partialResponse: firstMessage
-            }, 0);
             if (callConfig) {
               callConfig.initial_prompt_played = true;
               callConfigurations.set(callSid, callConfig);
@@ -1729,7 +1744,7 @@ app.ws('/connection', (ws, req) => {
             if (digitService?.hasExpectation(callSid)) {
               digitService.markDigitPrompted(callSid, gptService, interactionCount, 'dtmf', {
                 allowCallEnd: true,
-                prompt_text: firstMessage
+                prompt_text: promptUsed
               });
               digitService.scheduleDigitTimeout(callSid, gptService, 0);
             }
@@ -1753,26 +1768,44 @@ app.ws('/connection', (ws, req) => {
             } else {
             
             const initialExpectation = digitService?.getExpectation(callSid);
+            const fallbackPrompt = 'One moment while I pull that up.';
             const firstMessage = (callConfig && callConfig.first_message)
               ? callConfig.first_message
-              : (initialExpectation ? digitService.buildDigitPrompt(initialExpectation) : 'Hello! what\'s your name and how can i help you today?');
+              : (initialExpectation ? digitService.buildDigitPrompt(initialExpectation) : fallbackPrompt);
+            
+            let promptUsed = firstMessage;
+            try {
+              await ttsService.generate({
+                partialResponseIndex: null,
+                partialResponse: firstMessage
+              }, 0);
+            } catch (ttsError) {
+              console.error('Initial TTS error:', ttsError);
+              try {
+                await ttsService.generate({
+                  partialResponseIndex: null,
+                  partialResponse: fallbackPrompt
+                }, 0);
+                promptUsed = fallbackPrompt;
+              } catch (fallbackError) {
+                console.error('Initial TTS fallback error:', fallbackError);
+                await speakAndEndCall(callSid, CALL_END_MESSAGES.error, 'tts_error');
+                isInitialized = true;
+                return;
+              }
+            }
             
             try {
               await db.addTranscript({
                 call_sid: callSid,
                 speaker: 'ai',
-                message: firstMessage,
+                message: promptUsed,
                 interaction_count: 0,
                 personality_used: 'default'
               });
             } catch (dbError) {
               console.error('Database error adding AI transcript:', dbError);
             }
-            
-            await ttsService.generate({
-              partialResponseIndex: null, 
-              partialResponse: firstMessage
-            }, 0);
             if (callConfig) {
               callConfig.initial_prompt_played = true;
               callConfigurations.set(callSid, callConfig);
@@ -1780,7 +1813,7 @@ app.ws('/connection', (ws, req) => {
             if (digitService?.hasExpectation(callSid)) {
               digitService.markDigitPrompted(callSid, gptService, interactionCount, 'dtmf', {
                 allowCallEnd: true,
-                prompt_text: firstMessage
+                prompt_text: promptUsed
               });
               digitService.scheduleDigitTimeout(callSid, gptService, 0);
             }

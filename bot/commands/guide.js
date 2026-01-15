@@ -1,7 +1,7 @@
 const { InlineKeyboard } = require('grammy');
 const config = require('../config');
 const { getUser } = require('../db/db');
-const { section, emphasize, buildLine, escapeMarkdown } = require('../utils/messageStyle');
+const { section, emphasize, buildLine, escapeMarkdown, tipLine } = require('../utils/messageStyle');
 
 module.exports = (bot) => {
     bot.command('guide', async (ctx) => {

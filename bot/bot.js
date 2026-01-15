@@ -5,7 +5,7 @@ try {
     console.error('❌ Missing dependency "grammy". Run `npm ci --omit=dev` in /bot before starting PM2.');
     throw error;
 }
-const { Bot, session, InlineKeyboard } = grammyPkg;
+const { Bot, session, InlineKeyboard, InputFile } = grammyPkg;
 
 let conversationsPkg;
 try {
@@ -351,6 +351,92 @@ async function sendFullTranscriptFromApi(ctx, callSid) {
     for (let i = 0; i < chunks.length; i += 1) {
         await ctx.reply(chunks[i], { parse_mode: 'HTML' });
     }
+}
+
+function sleep(ms) {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function sendTranscriptAudioFromApi(ctx, callSid) {
+    if (!callSid) {
+        await ctx.reply('❌ Missing call identifier for transcript audio.');
+        return;
+    }
+
+    let callData;
+    try {
+        const response = await axios.get(`${config.apiUrl}/api/calls/${callSid}`, { timeout: 15000 });
+        callData = response.data?.call || response.data;
+    } catch (error) {
+        console.error('Transcript audio call fetch error:', error?.message || error);
+        await ctx.reply('❌ Unable to retrieve call details for transcript audio.');
+        return;
+    }
+
+    const isAdminUser = await new Promise((resolve) => isAdmin(ctx.from.id, resolve));
+    if (callData?.user_chat_id && callData.user_chat_id !== ctx.from.id && !isAdminUser) {
+        await ctx.reply('❌ You are not authorized to access transcript audio for this call.');
+        return;
+    }
+
+    let notified = false;
+    const maxAttempts = 6;
+    for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
+        let response;
+        try {
+            response = await axios.get(`${config.apiUrl}/api/calls/${callSid}/transcript/audio`, {
+                responseType: 'arraybuffer',
+                timeout: 20000,
+                validateStatus: () => true
+            });
+        } catch (error) {
+            console.error('Transcript audio fetch error:', error?.message || error);
+            await ctx.reply('❌ Failed to fetch transcript audio. Sending text transcript instead.');
+            await sendFullTranscriptFromApi(ctx, callSid);
+            return;
+        }
+
+        if (response.status === 200) {
+            const audioBuffer = Buffer.from(response.data);
+            if (!audioBuffer.length) {
+                await ctx.reply('❌ Transcript audio is empty. Sending text transcript instead.');
+                await sendFullTranscriptFromApi(ctx, callSid);
+                return;
+            }
+            await ctx.replyWithAudio(new InputFile(audioBuffer, 'transcript.mp3'), {
+                title: 'Transcript audio'
+            });
+            return;
+        }
+
+        if (response.status === 202) {
+            if (!notified) {
+                await ctx.reply('⏳ Generating transcript audio...');
+                notified = true;
+            }
+            await sleep(2000);
+            continue;
+        }
+
+        if (response.status === 404) {
+            await ctx.reply('❌ Transcript audio is not available for this call. Sending text transcript instead.');
+            await sendFullTranscriptFromApi(ctx, callSid);
+            return;
+        }
+
+        let errorMessage = 'Transcript audio failed.';
+        try {
+            const payload = JSON.parse(Buffer.from(response.data).toString('utf8'));
+            errorMessage = payload?.error || payload?.message || errorMessage;
+        } catch (_) {}
+
+        await ctx.reply(`❌ ${errorMessage} Sending text transcript instead.`);
+        await sendFullTranscriptFromApi(ctx, callSid);
+        return;
+    }
+
+    await ctx.reply('⏳ Transcript audio is still generating. Sending text transcript for now.');
+    await sendFullTranscriptFromApi(ctx, callSid);
 }
 
 async function handleCallFollowUp(ctx, callSid, followAction) {
@@ -720,8 +806,7 @@ bot.on('callback_query:data', async (ctx) => {
             const callSid = action.split(':')[1];
             await cancelActiveFlow(ctx, `callback:${action}`);
             resetSession(ctx);
-            await ctx.reply('🎧 Recording link is not available yet. Sending full transcript instead...');
-            await sendFullTranscriptFromApi(ctx, callSid);
+            await sendTranscriptAudioFromApi(ctx, callSid);
             return;
         }
 

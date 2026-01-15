@@ -104,6 +104,43 @@ function createDigitCollectionService(options = {}) {
     return map[normalizedProfile] || normalizedProfile || 'Digits';
   }
 
+  function labelForClosing(profile = 'generic') {
+    const normalizedProfile = normalizeProfileId(profile) || 'generic';
+    const map = {
+      verification: 'one-time password',
+      otp: 'one-time password',
+      pin: 'PIN',
+      order_number: 'order number',
+      reservation_number: 'reservation number',
+      ticket_number: 'ticket number',
+      case_number: 'case number',
+      claim_number: 'claim number',
+      extension: 'extension',
+      account_number: 'account number',
+      account: 'account number',
+      routing_number: 'routing number',
+      ssn: 'social security number',
+      dob: 'date of birth',
+      zip: 'ZIP code',
+      phone: 'phone number',
+      tax_id: 'tax ID',
+      ein: 'employer ID',
+      card_number: 'card number',
+      cvv: 'card security code',
+      card_expiry: 'card expiry',
+      amount: 'amount'
+    };
+    return map[normalizedProfile] || null;
+  }
+
+  function buildClosingMessage(profile) {
+    const label = labelForClosing(profile);
+    if (!label) {
+      return 'Thank you—your input has been received. Your request is complete. Goodbye.';
+    }
+    return `Thank you—your ${label} has been received and verified. Your request is complete. Goodbye.`;
+  }
+
   function estimateSpeechDurationMs(text = '') {
     const words = String(text || '')
       .trim()
@@ -1658,7 +1695,9 @@ function createDigitCollectionService(options = {}) {
           }).catch(() => {});
           const planShouldEnd = allowCallEnd && plan.end_call_on_success !== false;
           if (planShouldEnd) {
-            const completionMessage = plan.completion_message || closingMessage;
+            const completionMessage = plan.completion_message
+              || buildClosingMessage(collection.profile || expectation?.profile)
+              || closingMessage;
             if (deferCallEnd) {
               return;
             }
@@ -1678,9 +1717,10 @@ function createDigitCollectionService(options = {}) {
         if (deferCallEnd) {
           return;
         }
+        const completionMessage = buildClosingMessage(collection.profile || expectation?.profile) || closingMessage;
         await speakAndEndCall(
           callSid,
-          closingMessage,
+          completionMessage,
           (collection.profile === 'verification' || collection.profile === 'otp') ? 'otp_verified' : 'digits_collected'
         );
         return;
@@ -1798,7 +1838,8 @@ function createDigitCollectionService(options = {}) {
     scheduleDigitTimeout,
     setExpectation: (callSid, params) => digitCollectionManager.setExpectation(callSid, params),
     isFallbackActive: (callSid) => digitFallbackStates.get(callSid)?.active === true,
-    hasPlan: (callSid) => digitCollectionPlans.has(callSid)
+    hasPlan: (callSid) => digitCollectionPlans.has(callSid),
+    buildClosingMessage
   };
 }
 

@@ -2,6 +2,7 @@ require('dotenv').config();
 require('colors');
 
 const express = require('express');
+const fetch = require('node-fetch');
 const ExpressWs = require('express-ws');
 const path = require('path');
 const crypto = require('crypto');
@@ -215,6 +216,80 @@ function scheduleSilenceTimer(callSid, timeoutMs = 30000) {
     }
   }, timeoutMs);
   silenceTimers.set(callSid, timer);
+}
+
+function getTranscriptAudioEntry(callSid) {
+  const entry = transcriptAudioJobs.get(callSid);
+  if (!entry) return null;
+  if (Date.now() - entry.updatedAt > TRANSCRIPT_AUDIO_TTL_MS) {
+    transcriptAudioJobs.delete(callSid);
+    return null;
+  }
+  return entry;
+}
+
+async function generateTranscriptAudioBuffer(callSid) {
+  if (!config.deepgram?.apiKey) {
+    throw new Error('Deepgram API key not configured');
+  }
+  const call = await db.getCall(callSid);
+  if (!call) {
+    throw new Error('Call not found');
+  }
+  const transcripts = await db.getCallTranscripts(callSid);
+  if (!Array.isArray(transcripts) || transcripts.length === 0) {
+    throw new Error('Transcript not available');
+  }
+  const voiceModel = resolveVoiceModel(call) || config.deepgram.voiceModel || 'aura-asteria-en';
+  const lines = transcripts.map((entry) => {
+    const speaker = entry.speaker === 'user' ? 'User' : 'Agent';
+    return `${speaker}: ${entry.message || ''}`.trim();
+  });
+  const text = lines.join('\n');
+  const url = `https://api.deepgram.com/v1/speak?model=${encodeURIComponent(voiceModel)}&encoding=mp3`;
+  const response = await fetch(url, {
+    method: 'POST',
+    headers: {
+      'Authorization': `Token ${config.deepgram.apiKey}`,
+      'Content-Type': 'application/json'
+    },
+    body: JSON.stringify({ text })
+  });
+  if (!response.ok) {
+    const errorText = await response.text();
+    throw new Error(`TTS failed (${response.status}): ${errorText || response.statusText}`);
+  }
+  const audioBuffer = Buffer.from(await response.arrayBuffer());
+  if (!audioBuffer.length) {
+    throw new Error('Transcript audio empty');
+  }
+  return audioBuffer;
+}
+
+async function ensureTranscriptAudio(callSid) {
+  const existing = getTranscriptAudioEntry(callSid);
+  if (existing?.status === 'ready' || existing?.status === 'processing') {
+    return existing;
+  }
+  const entry = {
+    status: 'processing',
+    buffer: null,
+    error: null,
+    updatedAt: Date.now()
+  };
+  transcriptAudioJobs.set(callSid, entry);
+  generateTranscriptAudioBuffer(callSid)
+    .then((buffer) => {
+      entry.status = 'ready';
+      entry.buffer = buffer;
+      entry.updatedAt = Date.now();
+    })
+    .catch((error) => {
+      entry.status = 'error';
+      entry.error = error.message || 'Transcript audio failed';
+      entry.updatedAt = Date.now();
+    });
+  return entry;
 }
 
 function estimateAudioLevelFromBase64(base64 = '') {
@@ -619,6 +694,8 @@ const activeCalls = new Map();
 const callFunctionSystems = new Map(); // Store generated functions per call
 const callEndLocks = new Map();
 const silenceTimers = new Map();
+const transcriptAudioJobs = new Map();
+const TRANSCRIPT_AUDIO_TTL_MS = 60 * 60 * 1000;
 const pendingStreams = new Map(); // callSid -> timeout to detect missing websocket
 const gptQueues = new Map();
 const normalFlowBuffers = new Map();
@@ -720,7 +797,7 @@ const CALL_END_MESSAGES = {
   user_goodbye: 'Thanks for your time. Goodbye.',
   error: 'I am having trouble right now. Thank you and goodbye.'
 };
-const CLOSING_MESSAGE = 'Thank you—your input has been received. Goodbye.';
+const CLOSING_MESSAGE = 'Thank you—your input has been received. Your request is complete. Goodbye.';
 const DIGIT_SETTINGS = {
   otpLength: 6,
   otpMaxRetries: 3,
@@ -3823,6 +3900,29 @@ app.get('/api/calls/:callSid', async (req, res) => {
   }
 });
 
+app.get('/api/calls/:callSid/transcript/audio', async (req, res) => {
+  try {
+    const { callSid } = req.params;
+    const call = await db.getCall(callSid);
+    if (!call) {
+      return res.status(404).json({ error: 'Call not found' });
+    }
+    const entry = await ensureTranscriptAudio(callSid);
+    if (entry.status === 'processing') {
+      return res.status(202).json({ status: 'processing', retry_after_ms: 2000 });
+    }
+    if (entry.status === 'error') {
+      return res.status(500).json({ status: 'error', error: entry.error || 'Transcript audio failed' });
+    }
+    res.setHeader('Content-Type', 'audio/mpeg');
+    res.setHeader('Content-Disposition', 'attachment; filename="transcript.mp3"');
+    return res.status(200).send(entry.buffer);
+  } catch (error) {
+    console.error('Error generating transcript audio:', error);
+    return res.status(500).json({ status: 'error', error: error.message || 'Transcript audio failed' });
+  }
+});
+
 // Enhanced call status endpoint with real-time metrics
 app.get('/api/calls/:callSid/status', async (req, res) => {
   try {
@@ -4828,7 +4928,11 @@ app.post('/webhook/twilio-gather', async (req, res) => {
           queuePendingDigitAction(callSid, { type: 'reprompt', text: stepPrompt, scheduleTimeout: true });
         } else if (shouldEndOnSuccess) {
           clearPendingDigitReprompts(callSid);
-          queuePendingDigitAction(callSid, { type: 'end', text: CLOSING_MESSAGE, reason: 'otp_verified' });
+          const profile = expectation?.profile || collection.profile;
+          const completionMessage = digitService?.buildClosingMessage
+            ? digitService.buildClosingMessage(profile)
+            : CLOSING_MESSAGE;
+          queuePendingDigitAction(callSid, { type: 'end', text: completionMessage, reason: 'otp_verified' });
         }
         digitService.clearDigitFallbackState(callSid);
         const twiml = buildTwilioStreamTwiml(host);

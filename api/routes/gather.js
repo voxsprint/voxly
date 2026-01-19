@@ -21,7 +21,8 @@ function createTwilioGatherHandler(deps = {}) {
     getTwilioTtsAudioUrl,
     shouldUseTwilioPlay,
     resolveTwilioSayVoice,
-    isGroupedGatherPlan
+    isGroupedGatherPlan,
+    ttsTimeoutMs
   } = deps;
 
   const getService = () => (typeof getDigitService === 'function' ? getDigitService() : staticDigitService);
@@ -73,14 +74,31 @@ function createTwilioGatherHandler(deps = {}) {
       const usePlayForGrouped = Boolean(
         isGroupedPlayback && typeof shouldUseTwilioPlay === 'function' && shouldUseTwilioPlay(callConfig)
       );
+      const safeTtsTimeoutMs = Number.isFinite(Number(ttsTimeoutMs)) && Number(ttsTimeoutMs) > 0
+        ? Number(ttsTimeoutMs)
+        : 1200;
+      const resolveTtsUrl = async (text) => {
+        if (!usePlayForGrouped || !getTwilioTtsAudioUrl || !text) return null;
+        if (!safeTtsTimeoutMs) {
+          return getTwilioTtsAudioUrl(text, callConfig);
+        }
+        const timeoutPromise = new Promise((resolve) => {
+          setTimeout(() => resolve(null), safeTtsTimeoutMs);
+        });
+        try {
+          return await Promise.race([
+            getTwilioTtsAudioUrl(text, callConfig),
+            timeoutPromise
+          ]);
+        } catch (error) {
+          console.error('Twilio TTS timeout fallback:', error);
+          return null;
+        }
+      };
       const respondWithGather = async (exp, promptText = '', followupText = '') => {
         try {
-          const promptUrl = usePlayForGrouped && getTwilioTtsAudioUrl
-            ? await getTwilioTtsAudioUrl(promptText, callConfig, { cacheOnly: true })
-            : null;
-          const followupUrl = usePlayForGrouped && getTwilioTtsAudioUrl
-            ? await getTwilioTtsAudioUrl(followupText, callConfig, { cacheOnly: true })
-            : null;
+          const promptUrl = await resolveTtsUrl(promptText);
+          const followupUrl = await resolveTtsUrl(followupText);
           const twiml = digitService.buildTwilioGatherTwiml(
             callSid,
             exp,
@@ -95,6 +113,27 @@ function createTwilioGatherHandler(deps = {}) {
           return false;
         }
       };
+      const queryPlanId = req.query?.planId ? String(req.query.planId) : null;
+      const queryStepIndex = Number.isFinite(Number(req.query?.stepIndex))
+        ? Number(req.query.stepIndex)
+        : null;
+      const currentExpectation = digitService?.getExpectation?.(callSid);
+      if (
+        currentExpectation
+        && (queryPlanId || queryStepIndex)
+        && (
+          (queryPlanId && currentExpectation.plan_id && queryPlanId !== String(currentExpectation.plan_id))
+          || (Number.isFinite(queryStepIndex) && currentExpectation.plan_step_index && queryStepIndex !== Number(currentExpectation.plan_step_index))
+        )
+      ) {
+        const prompt = currentExpectation.prompt || digitService.buildDigitPrompt(currentExpectation);
+        console.warn(`Stale gather callback ignored for ${callSid} (step ${queryStepIndex})`);
+        if (await respondWithGather(currentExpectation, prompt)) {
+          return;
+        }
+        respondWithStream();
+        return;
+      }
       const respondWithStream = () => {
         const twiml = buildTwilioStreamTwiml(host);
         res.type('text/xml');
@@ -109,7 +148,7 @@ function createTwilioGatherHandler(deps = {}) {
         const response = new VoiceResponse();
         if (message) {
           if (usePlayForGrouped && getTwilioTtsAudioUrl) {
-            const url = await getTwilioTtsAudioUrl(message, callConfig, { cacheOnly: true });
+            const url = await resolveTtsUrl(message);
             if (url) {
               response.play(url);
             } else if (sayOptions) {
@@ -235,6 +274,23 @@ function createTwilioGatherHandler(deps = {}) {
         ? isGroupedGatherPlan(plan, callConfig)
         : Boolean(plan && ['banking', 'card'].includes(plan.group_id));
       if (isGroupedPlan) {
+        const now = Date.now();
+        const timeoutMs = Math.max(3000, (expectation?.timeout_s || 10) * 1000);
+        const promptedAt = expectation?.prompted_at;
+        const promptDelayMs = Number.isFinite(expectation?.prompted_delay_ms)
+          ? expectation.prompted_delay_ms
+          : 0;
+        if (promptedAt) {
+          const expectedTimeoutAt = promptedAt + promptDelayMs + timeoutMs;
+          if (now + 250 < expectedTimeoutAt) {
+            const prompt = digitService.buildPlanStepPrompt
+              ? digitService.buildPlanStepPrompt(expectation)
+              : (expectation.prompt || digitService.buildDigitPrompt(expectation));
+            if (await respondWithGather(expectation, prompt)) {
+              return;
+            }
+          }
+        }
         const timeoutMessage = expectation.timeout_failure_message || callEndMessages.no_response;
         clearPendingDigitReprompts?.(callSid);
         digitService.clearDigitFallbackState(callSid);

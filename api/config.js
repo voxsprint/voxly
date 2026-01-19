@@ -62,6 +62,7 @@ const twilioMachineDetectionTimeoutRaw = readEnv('TWILIO_MACHINE_DETECTION_TIMEO
 const twilioMachineDetectionTimeout = Number.isFinite(Number(twilioMachineDetectionTimeoutRaw))
   ? Number(twilioMachineDetectionTimeoutRaw)
   : undefined;
+const twilioTtsMaxWaitMs = Number(readEnv('TWILIO_TTS_MAX_WAIT_MS') || '1200');
 
 const callProvider = ensure('CALL_PROVIDER', 'twilio').toLowerCase();
 const awsRegion = ensure('AWS_REGION', 'us-east-1');
@@ -149,6 +150,7 @@ module.exports = {
     gatherFallback: twilioGatherFallback,
     machineDetection: twilioMachineDetection,
     machineDetectionTimeout: twilioMachineDetectionTimeout,
+    ttsMaxWaitMs: Number.isFinite(twilioTtsMaxWaitMs) ? twilioTtsMaxWaitMs : 1200
   },
   aws: {
     region: awsRegion,

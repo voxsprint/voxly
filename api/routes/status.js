@@ -1429,12 +1429,6 @@ class EnhancedWebhookService {
     return map[phaseKey] || '🟡';
   }
 
-  getWaveformPrefix(phaseKey) {
-    if (phaseKey === 'user_speaking') return 'U:';
-    if (phaseKey === 'agent_speaking') return 'A:';
-    return '';
-  }
-
   getLatencyMs(entry) {
     const phaseKey = entry?.phaseKey || 'waiting';
     if (phaseKey === 'ended') return null;
@@ -1682,9 +1676,7 @@ class EnhancedWebhookService {
     let phaseLine = entry.phase;
     if (frames && frames.length) {
       const frame = frames[entry.waveformIndex % frames.length] || frames[0];
-      const prefix = this.getWaveformPrefix(phaseKey);
-      const waveform = prefix ? `${prefix} ${frame}` : frame;
-      phaseLine = `${entry.phase} ${waveform}`;
+      phaseLine = `${entry.phase} ${frame}`;
     }
     const phaseAccent = this.getPhaseAccent(phaseKey);
     const phaseDisplay = `${phaseAccent} ${phaseLine}`;

@@ -20,6 +20,7 @@ const Database = require('./db/db');
 const { webhookService } = require('./routes/status');
 const DynamicFunctionEngine = require('./functions/DynamicFunctionEngine');
 const { createDigitCollectionService } = require('./functions/Digit');
+const { formatDigitCaptureLabel } = require('./functions/Labels');
 const config = require('./config');
 const { AwsConnectAdapter, AwsTtsAdapter, VonageVoiceAdapter } = require('./adapters');
 const { v4: uuidv4 } = require('uuid');
@@ -283,6 +284,25 @@ async function getTwilioTtsAudioUrl(text, callConfig, options = {}) {
     return `https://${config.server.hostname}/webhook/twilio-tts?key=${encodeURIComponent(key)}`;
   }
   return null;
+}
+
+async function getTwilioTtsAudioUrlSafe(text, callConfig, timeoutMs = 1200) {
+  const safeTimeoutMs = Number.isFinite(timeoutMs) && timeoutMs > 0 ? timeoutMs : 0;
+  if (!safeTimeoutMs) {
+    return getTwilioTtsAudioUrl(text, callConfig);
+  }
+  const timeoutPromise = new Promise((resolve) => {
+    setTimeout(() => resolve(null), safeTimeoutMs);
+  });
+  try {
+    return await Promise.race([
+      getTwilioTtsAudioUrl(text, callConfig),
+      timeoutPromise
+    ]);
+  } catch (error) {
+    console.error('Twilio TTS timeout fallback:', error);
+    return null;
+  }
 }
 
 function maskDigitsForLog(input = '') {
@@ -654,8 +674,9 @@ function startGroupedGather(callSid, callConfig, options = {}) {
       if (activeExpectation.prompted_at && options.force !== true) return;
       if (activeExpectation.plan_id && activePlan.id && activeExpectation.plan_id !== activePlan.id) return;
       const usePlay = shouldUseTwilioPlay(callConfig);
-      const preambleUrl = usePlay ? await getTwilioTtsAudioUrl(preamble, callConfig, { cacheOnly: true }) : null;
-      const promptUrl = usePlay ? await getTwilioTtsAudioUrl(prompt, callConfig, { cacheOnly: true }) : null;
+      const ttsTimeoutMs = Number(config.twilio?.ttsMaxWaitMs) || 1200;
+      const preambleUrl = usePlay ? await getTwilioTtsAudioUrlSafe(preamble, callConfig, ttsTimeoutMs) : null;
+      const promptUrl = usePlay ? await getTwilioTtsAudioUrlSafe(prompt, callConfig, ttsTimeoutMs) : null;
       await digitService.sendTwilioGather(callSid, activeExpectation, {
         prompt,
         preamble,
@@ -744,7 +765,9 @@ async function applyInitialDigitIntent(callSid, callConfig, gptService = null, i
     callConfig.digit_capture_active = false;
   }
   callConfigurations.set(callSid, callConfig);
-  if (result.intent?.mode === 'dtmf' && result.expectation) {
+  if (result.intent?.mode === 'dtmf' && Array.isArray(result.plan_steps) && result.plan_steps.length) {
+    webhookService.addLiveEvent(callSid, formatDigitCaptureLabel(result.intent, result.expectation), { force: true });
+  } else if (result.intent?.mode === 'dtmf' && result.expectation) {
     webhookService.addLiveEvent(callSid, `🔢 DTMF intent detected (${result.intent.reason})`, { force: true });
   } else {
     webhookService.addLiveEvent(callSid, `🗣️ Normal call flow (${result.intent?.reason || 'no_signal'})`, { force: true });
@@ -5308,6 +5331,7 @@ const twilioGatherHandler = createTwilioGatherHandler({
   closingMessage: CLOSING_MESSAGE,
   queuePendingDigitAction,
   getTwilioTtsAudioUrl,
+  ttsTimeoutMs: Number(config.twilio?.ttsMaxWaitMs) || 1200,
   shouldUseTwilioPlay,
   resolveTwilioSayVoice,
   isGroupedGatherPlan

@@ -2141,7 +2141,14 @@ function createDigitCollectionService(options = {}) {
     const min = expectation?.min_digits || 1;
     const max = expectation?.max_digits || min;
     const host = hostname || config?.server?.hostname;
-    const actionUrl = `https://${host}/webhook/twilio-gather?callSid=${encodeURIComponent(callSid)}`;
+    const queryParams = new URLSearchParams({ callSid: String(callSid) });
+    if (expectation?.plan_id) {
+      queryParams.set('planId', String(expectation.plan_id));
+    }
+    if (Number.isFinite(expectation?.plan_step_index)) {
+      queryParams.set('stepIndex', String(expectation.plan_step_index));
+    }
+    const actionUrl = `https://${host}/webhook/twilio-gather?${queryParams.toString()}`;
     const gatherOptions = {
       input: 'dtmf',
       numDigits: max,

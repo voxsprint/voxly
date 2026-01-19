@@ -23,7 +23,7 @@ const {
     extractTemplateVariables,
     TEMPLATE_METADATA
 } = require('../utils/templates');
-const { section: formatSection, buildLine, tipLine } = require('../utils/messageStyle');
+const { section: formatSection, buildLine, tipLine } = require('../utils/commandFormat');
 
 async function smsAlert(ctx, text) {
     await ctx.reply(formatSection('⚠️ SMS Alert', [text]));

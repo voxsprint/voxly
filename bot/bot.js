@@ -243,6 +243,15 @@ const {
     registerRemoveUserCommand,
     registerUserListCommand
 } = require('./commands/users');
+const { registerHelpCommand, handleHelp } = require('./commands/help');
+const { registerMenuCommand, handleMenu } = require('./commands/menu');
+const { registerGuideCommand, handleGuide } = require('./commands/guide');
+const {
+    registerApiCommands,
+    handleStatusCommand,
+    handleTestApiCommand,
+    handleHealthCommand
+} = require('./commands/api');
 
 // Register conversations with error handling
 bot.use(wrapConversation(callFlow, "call-conversation"));
@@ -270,10 +279,10 @@ registerPersonaCommand(bot);
 
 
 // Register non-conversation commands
-require('./commands/help')(bot);
-require('./commands/menu')(bot);
-require('./commands/guide')(bot);
-require('./commands/api')(bot);
+registerHelpCommand(bot);
+registerMenuCommand(bot);
+registerGuideCommand(bot);
+registerApiCommands(bot);
 registerProviderCommand(bot);
 const API_BASE = config.apiUrl;
 
@@ -749,9 +758,13 @@ bot.command('start', async (ctx) => {
             .text('📧 Email', 'EMAIL')
             .text('⏰ Schedule', 'SCHEDULE_SMS')
             .row()
-            .text('📋 Calls', 'CALLS')
-            .text('🧾 Threads', 'SMS_CONVO_HELP')
-            .row()
+            .text('📋 Calls', 'CALLS');
+
+        if (isOwner) {
+            kb.text('🧾 Threads', 'SMS_CONVO_HELP');
+        }
+
+        kb.row()
             .text('📜 SMS Status', 'SMS_STATUS_HELP')
             .text('📨 Email Status', 'EMAIL_STATUS_HELP')
             .row()
@@ -814,7 +827,7 @@ bot.on('callback_query:data', async (ctx) => {
 
         // Check admin permissions
         const isAdminUser = user.role === 'ADMIN';
-        const adminActions = ['ADDUSER', 'PROMOTE', 'REMOVE', 'USERS', 'STATUS', 'TEST_API', 'TEMPLATES', 'SMS_STATS', 'RECENT_SMS', 'PROVIDER_STATUS', 'BULK_SMS', 'BULK_EMAIL'];
+        const adminActions = ['ADDUSER', 'PROMOTE', 'REMOVE', 'USERS', 'STATUS', 'TEST_API', 'TEMPLATES', 'SMS_STATS', 'RECENT_SMS', 'SMS_CONVO_HELP', 'PROVIDER_STATUS', 'BULK_SMS', 'BULK_EMAIL'];
         const adminActionPrefixes = ['PROVIDER_SET:', 'EMAIL_BULK:'];
 
         const requiresAdmin = adminActions.includes(action) || adminActionPrefixes.some((prefix) => action.startsWith(prefix));
@@ -980,7 +993,7 @@ bot.on('callback_query:data', async (ctx) => {
 
         switch (action) {
             case 'HELP':
-                await executeHelpCommand(ctx);
+                await handleHelp(ctx);
                 break;
                 
             case 'USERS':
@@ -995,28 +1008,26 @@ bot.on('callback_query:data', async (ctx) => {
                 break;
                 
             case 'GUIDE':
-                await executeGuideCommand(ctx);
+                await handleGuide(ctx);
                 break;
                 
             case 'MENU':
-                await cancelActiveFlow(ctx, 'callback:MENU');
-                resetSession(ctx);
-                await executeMenuCommand(ctx, isAdminUser);
+                await handleMenu(ctx);
                 break;
                 
             case 'HEALTH':
-                await executeHealthCommand(ctx);
+                await handleHealthCommand(ctx);
                 break;
                 
             case 'STATUS':
                 if (isAdminUser) {
-                    await executeStatusCommand(ctx);
+                    await handleStatusCommand(ctx);
                 }
                 break;
 
             case 'TEST_API':
                 if (isAdminUser) {
-                    await executeTestApiCommand(ctx);
+                    await handleTestApiCommand(ctx);
                 }
                 break;
 
@@ -1084,97 +1095,7 @@ bot.on('callback_query:data', async (ctx) => {
     }
 });
 
-// Command execution functions for inline buttons
-async function executeHelpCommand(ctx) {
-    try {
-        // Check if user is authorized
-        const user = await new Promise(r => getUser(ctx.from.id, r));
-        if (!user) {
-            return ctx.reply('❌ You are not authorized to use this bot.');
-        }
-        const isOwner = await new Promise(r => isAdmin(ctx.from.id, r));
-        
-        // Build help text using HTML formatting (more reliable)
-        let helpText = `📱 <b>Basic Commands</b>
-• /start - Restart bot &amp; show main menu
-• /call - Start a new voice call
-• /sms - Send an SMS message
-• /email - Send an email message
-• /smsconversation &lt;phone&gt; - View SMS conversation
-• /emailstatus &lt;message_id&gt; - Check email delivery
-• /search &lt;term&gt; - Find calls by ID/phone/intent
-• /recent [limit] - List recent calls (max 50)
-• /health or /ping - Check bot &amp; API health
-• /guide - Show detailed usage guide
-• /menu - Show quick action buttons
-• /help - Show this help message`;
-        
-        if (isOwner) {
-            helpText += `
-            
-👑 <b>Admin Commands</b>
-• /adduser - Add new authorized user
-• /promote - Promote user to admin
-• /removeuser - Remove user access
-• /users - List all authorized users
-• /bulksms - Send bulk SMS messages
-• /bulkemail - Send bulk email messages
-• /schedulesms - Schedule SMS for later
-• /provider - View or switch call provider
-• /smsstats - View SMS statistics
-• /emailbulk - View bulk email job status
-• /templates - Manage call &amp; SMS templates
-• /status - Full system status check
-• /testapi - Test API connection`;
-        }
-        
-        helpText += `
-        
-📖 <b>Quick Usage</b>
-1. Use /call or click 📞 Call button
-2. Enter phone number (E.164 format: +1234567890)
-3. Define agent behavior/prompt
-4. Set initial message to be spoken
-5. Monitor call progress and receive notifications
-
-💡 <b>Examples</b>
-• Phone format: +1234567890 (not 123-456-7890)
-• Search calls: /search refund
-• List calls: /recent 20
-• Check health: /health
-        
-🆘 <b>Support &amp; Info</b>
-• Contact admin: @${config.admin.username}
-• Bot version: 2.0.0
-• For issues or questions, contact support`;
-        
-        const kb = new InlineKeyboard()
-        .text('📞 Call', 'CALL')
-        .text('📋 Menu', 'MENU')
-        .row()
-        .text('💬 SMS', 'SMS')
-        .text('📧 Email', 'EMAIL')
-        .row()
-        .text('📚 Guide', 'GUIDE');
-        
-        if (isOwner) {
-            kb.row()
-            .text('👥 Users', 'USERS')
-            .text('➕ Add', 'ADDUSER')
-            .row()
-            .text('☎️ Provider', 'PROVIDER_STATUS');
-        }
-        
-        await ctx.reply(helpText, {
-            parse_mode: 'HTML',
-            reply_markup: kb
-        });
-    } catch (error) {
-        console.error('Help command error:', error);
-        await ctx.reply('❌ Error displaying help. Please try again.');
-    }
-}
-
+// Command execution helpers for inline buttons
 async function executeUsersCommand(ctx) {
     try {
         const { getUserList } = require('./db/db');
@@ -1214,157 +1135,6 @@ async function executeUsersCommand(ctx) {
     } catch (error) {
         console.error('executeUsersCommand error:', error);
         await ctx.reply('❌ Error fetching users list. Please try again.');
-    }
-}
-
-async function executeGuideCommand(ctx) {
-    const mainGuide = `📚 *Voice Call Bot Guide*
-
-*Making Calls:*
-1️⃣ Start a call using /call or the Call button
-2️⃣ Enter phone number in E.164 format (+1234567890)
-3️⃣ Define the AI agent's behavior/personality
-4️⃣ Set the first message to be spoken
-5️⃣ Monitor the call progress
-
-*Phone Number Format:*
-• Must start with + symbol
-• Include country code
-• No spaces or special characters
-• Example: +1234567890
-
-*Best Practices:*
-• Keep agent prompts clear and specific
-• Test with short calls first
-• Monitor initial responses
-• End calls if needed
-
-*Troubleshooting:*
-• If call fails, check number format
-• Ensure proper authorization
-• Contact admin for persistent issues
-• Use /status to check bot health
-
-*Need Help?*
-Contact: @${config.admin.username} for support.
-Version: 2.0.0`;
-
-    const kb = new InlineKeyboard()
-        .text('📞 Call', 'CALL')
-        .text('📋 Commands', 'HELP')
-        .row()
-        .text('🔄 Menu', 'MENU')
-        .text('💬 SMS', 'SMS')
-        .row()
-        .text('📧 Email', 'EMAIL');
-
-    await ctx.reply(mainGuide, {
-        parse_mode: 'Markdown',
-        reply_markup: kb
-    });
-}
-
-async function executeMenuCommand(ctx, isAdminUser) {
-    const kb = new InlineKeyboard()
-        .text('📞 Call', 'CALL')
-        .text('💬 SMS', 'SMS')
-        .row()
-        .text('📧 Email', 'EMAIL')
-        .text('⏰ Schedule', 'SCHEDULE_SMS')
-        .row()
-        .text('📋 Calls', 'CALLS')
-        .text('🧾 Threads', 'SMS_CONVO_HELP')
-        .row()
-        .text('📜 SMS Status', 'SMS_STATUS_HELP')
-        .text('📨 Email Status', 'EMAIL_STATUS_HELP')
-        .row()
-        .text('📚 Guide', 'GUIDE')
-        .text('🏥 Health', 'HEALTH')
-        .row()
-        .text('ℹ️ Help', 'HELP');
-
-    if (isAdminUser) {
-        kb.row()
-            .text('📤 Bulk SMS', 'BULK_SMS')
-            .text('📧 Bulk Email', 'BULK_EMAIL')
-            .row()
-            .text('📊 SMS Stats', 'SMS_STATS')
-            .text('📥 Recent', 'RECENT_SMS')
-            .row()
-            .text('👥 Users', 'USERS')
-            .text('➕ Add', 'ADDUSER')
-            .row()
-            .text('⬆️ Promote', 'PROMOTE')
-            .text('❌ Remove', 'REMOVE')
-            .row()
-            .text('🧰 Templates', 'TEMPLATES')
-            .text('☎️ Provider', 'PROVIDER_STATUS')
-            .row()
-            .text('🔍 Status', 'STATUS')
-            .text('🧪 Test API', 'TEST_API');
-    }
-
-    const menuText = isAdminUser ? 
-        '🛡️ *Administrator Menu*\n\nSelect an action below:' :
-        '📋 *Quick Actions Menu*\n\nSelect an action below:';
-
-    await ctx.reply(menuText, {
-        parse_mode: 'Markdown',
-        reply_markup: kb
-    });
-}
-
-
-async function executeHealthCommand(ctx) {
-    const axios = require('axios');
-    
-    try {
-        const startTime = Date.now();
-        const response = await axios.get(`${config.apiUrl}/health`, {
-            timeout: 5000
-        });
-        const responseTime = Date.now() - startTime;
-        
-        const health = response.data;
-        
-        let message = `🏥 *Health Check*\n\n`;
-        message += `🤖 Bot: ✅ Responsive\n`;
-        message += `🌐 API: ${health.status === 'healthy' ? '✅' : '❌'} ${health.status}\n`;
-        message += `⚡ Response Time: ${responseTime}ms\n`;
-        message += `📊 Active Calls: ${health.active_calls || 0}\n`;
-        message += `⏰ Checked: ${new Date().toLocaleTimeString()}`;
-        
-        await ctx.reply(message, { parse_mode: 'Markdown' });
-    } catch (error) {
-        console.error('Health command error:', error);
-        await ctx.reply(`❌ *Health Check Failed*\n\nBot is online but API connection failed.\nError: ${error.message}`, { parse_mode: 'Markdown' });
-    }
-}
-
-async function executeStatusCommand(ctx) {
-    const axios = require('axios');
-    
-    try {
-        const response = await axios.get(`${config.apiUrl}/health`, {
-            timeout: 10000
-        });
-        
-        const health = response.data;
-        
-        let message = `🔍 *System Status*\n\n`;
-        message += `🤖 Bot: ✅ Online\n`;
-        message += `🌐 API: ${health.status === 'healthy' ? '✅' : '❌'} ${health.status}\n`;
-        message += `🗄️ Database: ${health.services?.database?.connected ? '✅ Connected' : '❌ Disconnected'}\n`;
-        message += `📊 Active Calls: ${health.active_calls || 0}\n`;
-        message += `📋 Recent Calls: ${health.services?.database?.recent_calls || 0}\n`;
-        message += `📡 Webhook Service: ${health.services?.webhook_service?.status || 'Unknown'}\n`;
-        message += `⏰ Last Check: ${new Date(health.timestamp).toLocaleString()}\n\n`;
-        message += `📡 API Endpoint: ${config.apiUrl}`;
-        
-        await ctx.reply(message, { parse_mode: 'Markdown' });
-    } catch (error) {
-        console.error('Status command error:', error);
-        await ctx.reply(`❌ *System Status Check Failed*\n\nError: ${error.message}`, { parse_mode: 'Markdown' });
     }
 }
 
@@ -1417,35 +1187,6 @@ async function executeRecentSmsCommand(ctx) {
     } catch (error) {
         console.error('Recent SMS callback error:', error);
         await ctx.reply('❌ Error fetching recent SMS messages.');
-    }
-}
-
-async function executeTestApiCommand(ctx) {
-    const axios = require('axios');
-    
-    try {
-        console.log('Testing API connection to:', config.apiUrl);
-        const response = await axios.get(`${config.apiUrl}/health`, {
-            timeout: 10000
-        });
-        
-        const health = response.data;
-        
-        let message = `✅ *API Status: ${health.status}*\n\n`;
-        message += `🔗 URL: ${config.apiUrl}\n`;
-        message += `📊 Active Calls: ${health.active_calls || 0}\n`;
-        message += `🗄️ Database: ${health.services?.database?.connected ? '✅ Connected' : '❌ Disconnected'}\n`;
-        message += `⏰ Timestamp: ${new Date(health.timestamp).toLocaleString()}`;
-        
-        // Add enhanced features info if available
-        if (health.enhanced_features) {
-            message += `\n🚀 Enhanced Features: ✅ Active`;
-        }
-        
-        await ctx.reply(message, { parse_mode: 'Markdown' });
-    } catch (error) {
-        console.error('API test failed:', error.message);
-        await ctx.reply(`❌ *API Test Failed*\n\nURL: ${config.apiUrl}\nError: ${error.message}`, { parse_mode: 'Markdown' });
     }
 }
 
@@ -1656,30 +1397,36 @@ async function executeProviderSwitchCommand(ctx, provider) {
 
 const TELEGRAM_COMMANDS = [
     { command: 'start', description: 'Start or restart the bot' },
+    { command: 'help', description: 'Show available commands' },
+    { command: 'menu', description: 'Show quick action menu' },
+    { command: 'guide', description: 'Show detailed usage guide' },
+    { command: 'health', description: 'Check bot and API health' },
     { command: 'call', description: 'Start outbound voice call' },
-    { command: 'sms', description: 'Send SMS message' },
-    { command: 'email', description: 'Send an email message' },
     { command: 'search', description: 'Search calls' },
     { command: 'recent', description: 'List recent calls' },
-    { command: 'smsconversation', description: 'View SMS conversation' },
+    { command: 'latency', description: 'Call latency breakdown' },
+    { command: 'version', description: 'Service version info' },
+    { command: 'digest', description: 'Daily call + notification digest' },
+    { command: 'sms', description: 'Send SMS message' },
+    { command: 'schedulesms', description: 'Schedule SMS message' },
+    { command: 'smsstatus', description: 'Check SMS delivery status' },
+    { command: 'smsconversation', description: 'View SMS conversation (admin only)' },
+    { command: 'recentsms', description: 'Recent SMS messages (admin only)' },
+    { command: 'smsstats', description: 'SMS statistics (admin only)' },
+    { command: 'email', description: 'Send an email message' },
     { command: 'emailstatus', description: 'Check email status' },
-    { command: 'guide', description: 'Show detailed usage guide' },
-    { command: 'help', description: 'Show available commands' },
-    { command: 'cancel', description: 'Cancel the current action' },
-    { command: 'menu', description: 'Show quick action menu' },
-    { command: 'health', description: 'Check bot and API health' },
     { command: 'bulksms', description: 'Send bulk SMS (admin only)' },
     { command: 'bulkemail', description: 'Send bulk email (admin only)' },
     { command: 'emailbulk', description: 'Bulk email status (admin only)' },
-    { command: 'schedulesms', description: 'Schedule SMS message' },
-    { command: 'provider', description: 'Manage call provider (admin only)' },
-    { command: 'smsstats', description: 'SMS statistics (admin only)' },
     { command: 'templates', description: 'Manage call & SMS templates (admin only)' },
+    { command: 'persona', description: 'Manage personas (admin only)' },
+    { command: 'provider', description: 'Manage call provider (admin only)' },
     { command: 'adduser', description: 'Add user (admin only)' },
     { command: 'promote', description: 'Promote to ADMIN (admin only)' },
     { command: 'removeuser', description: 'Remove a USER (admin only)' },
     { command: 'users', description: 'List authorized users (admin only)' },
-    { command: 'status', description: 'System status (admin only)' }
+    { command: 'status', description: 'System status (admin only)' },
+    { command: 'testapi', description: 'Test API connection (admin only)' }
 ];
 
 // Handle unknown commands and text messages

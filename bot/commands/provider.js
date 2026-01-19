@@ -1,7 +1,7 @@
 const axios = require('axios');
 const config = require('../config');
 const { getUser, isAdmin } = require('../db/db');
-const { buildLine, section, escapeMarkdown } = require('../utils/messageStyle');
+const { buildLine, section, escapeMarkdown } = require('../utils/commandFormat');
 
 const ADMIN_HEADER_NAME = 'x-admin-token';
 const SUPPORTED_PROVIDERS = ['twilio', 'aws', 'vonage'];

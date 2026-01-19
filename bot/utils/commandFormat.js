@@ -1,57 +1,65 @@
-const DEFAULT_PARSE_MODE = 'HTML';
+function normalizeReply(text, options = {}) {
+    const normalizedText = text === undefined || text === null ? '' : String(text);
+    const normalizedOptions = { ...options };
 
-const escapeHtml = (input = '') => {
-    if (input === null || input === undefined) return '';
-    return String(input)
-        .replace(/&/g, '&amp;')
-        .replace(/</g, '&lt;')
-        .replace(/>/g, '&gt;');
-};
-
-const formatCommandMessage = (text = '') => {
-    const safe = escapeHtml(text);
-    return safe
-        .replace(/\*([^*]+)\*/g, '<b>$1</b>')
-        .replace(/`([^`]+)`/g, '<code>$1</code>');
-};
-
-const normalizeReply = (text, options = {}) => {
-    if (options?.parse_mode === DEFAULT_PARSE_MODE) {
-        return { text, options };
-    }
-    const formatted = formatCommandMessage(text);
-    return {
-        text: formatted,
-        options: {
-            ...options,
-            parse_mode: DEFAULT_PARSE_MODE
+    if (!normalizedOptions.parse_mode) {
+        if (/<[^>]+>/.test(normalizedText)) {
+            normalizedOptions.parse_mode = 'HTML';
+        } else if (/[`*_]/.test(normalizedText)) {
+            normalizedOptions.parse_mode = 'Markdown';
         }
-    };
-};
-
-const logCommandError = (ctx, error, extra = {}) => {
-    const command = ctx?.message?.text?.split(' ')[0] || ctx?.callbackQuery?.data || 'unknown';
-    const payload = {
-        event: 'bot_command_error',
-        command,
-        user_id: ctx?.from?.id || null,
-        username: ctx?.from?.username || null,
-        chat_id: ctx?.chat?.id || null,
-        message: error?.message || 'unknown_error',
-        stack: error?.stack,
-        ...extra
-    };
-    try {
-        console.error(JSON.stringify(payload));
-    } catch (_) {
-        console.error('bot_command_error', payload);
     }
-};
+
+    return { text: normalizedText, options: normalizedOptions };
+}
+
+function logCommandError(ctx, error) {
+    const command = ctx.session?.lastCommand || ctx.message?.text || ctx.callbackQuery?.data || 'unknown';
+    const userId = ctx.from?.id || 'unknown';
+    const username = ctx.from?.username || 'unknown';
+    const message = error?.message || error;
+    console.error(`Command error (${command}) for user ${username} (${userId}):`, message);
+}
+
+function escapeMarkdown(text = '') {
+    return String(text).replace(/([_*[\]()`])/g, '\\$1');
+}
+
+function emphasize(text = '') {
+    return `*${text}*`;
+}
+
+function buildLine(icon, label, value) {
+    const safeLabel = label ? escapeMarkdown(label) : '';
+    const safeValue = value === undefined || value === null ? '' : String(value);
+    return `${icon} ${safeLabel ? `*${safeLabel}:* ` : ''}${safeValue}`;
+}
+
+function tipLine(icon, text) {
+    return `${icon} ${text}`;
+}
+
+function section(title, lines = []) {
+    const body = Array.isArray(lines) ? lines : [lines];
+    const cleaned = body.filter(Boolean);
+    const header = emphasize(title);
+    if (!cleaned.length) {
+        return header;
+    }
+    return `${header}\n${cleaned.join('\n')}`;
+}
+
+async function styledAlert(ctx, message, options = {}) {
+    return ctx.reply(section('⚠️ Notice', [message]), { parse_mode: 'Markdown', ...options });
+}
 
 module.exports = {
-    DEFAULT_PARSE_MODE,
-    escapeHtml,
-    formatCommandMessage,
     normalizeReply,
-    logCommandError
+    logCommandError,
+    escapeMarkdown,
+    emphasize,
+    buildLine,
+    tipLine,
+    section,
+    styledAlert
 };

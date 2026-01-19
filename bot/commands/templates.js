@@ -19,7 +19,7 @@ const {
   getCurrentOpId,
   guardAgainstCommandInterrupt
 } = require('../utils/sessionState');
-const { section, buildLine, tipLine } = require('../utils/messageStyle');
+const { section, buildLine, tipLine } = require('../utils/commandFormat');
 const { attachHmacAuth } = require('../utils/apiAuth');
 
 const templatesApi = axios.create({

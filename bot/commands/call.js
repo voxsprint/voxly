@@ -24,7 +24,7 @@ async function notifyCallError(ctx, lines = []) {
   const body = Array.isArray(lines) ? lines : [lines];
   await ctx.reply(section('❌ Call Alert', body));
 }
-const { section, escapeMarkdown, tipLine, buildLine } = require('../utils/messageStyle');
+const { section, escapeMarkdown, tipLine, buildLine } = require('../utils/commandFormat');
 
 const templatesApiBase = config.templatesApiUrl.replace(/\/+$/, '');
 const DEFAULT_FIRST_MESSAGE = 'Hello! This is an automated call. How can I help you today?';

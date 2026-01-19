@@ -26,7 +26,7 @@ const {
   buildLine,
   escapeMarkdown,
   emphasize
-} = require('../utils/messageStyle');
+} = require('../utils/commandFormat');
 
 const personaApi = axios.create({
   baseURL: config.apiUrl.replace(/\/+$/, ''),

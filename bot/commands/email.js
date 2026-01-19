@@ -8,7 +8,7 @@ const {
   registerAbortController,
   guardAgainstCommandInterrupt
 } = require('../utils/sessionState');
-const { section, buildLine, tipLine, escapeMarkdown, emphasize } = require('../utils/messageStyle');
+const { section, buildLine, tipLine, escapeMarkdown, emphasize } = require('../utils/commandFormat');
 const { askOptionWithButtons } = require('../utils/persona');
 
 function normalizeEmail(value) {

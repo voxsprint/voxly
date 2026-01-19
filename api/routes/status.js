@@ -30,52 +30,44 @@ class EnhancedWebhookService {
     this.liveConsoleMaxEvents = 5;
     this.liveConsoleMaxPreviewChars = 200;
     this.waveformFrames = [
-      '▁▁▂▁▁▁▁',
-      '▁▁▂▃▂▁▁',
-      '▁▂▃▄▃▂▁',
-      '▂▃▄▅▄▃▂',
-      '▂▄▅▆▅▄▂',
-      '▃▄▅▆▇▆▅',
-      '▄▅▆▇█▇▆',
-      '▅▆▇█▇▆▅',
-      '▄▅▆▇█▇▆',
-      '▃▄▅▆▇▆▅',
-      '▂▄▅▆▅▄▂',
-      '▂▃▄▅▄▃▂',
-      '▁▂▃▄▃▂▁',
-      '▁▁▂▃▂▁▁',
-      '▁▁▂▁▁▁▁'
+      '▁▂▁▂',
+      '▂▃▂▃',
+      '▃▄▃▄',
+      '▄▅▄▅',
+      '▅▆▅▆',
+      '▆▇▆▇',
+      '▇█▇█',
+      '▆▇▆▇',
+      '▅▆▅▆',
+      '▄▅▄▅',
+      '▃▄▃▄',
+      '▂▃▂▃',
+      '▁▂▁▂'
     ];
     this.waveformUserFrames = [
-      '▁▁▁▂▁▁▁',
-      '▁▁▂▃▂▁▁',
-      '▁▂▃▄▃▂▁',
-      '▂▃▄▅▄▃▂',
-      '▂▄▅▆▅▄▂',
-      '▃▄▅▆▇▆▅',
-      '▄▅▆▇█▇▆',
-      '▅▆▇█▇▆▅',
-      '▄▅▆▇█▇▆',
-      '▃▄▅▆▇▆▅',
-      '▂▄▅▆▅▄▂',
-      '▂▃▄▅▄▃▂',
-      '▁▂▃▄▃▂▁',
-      '▁▁▂▃▂▁▁',
-      '▁▁▁▂▁▁▁'
+      '▁▁▂▁',
+      '▁▂▃▂',
+      '▂▃▄▃',
+      '▂▄▅▄',
+      '▃▄▅▄',
+      '▂▄▅▄',
+      '▂▃▄▃',
+      '▁▂▃▂',
+      '▁▁▂▁'
     ];
     this.waveformListeningFrames = [
-      '▁▁▁▁▁▁▁',
-      '▁▁▂▁▁▂▁',
-      '▁▂▁▁▂▁▁',
-      '▂▁▁▂▁▁▂'
+      '▁▁▁▁',
+      '▁▂▁▂',
+      '▁▁▂▁'
     ];
-    this.waveformThinkingFrames = ['·   ', '··  ', '··· ', ' ···', '  ··', '   ·'];
-    this.waveformInterruptedFrames = ['▇▁▇▁▇▁▇', '▁▇▁▇▁▇▁', '▇▁▇▁▇▁▇', '█▁█▁█▁█'];
+    this.waveformThinkingFrames = ['·  ', '·· ', '···', ' ··', '  ·'];
+    this.waveformInterruptedFrames = ['▅▁▅▁', '▁▅▁▅', '▇▁▇▁', '█▁█▁'];
     this.signalCarrier = String(config.liveConsole?.carrier || 'VOICEDNUT LTE');
-    this.signalBarsMax = 4;
+    this.signalBarsMax = 5;
     this.signalBarFilled = '▮';
-    this.signalBarEmpty = '·';
-    this.signalBarGlyphs = ['▂', '▄', '▆', '█'];
+    this.signalBarEmpty = '░';
+    this.signalBarGlyphs = ['▂', '▄', '▆', '▇', '█'];
+    this.signalSmoothing = 0.35;
     this.lastSentimentAt = new Map();
     this.sentimentCooldownMs = 10000;
     this.mediaSeen = new Map();
@@ -144,7 +136,7 @@ class EnhancedWebhookService {
     const captureGroups = [
       {
         id: 'banking',
-        label: 'Banking',
+        label: 'Bank Info',
         fields: [
           { profiles: ['routing_number'], label: 'Routing Number' },
           { profiles: ['account_number'], label: 'Account Number' }
@@ -152,7 +144,7 @@ class EnhancedWebhookService {
       },
       {
         id: 'card',
-        label: 'Card',
+        label: 'Card Info',
         fields: [
           { profiles: ['card_number'], label: 'Card Number' },
           { profiles: ['card_expiry'], label: 'Expiry Date' },
@@ -1248,6 +1240,12 @@ class EnhancedWebhookService {
       script: meta.script || '—',
       waveformIndex: 0,
       waveformLevel: 0,
+      signalLevel: null,
+      jitterMs: null,
+      packetLossPct: null,
+      asrConfidence: null,
+      latencyMs: null,
+      lastWaveformLevel: null,
       sentimentFlag: '',
       compact: false
     };
@@ -1363,43 +1361,46 @@ class EnhancedWebhookService {
     }
   }
 
-  getSignalStrengthForPhase(phaseKey, level, index) {
-    const baseStrength = {
-      waiting: 2,
-      listening: 3,
-      user_speaking: 4,
-      thinking: 3,
-      agent_responding: 3,
-      agent_speaking: 4,
-      interrupted: 2,
-      ending: 2,
-      ended: 0
-    }[phaseKey] ?? 3;
+  getRawSignalLevel(entry) {
+    const phaseKey = entry?.phaseKey || 'waiting';
+    if (phaseKey === 'ended') return 0;
+    const metrics = this.getQualityMetrics(entry);
+    let level = 5;
+    if (metrics.jitterMs > 20) level -= 1;
+    if (metrics.latencyMs && metrics.latencyMs > 250) level -= 1;
+    if (metrics.packetLossPct > 1) level -= 1;
+    if (metrics.asrConfidence < 0.6) level -= 1;
 
-    const normalizedLevel = Number.isFinite(level) ? level : 0;
-    const audioBoost = Math.round(normalizedLevel * 2);
-    const wobble = Number.isFinite(index) ? (index % 3) - 1 : 0;
-    const strength = baseStrength + audioBoost + wobble;
-    return Math.max(0, Math.min(this.signalBarsMax, strength));
+    if (phaseKey === 'waiting') {
+      level = Math.min(level, 2);
+    } else if (phaseKey === 'ending') {
+      level = Math.min(level, 3);
+    }
+
+    return Math.max(0, Math.min(this.signalBarsMax, level));
+  }
+
+  getSmoothedSignalLevel(entry, rawLevel) {
+    const alpha = Number.isFinite(this.signalSmoothing) ? this.signalSmoothing : 0.35;
+    const safeRaw = Math.max(0, Math.min(this.signalBarsMax, Number(rawLevel) || 0));
+    const prev = Number.isFinite(entry?.signalLevel) ? entry.signalLevel : safeRaw;
+    const next = prev + (safeRaw - prev) * alpha;
+    entry.signalLevel = next;
+    return Math.max(0, Math.min(this.signalBarsMax, Math.round(next)));
   }
 
   formatSignalBars(strength) {
     const filled = Math.max(0, Math.min(this.signalBarsMax, Math.round(strength)));
-    const empty = Math.max(0, this.signalBarsMax - filled);
-    const bars = [];
-    for (let i = 0; i < filled; i += 1) {
-      const glyph = this.signalBarGlyphs[i] || this.signalBarFilled;
-      bars.push(glyph);
-    }
-    if (empty) {
-      bars.push(this.signalBarEmpty.repeat(empty));
-    }
+    const bars = this.signalBarGlyphs.map((glyph, index) => (
+      index < filled ? glyph : this.signalBarEmpty
+    ));
     return bars.join('');
   }
 
   buildSignalLine(entry) {
     const phaseKey = entry?.phaseKey || 'waiting';
-    const strength = this.getSignalStrengthForPhase(phaseKey, entry?.waveformLevel, entry?.waveformIndex);
+    const rawLevel = this.getRawSignalLevel(entry);
+    const strength = this.getSmoothedSignalLevel(entry, rawLevel);
     const bars = this.formatSignalBars(strength);
     const isEnded = phaseKey === 'ended';
     const isConnected = [
@@ -1411,7 +1412,8 @@ class EnhancedWebhookService {
       'interrupted',
       'ending'
     ].includes(phaseKey);
-    const badge = isEnded ? '🔴 OFFLINE' : (isConnected ? '🟢 LIVE' : '🟡 CONNECTING');
+    const liveBadge = strength >= 4 ? '🟢 LIVE' : (strength >= 2 ? '🟡 LIVE' : '🟠 LIVE');
+    const badge = isEnded ? '🔴 OFFLINE' : (isConnected ? liveBadge : '🟡 CONNECTING');
     return `📶 ${this.signalCarrier} ${bars} ${badge}`;
   }
 
@@ -1431,6 +1433,10 @@ class EnhancedWebhookService {
   }
 
   getLatencyMs(entry) {
+    const override = Number(entry?.latencyMs);
+    if (Number.isFinite(override)) {
+      return Math.max(60, Math.min(420, override));
+    }
     const phaseKey = entry?.phaseKey || 'waiting';
     if (phaseKey === 'ended') return null;
     const baseMap = {
@@ -1449,6 +1455,44 @@ class EnhancedWebhookService {
     const levelShift = Math.round((0.55 - level) * 18);
     const value = base + jitter + levelShift;
     return Math.max(60, Math.min(420, value));
+  }
+
+  getQualityMetrics(entry) {
+    const latencyMs = this.getLatencyMs(entry);
+    let jitterMs = Number(entry?.jitterMs);
+    if (!Number.isFinite(jitterMs)) {
+      const fallback = Number.isFinite(entry?.waveformIndex)
+        ? Math.abs(((entry.waveformIndex % 5) - 2) * 6)
+        : 0;
+      jitterMs = Math.max(0, Math.min(60, fallback));
+    }
+    let packetLossPct = Number(entry?.packetLossPct);
+    if (!Number.isFinite(packetLossPct)) {
+      packetLossPct = 0;
+    }
+    if (packetLossPct > 0 && packetLossPct < 1) {
+      packetLossPct *= 100;
+    }
+    let asrConfidence = Number(entry?.asrConfidence);
+    if (!Number.isFinite(asrConfidence)) {
+      asrConfidence = 0.75;
+    }
+    return {
+      latencyMs,
+      jitterMs,
+      packetLossPct,
+      asrConfidence
+    };
+  }
+
+  getQualityScore(entry) {
+    const metrics = this.getQualityMetrics(entry);
+    let score = 5;
+    if (metrics.jitterMs > 20) score -= 1;
+    if (metrics.latencyMs && metrics.latencyMs > 250) score -= 1;
+    if (metrics.packetLossPct > 1) score -= 1;
+    if (metrics.asrConfidence < 0.6) score -= 1;
+    return Math.max(0, Math.min(5, score));
   }
 
   formatLatencyLine(entry) {
@@ -1472,6 +1516,10 @@ class EnhancedWebhookService {
     if (/error|failed|timeout|no answer|busy|canceled|voicemail/.test(eventsText)) score += 2;
     if (/retry|transfer|interrupted/.test(eventsText)) score += 1;
     if (entry?.sentimentFlag) score += 1;
+
+    const qualityScore = this.getQualityScore(entry);
+    if (qualityScore <= 1) score += 2;
+    if (qualityScore <= 3) score += 1;
 
     if (score >= 3) return { emoji: '🚨', label: 'At risk', dropRisk: 'High' };
     if (score >= 2) return { emoji: '⚠️', label: 'Degraded', dropRisk: 'Medium' };
@@ -1558,9 +1606,27 @@ class EnhancedWebhookService {
     const phase = this.getConsolePhaseLabel(phaseKey);
     entry.phase = phase;
     entry.phaseKey = phaseKey;
+    const metrics = options.metrics || {};
+    if (Number.isFinite(options.latencyMs)) entry.latencyMs = Number(options.latencyMs);
+    if (Number.isFinite(metrics.latencyMs)) entry.latencyMs = Number(metrics.latencyMs);
+    if (Number.isFinite(options.jitterMs)) entry.jitterMs = Number(options.jitterMs);
+    if (Number.isFinite(metrics.jitterMs)) entry.jitterMs = Number(metrics.jitterMs);
+    if (Number.isFinite(options.packetLossPct)) entry.packetLossPct = Number(options.packetLossPct);
+    if (Number.isFinite(metrics.packetLossPct)) entry.packetLossPct = Number(metrics.packetLossPct);
+    if (Number.isFinite(options.asrConfidence)) entry.asrConfidence = Number(options.asrConfidence);
+    if (Number.isFinite(metrics.asrConfidence)) entry.asrConfidence = Number(metrics.asrConfidence);
     const frames = this.getWaveformFramesForPhase(phaseKey);
     if (frames && frames.length) {
       const level = this.clampLevel(options.level);
+      if (Number.isFinite(level)) {
+        const prevLevel = Number.isFinite(entry.lastWaveformLevel) ? entry.lastWaveformLevel : level;
+        const delta = Math.abs(level - prevLevel);
+        const derivedJitterMs = Math.round(delta * 80);
+        if (!Number.isFinite(entry.jitterMs)) {
+          entry.jitterMs = derivedJitterMs;
+        }
+        entry.lastWaveformLevel = level;
+      }
       entry.waveformLevel = level ?? entry.waveformLevel ?? 0;
       entry.waveformIndex = Number.isFinite(level)
         ? this.pickWaveformIndex(level, frames)

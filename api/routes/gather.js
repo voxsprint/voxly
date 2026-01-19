@@ -95,13 +95,16 @@ function createTwilioGatherHandler(deps = {}) {
           return null;
         }
       };
-      const respondWithGather = async (exp, promptText = '', followupText = '') => {
+      const respondWithGather = async (exp, promptText = '', followupText = '', options = {}) => {
         try {
           const promptForDelay = promptText
             || exp?.prompt
             || (digitService?.buildDigitPrompt ? digitService.buildDigitPrompt(exp) : '');
           if (digitService?.markDigitPrompted && exp) {
-            digitService.markDigitPrompted(callSid, null, 0, 'gather', { prompt_text: promptForDelay });
+            digitService.markDigitPrompted(callSid, null, 0, 'gather', {
+              prompt_text: promptForDelay,
+              reset_buffer: options.resetBuffer === true
+            });
           }
           const promptUrl = await resolveTtsUrl(promptText);
           const followupUrl = await resolveTtsUrl(followupText);
@@ -176,7 +179,8 @@ function createTwilioGatherHandler(deps = {}) {
       digitService?.clearDigitTimeout?.(callSid);
 
       const digits = String(Digits || '').trim();
-      const dedupeKey = digits ? `${callSid}:${digits}` : null;
+      const stepTag = expectation?.plan_id ? `${expectation.plan_id}:${expectation.plan_step_index || 'na'}` : 'no_plan';
+      const dedupeKey = digits ? `${callSid}:${stepTag}:${digits}` : null;
       if (dedupeKey) {
         const lastSeen = gatherEventDedupe?.get(dedupeKey);
         if (lastSeen && Date.now() - lastSeen < 2000) {
@@ -207,7 +211,15 @@ function createTwilioGatherHandler(deps = {}) {
           ? digitService.formatOtpForDisplay(digits, 'progress', expectation?.max_digits)
           : `Keypad (Gather): ${digits}`;
         webhookService?.addLiveEvent?.(callSid, `🔢 ${display}`, { force: true });
-        const collection = digitService.recordDigits(callSid, digits, { timestamp: Date.now(), source: 'gather' });
+        const attemptId = expectation?.attempt_id || null;
+        const collection = digitService.recordDigits(callSid, digits, {
+          timestamp: Date.now(),
+          source: 'gather',
+          full_input: true,
+          attempt_id: attemptId,
+          plan_id: expectation?.plan_id || null,
+          plan_step_index: expectation?.plan_step_index || null
+        });
         await digitService.handleCollectionResult(callSid, collection, null, 0, 'gather', { allowCallEnd: true, deferCallEnd: true });
 
         if (collection.accepted) {
@@ -268,7 +280,7 @@ function createTwilioGatherHandler(deps = {}) {
         clearPendingDigitReprompts?.(callSid);
         digitService.clearDigitTimeout(callSid);
         digitService.markDigitPrompted(callSid, null, 0, 'gather', { prompt_text: reprompt });
-        if (await respondWithGather(expectation, reprompt)) {
+        if (await respondWithGather(expectation, reprompt, '', { resetBuffer: true })) {
           return;
         }
         respondWithStream();
@@ -292,7 +304,7 @@ function createTwilioGatherHandler(deps = {}) {
             const prompt = digitService.buildPlanStepPrompt
               ? digitService.buildPlanStepPrompt(expectation)
               : (expectation.prompt || digitService.buildDigitPrompt(expectation));
-            if (await respondWithGather(expectation, prompt)) {
+            if (await respondWithGather(expectation, prompt, '', { resetBuffer: true })) {
               return;
             }
           }
@@ -304,11 +316,18 @@ function createTwilioGatherHandler(deps = {}) {
         if (digitService?.updatePlanState) {
           digitService.updatePlanState(callSid, plan, 'FAIL', { step_index: expectation?.plan_step_index, reason: 'timeout' });
         }
-        callConfig.digit_capture_active = false;
-        if (callConfig.call_mode === 'dtmf_capture') {
-          callConfig.call_mode = 'normal';
+        if (digitService?.setCaptureActive) {
+          digitService.setCaptureActive(callSid, false, { reason: 'timeout' });
+        } else {
+          callConfig.digit_capture_active = false;
+          if (callConfig.call_mode === 'dtmf_capture') {
+            callConfig.call_mode = 'normal';
+          }
+          callConfig.flow_state = 'normal';
+          callConfig.flow_state_reason = 'timeout';
+          callConfig.flow_state_updated_at = new Date().toISOString();
+          callConfigurations.set(callSid, callConfig);
         }
-        callConfigurations.set(callSid, callConfig);
         await respondWithHangup(timeoutMessage);
         return;
       }
@@ -333,7 +352,7 @@ function createTwilioGatherHandler(deps = {}) {
       clearPendingDigitReprompts?.(callSid);
       digitService.clearDigitTimeout(callSid);
       digitService.markDigitPrompted(callSid, null, 0, 'gather', { prompt_text: timeoutPrompt });
-      if (await respondWithGather(expectation, timeoutPrompt)) {
+      if (await respondWithGather(expectation, timeoutPrompt, '', { resetBuffer: true })) {
         return;
       }
       respondWithStream();

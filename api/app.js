@@ -108,10 +108,22 @@ function clearSilenceTimer(callSid) {
   }
 }
 
+function isCaptureActiveConfig(callConfig) {
+  if (!callConfig) return false;
+  const flowState = callConfig.flow_state;
+  if (flowState === 'capture_active' || flowState === 'capture_pending') {
+    return true;
+  }
+  if (callConfig.call_mode === 'dtmf_capture') {
+    return true;
+  }
+  return callConfig?.digit_intent?.mode === 'dtmf' && callConfig?.digit_capture_active === true;
+}
+
 function isCaptureActive(callSid) {
   if (!callSid) return false;
   const callConfig = callConfigurations.get(callSid);
-  return callConfig?.digit_intent?.mode === 'dtmf' && callConfig?.digit_capture_active === true;
+  return isCaptureActiveConfig(callConfig);
 }
 
 function resolveVoiceModel(callConfig) {
@@ -379,7 +391,8 @@ async function handlePendingDigitActions(callSid, actions = [], gptService, inte
       if (digitService) {
         digitService.markDigitPrompted(callSid, gptService, interactionCount, 'dtmf', {
           allowCallEnd: true,
-          prompt_text: action.text
+          prompt_text: action.text,
+          reset_buffer: true
         });
         if (action.scheduleTimeout) {
           digitService.scheduleDigitTimeout(callSid, gptService, interactionCount + 1);
@@ -647,7 +660,7 @@ function isGroupedGatherPlan(plan, callConfig = {}) {
   return provider === 'twilio'
     && ['banking', 'card'].includes(plan.group_id)
     && plan.capture_mode === 'ivr_gather'
-    && callConfig?.digit_capture_active === true;
+    && isCaptureActiveConfig(callConfig);
 }
 
 function startGroupedGather(callSid, callConfig, options = {}) {
@@ -665,6 +678,8 @@ function startGroupedGather(callSid, callConfig, options = {}) {
   const sayOptions = sayVoice ? { voice: sayVoice } : null;
   const delayMs = Math.max(0, Number.isFinite(options.delayMs) ? options.delayMs : 0);
   const preamble = options.preamble || '';
+  const gptService = options.gptService || null;
+  const interactionCount = Number.isFinite(options.interactionCount) ? options.interactionCount : 0;
   setTimeout(async () => {
     try {
       const activePlan = digitService.getPlan(callSid);
@@ -677,13 +692,30 @@ function startGroupedGather(callSid, callConfig, options = {}) {
       const ttsTimeoutMs = Number(config.twilio?.ttsMaxWaitMs) || 1200;
       const preambleUrl = usePlay ? await getTwilioTtsAudioUrlSafe(preamble, callConfig, ttsTimeoutMs) : null;
       const promptUrl = usePlay ? await getTwilioTtsAudioUrlSafe(prompt, callConfig, ttsTimeoutMs) : null;
-      await digitService.sendTwilioGather(callSid, activeExpectation, {
+      const sent = await digitService.sendTwilioGather(callSid, activeExpectation, {
         prompt,
         preamble,
         promptUrl,
         preambleUrl,
         sayOptions
       });
+      if (!sent) {
+        webhookService.addLiveEvent(callSid, '⚠️ Gather unavailable; using stream DTMF capture', { force: true });
+        digitService.markDigitPrompted(callSid, gptService, interactionCount, 'dtmf', {
+          allowCallEnd: true,
+          prompt_text: [preamble, prompt].filter(Boolean).join(' ')
+        });
+        if (gptService) {
+          const personalityInfo = gptService?.personalityEngine?.getCurrentPersonality?.();
+          gptService.emit('gptreply', {
+            partialResponseIndex: null,
+            partialResponse: [preamble, prompt].filter(Boolean).join(' '),
+            personalityInfo,
+            adaptationHistory: gptService?.personalityChanges?.slice(-3) || []
+          }, interactionCount);
+        }
+        digitService.scheduleDigitTimeout(callSid, gptService, interactionCount);
+      }
     } catch (err) {
       console.error('Grouped gather start error:', err);
     }
@@ -746,6 +778,9 @@ async function applyInitialDigitIntent(callSid, callConfig, gptService = null, i
     };
     if (existing.intent?.mode === 'dtmf' && callConfig.digit_capture_active !== true) {
       callConfig.digit_capture_active = true;
+      callConfig.flow_state = existing.expectation ? 'capture_active' : 'capture_pending';
+      callConfig.flow_state_reason = existing.intent?.reason || 'digit_intent';
+      callConfig.flow_state_updated_at = new Date().toISOString();
       callConfigurations.set(callSid, callConfig);
     }
     if (existing.intent?.mode === 'dtmf' && existing.expectation) {
@@ -761,9 +796,14 @@ async function applyInitialDigitIntent(callSid, callConfig, gptService = null, i
   callConfig.digit_intent = result.intent;
   if (result.intent?.mode === 'dtmf') {
     callConfig.digit_capture_active = true;
+    callConfig.flow_state = result.expectation ? 'capture_active' : 'capture_pending';
+    callConfig.flow_state_reason = result.intent?.reason || 'digit_intent';
   } else {
     callConfig.digit_capture_active = false;
+    callConfig.flow_state = 'normal';
+    callConfig.flow_state_reason = result.intent?.reason || 'no_signal';
   }
+  callConfig.flow_state_updated_at = new Date().toISOString();
   callConfigurations.set(callSid, callConfig);
   if (result.intent?.mode === 'dtmf' && Array.isArray(result.plan_steps) && result.plan_steps.length) {
     webhookService.addLiveEvent(callSid, formatDigitCaptureLabel(result.intent, result.expectation), { force: true });
@@ -2068,7 +2108,7 @@ app.ws('/connection', (ws, req) => {
               if (pendingDigitActions.length) {
                 await handlePendingDigitActions(callSid, pendingDigitActions, gptService, interactionCount);
               }
-              startGroupedGather(callSid, callConfig, { preamble: '' });
+              startGroupedGather(callSid, callConfig, { preamble: '', gptService, interactionCount });
             } else {
             await recordingService(ttsService, callSid);
             
@@ -2103,7 +2143,7 @@ app.ws('/connection', (ws, req) => {
                 }
                 webhookService.recordTranscriptTurn(callSid, 'agent', preamble);
               }
-              startGroupedGather(callSid, callConfig, { preamble });
+              startGroupedGather(callSid, callConfig, { preamble, gptService, interactionCount });
               scheduleSilenceTimer(callSid);
               isInitialized = true;
               if (pendingDigitActions.length) {
@@ -2163,7 +2203,12 @@ app.ws('/connection', (ws, req) => {
               digitService.scheduleDigitTimeout(callSid, gptService, 0);
             }
             scheduleSilenceTimer(callSid);
-            startGroupedGather(callSid, callConfig, { preamble: '', delayMs: estimateSpeechDurationMs(promptUsed) + 200 });
+            startGroupedGather(callSid, callConfig, {
+              preamble: '',
+              delayMs: estimateSpeechDurationMs(promptUsed) + 200,
+              gptService,
+              interactionCount
+            });
             
             isInitialized = true;
             if (pendingDigitActions.length) {
@@ -2180,7 +2225,7 @@ app.ws('/connection', (ws, req) => {
               if (pendingDigitActions.length) {
                 await handlePendingDigitActions(callSid, pendingDigitActions, gptService, interactionCount);
               }
-              startGroupedGather(callSid, callConfig, { preamble: '' });
+              startGroupedGather(callSid, callConfig, { preamble: '', gptService, interactionCount });
             } else {
             
             const initialExpectation = digitService?.getExpectation(callSid);
@@ -2214,7 +2259,7 @@ app.ws('/connection', (ws, req) => {
                 }
                 webhookService.recordTranscriptTurn(callSid, 'agent', preamble);
               }
-              startGroupedGather(callSid, callConfig, { preamble });
+              startGroupedGather(callSid, callConfig, { preamble, gptService, interactionCount });
               scheduleSilenceTimer(callSid);
               isInitialized = true;
               return;
@@ -2269,7 +2314,12 @@ app.ws('/connection', (ws, req) => {
               digitService.scheduleDigitTimeout(callSid, gptService, 0);
             }
             scheduleSilenceTimer(callSid);
-            startGroupedGather(callSid, callConfig, { preamble: '', delayMs: estimateSpeechDurationMs(promptUsed) + 200 });
+            startGroupedGather(callSid, callConfig, {
+              preamble: '',
+              delayMs: estimateSpeechDurationMs(promptUsed) + 200,
+              gptService,
+              interactionCount
+            });
             
             isInitialized = true;
             }
@@ -2301,7 +2351,7 @@ app.ws('/connection', (ws, req) => {
           if (digits) {
             clearSilenceTimer(callSid);
             const callConfig = callConfigurations.get(callSid);
-            const captureActive = callConfig?.digit_capture_active === true;
+            const captureActive = isCaptureActiveConfig(callConfig);
             let isDigitIntent = callConfig?.digit_intent?.mode === 'dtmf' || captureActive;
             if (!isDigitIntent && callConfig && digitService) {
               const hasExplicitDigitConfig = !!(
@@ -2320,10 +2370,20 @@ app.ws('/connection', (ws, req) => {
               return;
             }
             const expectation = digitService?.getExpectation(callSid);
+            const activePlan = digitService?.getPlan?.(callSid);
+            const planStepIndex = Number.isFinite(activePlan?.index)
+              ? activePlan.index + 1
+              : null;
             console.log(`Media DTMF for ${callSid}: ${maskDigitsForLog(digits)} (expectation ${expectation ? 'present' : 'missing'})`);
             if (!expectation) {
               if (digitService?.bufferDigits) {
-                digitService.bufferDigits(callSid, digits, { timestamp: Date.now(), source: 'dtmf', early: true });
+                digitService.bufferDigits(callSid, digits, {
+                  timestamp: Date.now(),
+                  source: 'dtmf',
+                  early: true,
+                  plan_id: activePlan?.id || null,
+                  plan_step_index: planStepIndex
+                });
               }
               webhookService.addLiveEvent(callSid, `🔢 Keypad: ${digits} (buffered early)`, { force: true });
               return;
@@ -2337,7 +2397,13 @@ app.ws('/connection', (ws, req) => {
               ? digitService.formatOtpForDisplay(digits, 'progress', activeExpectation?.max_digits)
               : `Keypad: ${digits}`;
             webhookService.addLiveEvent(callSid, `🔢 ${display}`, { force: true });
-            const collection = digitService.recordDigits(callSid, digits, { timestamp: Date.now() });
+            const collection = digitService.recordDigits(callSid, digits, {
+              timestamp: Date.now(),
+              source: 'dtmf',
+              attempt_id: activeExpectation?.attempt_id || null,
+              plan_id: activeExpectation?.plan_id || null,
+              plan_step_index: activeExpectation?.plan_step_index || null
+            });
             await digitService.handleCollectionResult(callSid, collection, gptService, interactionCount, 'dtmf', { allowCallEnd: true });
           }
         } else if (event === 'stop') {
@@ -2400,7 +2466,7 @@ app.ws('/connection', (ws, req) => {
 
       const callConfig = callConfigurations.get(callSid);
       const isDigitIntent = callConfig?.digit_intent?.mode === 'dtmf';
-      const captureActive = callConfig?.digit_capture_active === true;
+      const captureActive = isCaptureActiveConfig(callConfig);
       const otpContext = digitService.getOtpContext(text, callSid);
       console.log(`Customer: ${otpContext.maskedForLogs}`);
 
@@ -2433,7 +2499,14 @@ app.ws('/connection', (ws, req) => {
           activeExpectation?.max_digits
         );
         webhookService.addLiveEvent(callSid, `🔢 ${progress}`, { force: true });
-        const collection = digitService.recordDigits(callSid, otpContext.codes[otpContext.codes.length - 1], { timestamp: Date.now(), source: 'spoken' });
+        const collection = digitService.recordDigits(callSid, otpContext.codes[otpContext.codes.length - 1], {
+          timestamp: Date.now(),
+          source: 'spoken',
+          full_input: true,
+          attempt_id: activeExpectation?.attempt_id || null,
+          plan_id: activeExpectation?.plan_id || null,
+          plan_step_index: activeExpectation?.plan_step_index || null
+        });
         await digitService.handleCollectionResult(callSid, collection, gptService, interactionCount, 'spoken', { allowCallEnd: true });
       }
       if (captureActive) {
@@ -2663,7 +2736,7 @@ app.ws('/vonage/stream', async (ws, req) => {
       clearSilenceTimer(callSid);
       const callConfig = callConfigurations.get(callSid);
       const isDigitIntent = callConfig?.digit_intent?.mode === 'dtmf';
-      const captureActive = callConfig?.digit_capture_active === true;
+      const captureActive = isCaptureActiveConfig(callConfig);
       const otpContext = digitService.getOtpContext(text, callSid);
       try {
         await db.addTranscript({
@@ -2691,7 +2764,14 @@ app.ws('/vonage/stream', async (ws, req) => {
           activeExpectation?.max_digits
         );
         webhookService.addLiveEvent(callSid, `🔢 ${progress}`, { force: true });
-        const collection = digitService.recordDigits(callSid, otpContext.codes[otpContext.codes.length - 1], { timestamp: Date.now(), source: 'spoken' });
+        const collection = digitService.recordDigits(callSid, otpContext.codes[otpContext.codes.length - 1], {
+          timestamp: Date.now(),
+          source: 'spoken',
+          full_input: true,
+          attempt_id: activeExpectation?.attempt_id || null,
+          plan_id: activeExpectation?.plan_id || null,
+          plan_step_index: activeExpectation?.plan_step_index || null
+        });
         await digitService.handleCollectionResult(callSid, collection, gptService, interactionCount, 'spoken', { allowCallEnd: true });
       }
       if (captureActive) {
@@ -2851,7 +2931,7 @@ app.ws('/aws/stream', (ws, req) => {
       clearSilenceTimer(callSid);
       const session = await sessionPromise;
       const isDigitIntent = session?.callConfig?.digit_intent?.mode === 'dtmf';
-      const captureActive = session?.callConfig?.digit_capture_active === true;
+      const captureActive = isCaptureActiveConfig(session?.callConfig);
       const otpContext = digitService.getOtpContext(text, callSid);
       try {
         await db.addTranscript({
@@ -2880,7 +2960,14 @@ app.ws('/aws/stream', (ws, req) => {
           activeExpectation?.max_digits
         );
         webhookService.addLiveEvent(callSid, `🔢 ${progress}`, { force: true });
-        const collection = digitService.recordDigits(callSid, otpContext.codes[otpContext.codes.length - 1], { timestamp: Date.now(), source: 'spoken' });
+        const collection = digitService.recordDigits(callSid, otpContext.codes[otpContext.codes.length - 1], {
+          timestamp: Date.now(),
+          source: 'spoken',
+          full_input: true,
+          attempt_id: activeExpectation?.attempt_id || null,
+          plan_id: activeExpectation?.plan_id || null,
+          plan_step_index: activeExpectation?.plan_step_index || null
+        });
         await digitService.handleCollectionResult(callSid, collection, session.gptService, interactionCount, 'spoken', { allowCallEnd: true });
       }
       if (captureActive) {
@@ -3839,10 +3926,11 @@ async function placeOutboundCall(payload, hostOverride = null) {
     }
   }
 
+  const createdAt = new Date().toISOString();
   const callConfig = {
     prompt: prompt,
     first_message: first_message,
-    created_at: new Date().toISOString(),
+    created_at: createdAt,
     user_chat_id: user_chat_id,
     customer_name: customer_name || null,
     provider: currentProvider,
@@ -3863,7 +3951,11 @@ async function placeOutboundCall(payload, hostOverride = null) {
     collection_max_retries: collection_max_retries || null,
     collection_mask_for_gpt: collection_mask_for_gpt,
     collection_speak_confirmation: collection_speak_confirmation,
-    script_policy: scriptPolicy
+    script_policy: scriptPolicy,
+    flow_state: 'normal',
+    flow_state_updated_at: createdAt,
+    call_mode: 'normal',
+    digit_capture_active: false
   };
 
   callConfigurations.set(callId, callConfig);

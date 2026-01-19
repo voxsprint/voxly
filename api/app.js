@@ -547,6 +547,16 @@ async function applyInitialDigitIntent(callSid, callConfig, gptService = null, i
   } else {
     webhookService.addLiveEvent(callSid, `🗣️ Normal call flow (${result.intent?.reason || 'no_signal'})`, { force: true });
   }
+  if (result.intent?.mode === 'dtmf' && Array.isArray(result.plan_steps) && result.plan_steps.length) {
+    webhookService.addLiveEvent(callSid, `🧭 Digit capture plan started (${result.intent.group_id || 'group'})`, { force: true });
+    await digitService.requestDigitCollectionPlan(callSid, {
+      steps: result.plan_steps,
+      end_call_on_success: true,
+      group_id: result.intent.group_id,
+      capture_mode: 'ivr_gather'
+    }, gptService);
+    return result;
+  }
   if (result.intent?.mode === 'dtmf' && result.expectation) {
     try {
       await digitService.flushBufferedDigits(callSid, gptService, interactionCount, 'dtmf', { allowCallEnd: true });
@@ -3042,7 +3052,7 @@ app.post('/webhook/telegram', async (req, res) => {
   }
 });
 
-app.get('/webhook/vonage/answer', (req, res) => {
+const handleVonageAnswer = (req, res) => {
   const callSid = req.query.callSid;
   const wsUrl = `wss://${config.server.hostname}/vonage/stream?callSid=${callSid}`;
 
@@ -3058,9 +3068,9 @@ app.get('/webhook/vonage/answer', (req, res) => {
       ]
     }
   ]);
-});
+};
 
-app.post('/webhook/vonage/event', async (req, res) => {
+const handleVonageEvent = async (req, res) => {
   try {
     const { uuid, status, duration } = req.body || {};
     const callSid = req.query.callSid || (uuid ? vonageCallMap.get(uuid) : null) || uuid;
@@ -3095,7 +3105,13 @@ app.post('/webhook/vonage/event', async (req, res) => {
     console.error('Vonage webhook error:', error);
     res.status(200).send('OK');
   }
-});
+};
+
+app.get('/webhook/vonage/answer', handleVonageAnswer);
+app.get('/answer', handleVonageAnswer);
+
+app.post('/webhook/vonage/event', handleVonageEvent);
+app.post('/event', handleVonageEvent);
 
 app.post('/webhook/aws/status', async (req, res) => {
   try {
@@ -4966,13 +4982,26 @@ app.post('/webhook/twilio-gather', async (req, res) => {
     }
     console.log(`Gather webhook hit: callSid=${callSid} digits=${maskDigitsForLog(Digits || '')}`);
 
-    const expectation = digitService?.getExpectation(callSid);
+    let expectation = digitService?.getExpectation(callSid);
     if (!expectation) {
-      console.warn(`Gather webhook had no expectation; reconnecting stream for ${callSid}`);
+      const callConfig = callConfigurations.get(callSid) || {};
+      const groupId = digitService?.getLockedGroup ? digitService.getLockedGroup(callConfig) : null;
+      if (groupId && digitService?.requestDigitCollectionPlan) {
+        await digitService.requestDigitCollectionPlan(callSid, {
+          group_id: groupId,
+          steps: [],
+          end_call_on_success: true,
+          capture_mode: 'ivr_gather',
+          defer_twiml: true
+        });
+        expectation = digitService.getExpectation(callSid);
+      }
+    }
+    if (!expectation) {
+      console.warn(`Gather webhook had no expectation for ${callSid}`);
       const response = new VoiceResponse();
-      const host = resolveHost(req);
-      response.say('One moment please.');
-      response.connect().stream({ url: `wss://${host}/connection`, track: TWILIO_STREAM_TRACK });
+      response.say('We could not start digit capture. Goodbye.');
+      response.hangup();
       res.type('text/xml');
       res.end(response.toString());
       return;
@@ -5036,6 +5065,10 @@ app.post('/webhook/twilio-gather', async (req, res) => {
     const digits = String(Digits || '').trim();
     if (digits) {
       const expectation = digitService.getExpectation(callSid);
+      const plan = digitService?.getPlan ? digitService.getPlan(callSid) : null;
+      const hadPlan = !!expectation?.plan_id;
+      const planEndOnSuccess = plan ? plan.end_call_on_success !== false : true;
+      const planCompletionMessage = plan?.completion_message || '';
       const shouldEndOnSuccess = expectation?.end_call_on_success !== false;
       const display = expectation?.profile === 'verification'
         ? digitService.formatOtpForDisplay(digits, 'progress', expectation?.max_digits)
@@ -5047,14 +5080,22 @@ app.post('/webhook/twilio-gather', async (req, res) => {
       if (collection.accepted) {
         const nextExpectation = digitService.getExpectation(callSid);
         if (nextExpectation?.plan_id) {
-          const basePrompt = nextExpectation.prompt || digitService.buildDigitPrompt(nextExpectation);
-          const stepPrompt = nextExpectation.plan_total_steps
-            ? `Step ${nextExpectation.plan_step_index} of ${nextExpectation.plan_total_steps}. ${basePrompt}`
-            : basePrompt;
+          const stepPrompt = digitService.buildPlanStepPrompt
+            ? digitService.buildPlanStepPrompt(nextExpectation)
+            : (nextExpectation.prompt || digitService.buildDigitPrompt(nextExpectation));
           clearPendingDigitReprompts(callSid);
           digitService.clearDigitTimeout(callSid);
           digitService.markDigitPrompted(callSid, null, 0, 'gather', { prompt_text: stepPrompt });
           if (respondWithGather(nextExpectation, stepPrompt)) {
+            return;
+          }
+        } else if (hadPlan) {
+          clearPendingDigitReprompts(callSid);
+          const profile = expectation?.profile || collection.profile;
+          const completionMessage = planCompletionMessage
+            || (digitService?.buildClosingMessage ? digitService.buildClosingMessage(profile) : CLOSING_MESSAGE);
+          if (planEndOnSuccess) {
+            respondWithHangup(completionMessage);
             return;
           }
         } else if (shouldEndOnSuccess) {

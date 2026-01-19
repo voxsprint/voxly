@@ -43,6 +43,44 @@ const DEFAULT_CIRCUIT_BREAKER = {
   errorRate: 0.3,
   cooldownMs: 60000
 };
+const GROUP_MIN_SCORE = 2;
+const GROUP_MIN_CONFIDENCE = 0.75;
+const GROUP_KEYWORDS = {
+  banking: {
+    positive: {
+      strong: ['routing', 'aba', 'checking', 'savings'],
+      weak: ['bank account', 'account']
+    },
+    negative: ['card', 'cvv', 'expiry', 'expiration', 'zip']
+  },
+  card: {
+    positive: {
+      strong: ['card number', 'cvv', 'expiry', 'expiration', 'zip'],
+      weak: ['card', 'security code']
+    },
+    negative: ['routing', 'aba', 'checking', 'savings', 'bank account', 'account']
+  }
+};
+const DIGIT_CAPTURE_GROUPS = {
+  banking: {
+    id: 'banking',
+    label: 'Banking',
+    steps: [
+      { profile: 'routing_number' },
+      { profile: 'account_number' }
+    ]
+  },
+  card: {
+    id: 'card',
+    label: 'Card Details',
+    steps: [
+      { profile: 'card_number' },
+      { profile: 'card_expiry' },
+      { profile: 'zip' },
+      { profile: 'cvv' }
+    ]
+  }
+};
 
 const SUPPORTED_DIGIT_PROFILES = new Set([
   'generic',
@@ -141,6 +179,13 @@ function createDigitCollectionService(options = {}) {
     if (normalized === 'routing') normalized = 'routing_number';
     if (normalized === 'account_num') normalized = 'account_number';
     if (normalized === 'routing_num') normalized = 'routing_number';
+    if (normalized === 'expiry_date' || normalized === 'expiration_date' || normalized === 'exp_date' || normalized === 'expiry') {
+      normalized = 'card_expiry';
+    }
+    if (normalized === 'zip_code' || normalized === 'postal_code') normalized = 'zip';
+    if (normalized === 'cvc' || normalized === 'cvc2' || normalized === 'card_cvv' || normalized === 'security_code') {
+      normalized = 'cvv';
+    }
     if (REMOVED_DIGIT_PROFILES.has(normalized)) return 'generic';
     return normalized;
   }
@@ -394,6 +439,196 @@ function createDigitCollectionService(options = {}) {
     } catch (err) {
       logDigitMetric('audit_log_failed', { callSid, event: eventType, error: err.message });
     }
+  };
+
+  const normalizeGroupId = (value = '') => {
+    const raw = String(value || '').toLowerCase().trim();
+    if (!raw) return null;
+    if (['banking', 'bank', 'banking_group', 'bank_details', 'bank_account'].includes(raw)) return 'banking';
+    if (['card', 'card_details', 'card_group', 'payment_card', 'card_info'].includes(raw)) return 'card';
+    return null;
+  };
+
+  const resolveGroupFromProfile = (profile = '') => normalizeGroupId(profile);
+
+  const normalizeCaptureText = (text = '') => {
+    let normalized = String(text || '').toLowerCase();
+    normalized = normalized.replace(/[“”"']/g, '');
+    normalized = normalized.replace(/\bmm\s*[/\-]\s*yy\b/g, ' expiry ');
+    normalized = normalized.replace(/\bmm\s*yy\b/g, ' expiry ');
+    normalized = normalized.replace(/\bexp(?:iration)?\s*date?\b/g, ' expiry ');
+    normalized = normalized.replace(/\bsecurity code\b/g, ' cvv ');
+    normalized = normalized.replace(/\bcvc2?\b/g, ' cvv ');
+    normalized = normalized.replace(/\baba\b/g, ' routing ');
+    normalized = normalized.replace(/\brouting number\b/g, ' routing ');
+    normalized = normalized.replace(/\bchecking account\b/g, ' checking ');
+    normalized = normalized.replace(/\bsavings account\b/g, ' savings ');
+    normalized = normalized.replace(/\bzip code\b/g, ' zip ');
+    normalized = normalized.replace(/\bpostal code\b/g, ' zip ');
+    normalized = normalized.replace(/\baccount number\b/g, ' account ');
+    normalized = normalized.replace(/[^a-z0-9\s]/g, ' ');
+    normalized = normalized.replace(/\s+/g, ' ').trim();
+    return normalized;
+  };
+
+  const scoreGroupMatch = (normalizedText, groupId) => {
+    const config = GROUP_KEYWORDS[groupId];
+    if (!config || !normalizedText) {
+      return {
+        groupId,
+        score: 0,
+        confidence: 0,
+        matches: { strong: [], weak: [], negative: [] }
+      };
+    }
+    const matches = { strong: [], weak: [], negative: [] };
+    const addMatches = (keywords, bucket) => {
+      keywords.forEach((keyword) => {
+        if (!keyword) return;
+        if (normalizedText.includes(keyword)) {
+          matches[bucket].push(keyword);
+        }
+      });
+    };
+    addMatches(config.positive?.strong || [], 'strong');
+    addMatches(config.positive?.weak || [], 'weak');
+    addMatches(config.negative || [], 'negative');
+
+    const positiveScore = matches.strong.length * 2 + matches.weak.length;
+    const negativeScore = matches.negative.length * 1.5;
+    const total = positiveScore + negativeScore;
+    const confidence = total > 0 ? positiveScore / total : 0;
+    return {
+      groupId,
+      score: positiveScore,
+      confidence,
+      matches
+    };
+  };
+
+  const resolveGroupFromPrompt = (text = '') => {
+    const normalized = normalizeCaptureText(text);
+    if (!normalized) {
+      return { groupId: null, reason: 'empty_prompt', confidence: 0, matches: {} };
+    }
+    const bankingScore = scoreGroupMatch(normalized, 'banking');
+    const cardScore = scoreGroupMatch(normalized, 'card');
+    const candidates = [bankingScore, cardScore].filter((entry) => entry.score > 0);
+    const eligible = candidates.filter((entry) => entry.score >= GROUP_MIN_SCORE && entry.confidence >= GROUP_MIN_CONFIDENCE);
+    if (eligible.length === 1) {
+      return {
+        groupId: eligible[0].groupId,
+        reason: 'keyword_match',
+        confidence: eligible[0].confidence,
+        matches: eligible[0].matches
+      };
+    }
+    if (eligible.length > 1) {
+      return {
+        groupId: null,
+        reason: 'ambiguous',
+        confidence: Math.max(bankingScore.confidence, cardScore.confidence),
+        matches: { banking: bankingScore.matches, card: cardScore.matches }
+      };
+    }
+    if (candidates.length) {
+      return {
+        groupId: null,
+        reason: 'low_confidence',
+        confidence: Math.max(bankingScore.confidence, cardScore.confidence),
+        matches: { banking: bankingScore.matches, card: cardScore.matches }
+      };
+    }
+    return { groupId: null, reason: 'no_match', confidence: 0, matches: {} };
+  };
+
+  const resolveExplicitGroup = (callConfig = {}) => {
+    const strictSources = [
+      { value: callConfig.capture_group, source: 'capture_group' },
+      { value: callConfig.captureGroup, source: 'capture_group' },
+      { value: callConfig.digit_plan_id, source: 'digit_plan_id' },
+      { value: callConfig.digitPlanId, source: 'digit_plan_id' }
+    ];
+    for (const entry of strictSources) {
+      if (!entry.value) continue;
+      const normalized = normalizeGroupId(entry.value);
+      if (!normalized) {
+        return { provided: true, groupId: null, reason: 'invalid_explicit_group', source: entry.source };
+      }
+      return { provided: true, groupId: normalized, reason: 'explicit', source: entry.source };
+    }
+
+    const optionalSources = [
+      { value: callConfig.collection_profile, source: 'collection_profile' },
+      { value: callConfig.digit_profile_id, source: 'digit_profile_id' },
+      { value: callConfig.digitProfileId, source: 'digit_profile_id' },
+      { value: callConfig.digit_profile, source: 'digit_profile' }
+    ];
+    for (const entry of optionalSources) {
+      if (!entry.value) continue;
+      const normalized = normalizeGroupId(entry.value);
+      if (normalized) {
+        return { provided: true, groupId: normalized, reason: 'explicit', source: entry.source };
+      }
+    }
+    return { provided: false, groupId: null, reason: 'none', source: null };
+  };
+
+  const lockGroupForCall = (callSid, callConfig, groupId, reason, meta = {}) => {
+    if (!callSid || !callConfig || !groupId) return;
+    const current = normalizeGroupId(callConfig.capture_group || callConfig.captureGroup);
+    if (callConfig.group_locked && current && current !== groupId) {
+      logDigitMetric('group_lock_conflict', { callSid, current, next: groupId, reason });
+      return;
+    }
+    callConfig.capture_group = groupId;
+    callConfig.group_locked = true;
+    callConfig.capture_group_reason = reason;
+    callConfigurations.set(callSid, callConfig);
+    logDigitMetric('group_locked', {
+      callSid,
+      group: groupId,
+      reason,
+      confidence: meta.confidence || null,
+      matched_keywords: meta.matched_keywords || null
+    });
+  };
+
+  const applyGroupOverrides = (step = {}, callConfig = {}) => {
+    const overrides = {};
+    const timeout = Number(callConfig.collection_timeout_s);
+    if (Number.isFinite(timeout)) {
+      overrides.timeout_s = timeout;
+    }
+    const retries = Number(callConfig.collection_max_retries);
+    if (Number.isFinite(retries)) {
+      overrides.max_retries = retries;
+    }
+    if (typeof callConfig.collection_mask_for_gpt === 'boolean') {
+      overrides.mask_for_gpt = callConfig.collection_mask_for_gpt;
+    }
+    if (typeof callConfig.collection_speak_confirmation === 'boolean') {
+      overrides.speak_confirmation = callConfig.collection_speak_confirmation;
+    }
+    return { ...step, ...overrides };
+  };
+
+  const buildGroupPlanSteps = (groupId, callConfig = {}) => {
+    const group = DIGIT_CAPTURE_GROUPS[groupId];
+    if (!group) return [];
+    return group.steps.map((step) => applyGroupOverrides(step, callConfig));
+  };
+
+  const buildGroupIntent = (groupId, reason, callConfig = {}) => {
+    const steps = buildGroupPlanSteps(groupId, callConfig);
+    if (!steps.length) return null;
+    return {
+      mode: 'dtmf',
+      reason,
+      confidence: 0.98,
+      group_id: groupId,
+      plan_steps: steps
+    };
   };
 
   const buildCollectionFingerprint = (collection, expectation) => {
@@ -1747,13 +1982,18 @@ function createDigitCollectionService(options = {}) {
     const max = expectation?.max_digits || min;
     const host = hostname || config?.server?.hostname;
     const actionUrl = `https://${host}/webhook/twilio-gather?callSid=${encodeURIComponent(callSid)}`;
-    const gather = response.gather({
+    const gatherOptions = {
       input: 'dtmf',
       numDigits: max,
       timeout: Math.max(3, expectation?.timeout_s || 10),
       action: actionUrl,
-      method: 'POST'
-    });
+      method: 'POST',
+      actionOnEmptyResult: true
+    };
+    if (expectation?.allow_terminator) {
+      gatherOptions.finishOnKey = expectation?.terminator_char || '#';
+    }
+    const gather = response.gather(gatherOptions);
     const hasPromptOverride = Object.prototype.hasOwnProperty.call(options, 'prompt');
     const prompt = hasPromptOverride ? options.prompt : buildDigitPrompt(expectation);
     if (prompt) {
@@ -1763,6 +2003,18 @@ function createDigitCollectionService(options = {}) {
       response.say(options.followup);
     }
     return response.toString();
+  }
+
+  async function sendTwilioGather(callSid, expectation, options = {}, hostname) {
+    const provider = typeof getCurrentProvider === 'function' ? getCurrentProvider() : config?.platform?.provider;
+    if (provider && provider !== 'twilio') return false;
+    if (!config?.server?.hostname) return false;
+    if (!twilioClient || !config?.twilio?.accountSid || !config?.twilio?.authToken) return false;
+    const client = twilioClient(config.twilio.accountSid, config.twilio.authToken);
+    const twiml = buildTwilioGatherTwiml(callSid, expectation, options, hostname);
+    await client.calls(callSid).update({ twiml });
+    markDigitPrompted(callSid, null, 0, 'gather', { prompt_text: options.prompt || '' });
+    return true;
   }
 
   async function triggerTwilioGatherFallback(callSid, expectation, options = {}) {
@@ -1934,6 +2186,9 @@ function createDigitCollectionService(options = {}) {
     ).trim().toLowerCase();
     if (!rawProfile) return null;
     if (REMOVED_DIGIT_PROFILES.has(rawProfile)) return null;
+    if (normalizeGroupId(rawProfile)) {
+      return null;
+    }
     const profile = normalizeProfileId(rawProfile);
     if (!profile) return null;
     if (!isSupportedProfile(profile)) {
@@ -1997,6 +2252,25 @@ function createDigitCollectionService(options = {}) {
       });
     }
     return null;
+  }
+
+  function resolveLockedGroup(callConfig = {}) {
+    if (!callConfig) return null;
+    const locked = normalizeGroupId(callConfig.capture_group || callConfig.captureGroup);
+    if (callConfig.group_locked && locked) return locked;
+    const explicitStrict = normalizeGroupId(callConfig.capture_group || callConfig.captureGroup);
+    if (explicitStrict) return explicitStrict;
+    const explicitPlan = normalizeGroupId(callConfig.digit_plan_id || callConfig.digitPlanId);
+    if (explicitPlan) return explicitPlan;
+    const rawProfile = String(
+      callConfig.collection_profile
+        || callConfig.digit_profile_id
+        || callConfig.digitProfileId
+        || callConfig.digit_profile
+        || ''
+    ).trim().toLowerCase();
+    if (!rawProfile) return null;
+    return normalizeGroupId(rawProfile);
   }
 
   const MIN_INFER_CONFIDENCE = 0.65;
@@ -2178,6 +2452,33 @@ function createDigitCollectionService(options = {}) {
   }
 
   function determineDigitIntent(callSid, callConfig = {}) {
+    const explicitGroup = resolveLockedGroup(callConfig);
+    if (explicitGroup) {
+      lockGroupForCall(callSid, callConfig, explicitGroup, 'locked');
+      const intent = buildGroupIntent(explicitGroup, 'explicit_group', callConfig);
+      if (intent) {
+        return intent;
+      }
+    }
+    const explicitSelection = resolveExplicitGroup(callConfig);
+    if (explicitSelection.provided) {
+      if (!explicitSelection.groupId) {
+        logDigitMetric('group_invalid_explicit', { callSid, source: explicitSelection.source });
+        return { mode: 'normal', reason: 'invalid_group', confidence: 0 };
+      }
+      lockGroupForCall(callSid, callConfig, explicitSelection.groupId, explicitSelection.reason);
+      const intent = buildGroupIntent(explicitSelection.groupId, 'explicit_group', callConfig);
+      if (intent) {
+        logDigitMetric('group_selected', {
+          callSid,
+          group: explicitSelection.groupId,
+          reason: explicitSelection.reason,
+          confidence: 1,
+          matched_keywords: []
+        });
+        return intent;
+      }
+    }
     const explicitProfileRaw = callConfig.collection_profile
       || callConfig.digit_profile_id
       || callConfig.digitProfileId
@@ -2240,6 +2541,33 @@ function createDigitCollectionService(options = {}) {
       return { mode: 'normal', reason: 'no_prompt', confidence: 0 };
     }
 
+    const groupResolution = resolveGroupFromPrompt(text);
+    if (groupResolution.groupId) {
+      lockGroupForCall(callSid, callConfig, groupResolution.groupId, groupResolution.reason, {
+        confidence: groupResolution.confidence,
+        matched_keywords: groupResolution.matches
+      });
+      logDigitMetric('group_selected', {
+        callSid,
+        group: groupResolution.groupId,
+        reason: groupResolution.reason,
+        confidence: groupResolution.confidence,
+        matched_keywords: groupResolution.matches
+      });
+      const intent = buildGroupIntent(groupResolution.groupId, 'prompt_group', callConfig);
+      if (intent) return intent;
+    } else {
+      logDigitMetric('group_not_selected', {
+        callSid,
+        reason: groupResolution.reason,
+        confidence: groupResolution.confidence,
+        matched_keywords: groupResolution.matches
+      });
+      if (groupResolution.reason === 'ambiguous' || groupResolution.reason === 'low_confidence') {
+        return { mode: 'normal', reason: 'group_ambiguous', confidence: 0 };
+      }
+    }
+
     const inferred = inferDigitExpectationFromText(text, callConfig);
     if (inferred && (inferred.confidence || 0) >= MIN_INFER_CONFIDENCE) {
       return {
@@ -2258,12 +2586,12 @@ function createDigitCollectionService(options = {}) {
     logDigitMetric('intent_resolved', {
       callSid,
       mode: intent?.mode,
-      profile: intent?.expectation?.profile || null,
+      profile: intent?.expectation?.profile || intent?.group_id || null,
       reason: intent?.reason || null,
       confidence: intent?.confidence || 0
     });
     if (intent.mode !== 'dtmf' || !intent.expectation) {
-      return { intent, expectation: null };
+      return { intent, expectation: null, plan_steps: intent?.plan_steps || null };
     }
     const payload = normalizeDigitExpectation({
       ...intent.expectation,
@@ -2273,6 +2601,13 @@ function createDigitCollectionService(options = {}) {
     payload.reason = intent.reason || 'initial_intent';
     digitCollectionManager.setExpectation(callSid, payload);
     return { intent, expectation: payload };
+  }
+
+  function buildPlanStepPrompt(expectation = {}) {
+    const basePrompt = expectation.prompt || buildDigitPrompt(expectation);
+    return expectation.plan_total_steps
+      ? `Step ${expectation.plan_step_index} of ${expectation.plan_total_steps}. ${basePrompt}`
+      : basePrompt;
   }
 
   async function startNextDigitPlanStep(callSid, plan, gptService = null, interactionCount = 0) {
@@ -2323,11 +2658,9 @@ function createDigitCollectionService(options = {}) {
       return;
     }
 
-    const basePrompt = payload.prompt || buildDigitPrompt(payload);
-    const instruction = payload.plan_total_steps
-      ? `Step ${payload.plan_step_index} of ${payload.plan_total_steps}. ${basePrompt}`
-      : basePrompt;
+    const instruction = buildPlanStepPrompt(payload);
     const channel = payload.channel || plan.channel || 'dtmf';
+    const captureMode = plan.capture_mode || payload.capture_mode || null;
 
     if (channel === 'sms' && smsService) {
       const smsPrompt = buildSmsStepPrompt(payload);
@@ -2363,7 +2696,9 @@ function createDigitCollectionService(options = {}) {
         allowCallEnd: true,
         prompt_text: instruction
       });
-      scheduleDigitTimeout(callSid, gptService, interactionCount);
+      if (captureMode !== 'ivr_gather') {
+        scheduleDigitTimeout(callSid, gptService, interactionCount);
+      }
     }
   }
 
@@ -2381,6 +2716,16 @@ function createDigitCollectionService(options = {}) {
       args.end_call_on_success = true;
     }
     if (args.profile) {
+      const groupFromArg = normalizeGroupId(args.profile);
+      if (groupFromArg) {
+        const steps = buildGroupPlanSteps(groupFromArg, callConfigurations.get(callSid) || {});
+        return requestDigitCollectionPlan(callSid, {
+          steps,
+          end_call_on_success: true,
+          group_id: groupFromArg,
+          capture_mode: 'ivr_gather'
+        }, gptService);
+      }
       const normalizedProfile = normalizeProfileId(args.profile);
       if (!isSupportedProfile(normalizedProfile)) {
         logDigitMetric('profile_invalid_request', { profile: args.profile });
@@ -2390,6 +2735,26 @@ function createDigitCollectionService(options = {}) {
       }
     }
     const callConfig = callConfigurations.get(callSid);
+    const requestedGroup = resolveGroupFromProfile(args.profile);
+    if (requestedGroup) {
+      const steps = buildGroupPlanSteps(requestedGroup, callConfig || {});
+      return requestDigitCollectionPlan(callSid, {
+        steps,
+        end_call_on_success: true,
+        group_id: requestedGroup,
+        capture_mode: 'ivr_gather'
+      }, gptService);
+    }
+    const lockedGroup = resolveLockedGroup(callConfig || {});
+    if (lockedGroup) {
+      const steps = buildGroupPlanSteps(lockedGroup, callConfig || {});
+      return requestDigitCollectionPlan(callSid, {
+        steps,
+        end_call_on_success: true,
+        group_id: lockedGroup,
+        capture_mode: 'ivr_gather'
+      }, gptService);
+    }
     const lockedExpectation = resolveLockedExpectation(callConfig);
     if (lockedExpectation?.profile) {
       const requestedProfile = args.profile ? String(args.profile).toLowerCase() : null;
@@ -2464,7 +2829,11 @@ function createDigitCollectionService(options = {}) {
   }
 
   async function requestDigitCollectionPlan(callSid, args = {}, gptService = null) {
-    const steps = Array.isArray(args.steps) ? args.steps : [];
+    let steps = Array.isArray(args.steps) ? args.steps : [];
+    const groupFromArgs = normalizeGroupId(args.group_id);
+    if (!steps.length && groupFromArgs) {
+      steps = buildGroupPlanSteps(groupFromArgs, callConfigurations.get(callSid) || {});
+    }
     if (!steps.length) {
       return { error: 'No steps provided' };
     }
@@ -2477,12 +2846,27 @@ function createDigitCollectionService(options = {}) {
       await handleCircuitFallback(callSid, payload, true, false, 'system');
       return { error: 'circuit_open' };
     }
+    const callConfig = callConfigurations.get(callSid) || {};
+    let groupId = groupFromArgs;
+    if (groupId) {
+      const groupSteps = buildGroupPlanSteps(groupId, callConfig);
+      if (groupSteps.length) {
+        steps = groupSteps;
+      }
+    }
+    const lockedGroup = resolveLockedGroup(callConfig);
+    if (lockedGroup) {
+      const groupSteps = buildGroupPlanSteps(lockedGroup, callConfig);
+      if (groupSteps.length) {
+        steps = groupSteps;
+        groupId = lockedGroup;
+      }
+    }
     setCallDigitIntent(callSid, { mode: 'dtmf', reason: 'tool_plan', confidence: 1 });
     digitCollectionManager.expectations.delete(callSid);
     clearDigitTimeout(callSid);
     clearDigitFallbackState(callSid);
 
-    const callConfig = callConfigurations.get(callSid);
     const normalizedSteps = steps.map((step) => {
       const normalized = { ...step };
       if (normalized.profile) {
@@ -2531,11 +2915,14 @@ function createDigitCollectionService(options = {}) {
     const planEndOnSuccess = typeof args.end_call_on_success === 'boolean'
       ? args.end_call_on_success
       : true;
+    const captureMode = args.capture_mode || (groupId ? 'ivr_gather' : null);
     const plan = {
       id: `plan_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`,
       steps: stepsToUse,
       index: 0,
       active: true,
+      group_id: groupId,
+      capture_mode: captureMode,
       end_call_on_success: planEndOnSuccess,
       completion_message: typeof args.completion_message === 'string' ? args.completion_message.trim() : '',
       created_at: new Date().toISOString(),
@@ -2555,7 +2942,15 @@ function createDigitCollectionService(options = {}) {
       total_steps: stepsToUse.length
     }).catch(() => {});
 
-    await startNextDigitPlanStep(callSid, plan, gptService, 0);
+    const promptService = captureMode === 'ivr_gather' ? null : gptService;
+    await startNextDigitPlanStep(callSid, plan, promptService, 0);
+    if (plan.capture_mode === 'ivr_gather' && args.defer_twiml !== true) {
+      const currentExpectation = digitCollectionManager.expectations.get(callSid);
+      if (currentExpectation) {
+        const prompt = buildPlanStepPrompt(currentExpectation);
+        await sendTwilioGather(callSid, currentExpectation, { prompt });
+      }
+    }
     return { status: 'started', steps: stepsToUse.length };
   }
 
@@ -3155,6 +3550,7 @@ function createDigitCollectionService(options = {}) {
     expectations: digitCollectionManager.expectations,
     buildDigitPrompt,
     buildTwilioGatherTwiml,
+    buildPlanStepPrompt,
     clearCallState,
     clearDigitFallbackState,
     clearDigitPlan,
@@ -3178,6 +3574,15 @@ function createDigitCollectionService(options = {}) {
     recordDigits: (callSid, digits, meta) => digitCollectionManager.recordDigits(callSid, digits, meta),
     requestDigitCollection,
     requestDigitCollectionPlan,
+    getPlan: (callSid) => digitCollectionPlans.get(callSid),
+    getLockedGroup: resolveLockedGroup,
+    __test: {
+      normalizeCaptureText,
+      resolveGroupFromPrompt,
+      resolveExplicitGroup,
+      resolveLockedGroup,
+      scoreGroupMatch
+    },
     scheduleDigitTimeout,
     setExpectation: (callSid, params) => digitCollectionManager.setExpectation(callSid, params),
     isFallbackActive: (callSid) => digitFallbackStates.get(callSid)?.active === true,

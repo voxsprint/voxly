@@ -18,6 +18,7 @@ const { conversations, createConversation } = conversationsPkg;
 const axios = require('axios');
 const config = require('./config');
 const { attachHmacAuth } = require('./utils/apiAuth');
+const { normalizeReply, logCommandError } = require('./utils/commandFormat');
 
 const apiOrigins = new Set();
 try {
@@ -82,6 +83,46 @@ bot.use(async (ctx, next) => {
         ctx.session.currentOp = null;
     }
     return next();
+});
+
+// Normalize command replies to HTML formatting
+bot.use(async (ctx, next) => {
+    const isCommand = Boolean(
+        ctx.message?.text?.startsWith('/')
+        || ctx.callbackQuery?.data
+        || ctx.session?.lastCommand
+    );
+    if (!isCommand) {
+        return next();
+    }
+    const originalReply = ctx.reply.bind(ctx);
+    ctx.reply = (text, options = {}) => {
+        const normalized = normalizeReply(text, options);
+        return originalReply(normalized.text, normalized.options);
+    };
+    return next();
+});
+
+// Shared command wrapper for consistent error handling
+bot.use(async (ctx, next) => {
+    const isCommand = Boolean(
+        ctx.message?.text?.startsWith('/')
+        || ctx.callbackQuery?.data
+        || ctx.session?.lastCommand
+    );
+    if (!isCommand) {
+        return next();
+    }
+    try {
+        return await next();
+    } catch (error) {
+        logCommandError(ctx, error);
+        try {
+            await ctx.reply('⚠️ Sorry, something went wrong while handling that command. Please try again.');
+        } catch (replyError) {
+            console.error('Failed to send command fallback:', replyError);
+        }
+    }
 });
 
 // Operator/alert inline actions

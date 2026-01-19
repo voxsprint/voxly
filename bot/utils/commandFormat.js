@@ -21,6 +21,14 @@ function logCommandError(ctx, error) {
     console.error(`Command error (${command}) for user ${username} (${userId}):`, message);
 }
 
+function escapeHtml(text = '') {
+    if (text === null || text === undefined) return '';
+    return String(text)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;');
+}
+
 function escapeMarkdown(text = '') {
     return String(text).replace(/([_*[\]()`])/g, '\\$1');
 }
@@ -56,6 +64,7 @@ async function styledAlert(ctx, message, options = {}) {
 module.exports = {
     normalizeReply,
     logCommandError,
+    escapeHtml,
     escapeMarkdown,
     emphasize,
     buildLine,

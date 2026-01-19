@@ -201,7 +201,7 @@ async function handleSearchCommand(ctx) {
         const parts = ctx.message.text.split(/\s+/).slice(1);
         const query = parts.join(' ').trim();
         if (!query || query.length < 2) {
-            return ctx.reply('🔍 Usage: /search <term>');
+            return ctx.reply('🔍 <b>Usage:</b> <code>/search &lt;term&gt;</code>', { parse_mode: 'HTML' });
         }
 
         await ctx.reply(`🔍 Searching calls for “${query}”…`);
@@ -269,7 +269,7 @@ async function handleLatencyCommand(ctx) {
         const parts = ctx.message.text.split(/\s+/).slice(1);
         const callSid = parts[0];
         if (!callSid) {
-            return ctx.reply('⏱️ Usage: /latency <callSid>');
+            return ctx.reply('⏱️ <b>Usage:</b> <code>/latency &lt;callSid&gt;</code>', { parse_mode: 'HTML' });
         }
         const res = await axios.get(`${config.apiUrl}/api/calls/${callSid}/latency`, { timeout: 8000 });
         const lat = res.data?.latency_metrics || {};

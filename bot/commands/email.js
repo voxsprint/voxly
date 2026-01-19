@@ -717,8 +717,8 @@ function registerEmailCommands(bot) {
       const args = ctx.message?.text?.split(' ') || [];
       if (args.length < 2) {
         return ctx.reply(
-          '📧 *Usage:* `/emailstatus <message_id>`\n\nExample: `/emailstatus email_1234...`',
-          { parse_mode: 'Markdown' }
+          '📧 <b>Usage:</b> <code>/emailstatus &lt;message_id&gt;</code>\n\nExample: <code>/emailstatus email_1234...</code>',
+          { parse_mode: 'HTML' }
         );
       }
       const messageId = args[1].trim();
@@ -738,8 +738,8 @@ function registerEmailCommands(bot) {
       const args = ctx.message?.text?.split(' ') || [];
       if (args.length < 2) {
         return ctx.reply(
-          '📦 *Usage:* `/emailbulk <bulk_job_id>`\n\nExample: `/emailbulk bulk_1234...`',
-          { parse_mode: 'Markdown' }
+          '📦 <b>Usage:</b> <code>/emailbulk &lt;bulk_job_id&gt;</code>\n\nExample: <code>/emailbulk bulk_1234...</code>',
+          { parse_mode: 'HTML' }
         );
       }
       const jobId = args[1].trim();

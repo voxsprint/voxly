@@ -1071,17 +1071,26 @@ bot.on('callback_query:data', async (ctx) => {
                 break;
 
             case 'SMS_STATUS_HELP':
-                await ctx.reply('Use /smsstatus <message_sid> to check delivery status.\nExample: /smsstatus SM1234567890abcdef');
+                await ctx.reply(
+                    'Use <code>/smsstatus &lt;message_sid&gt;</code> to check delivery status.\nExample: <code>/smsstatus SM1234567890abcdef</code>',
+                    { parse_mode: 'HTML' }
+                );
                 break;
 
             case 'SMS_CONVO_HELP':
                 if (isAdminUser) {
-                    await ctx.reply('Use /smsconversation <phone_number> to view a thread.\nExample: /smsconversation +1234567890');
+                    await ctx.reply(
+                        'Use <code>/smsconversation &lt;phone_number&gt;</code> to view a thread.\nExample: <code>/smsconversation +1234567890</code>',
+                        { parse_mode: 'HTML' }
+                    );
                 }
                 break;
 
             case 'EMAIL_STATUS_HELP':
-                await ctx.reply('Use /emailstatus <message_id> to check email status.\nExample: /emailstatus email_1234...');
+                await ctx.reply(
+                    'Use <code>/emailstatus &lt;message_id&gt;</code> to check email status.\nExample: <code>/emailstatus email_1234...</code>',
+                    { parse_mode: 'HTML' }
+                );
                 break;
                 
             default:

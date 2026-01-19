@@ -1,7 +1,7 @@
 const { InlineKeyboard } = require('grammy');
 const config = require('../config');
 const { getUser } = require('../db/db');
-const { section, emphasize, buildLine, escapeMarkdown, tipLine } = require('../utils/commandFormat');
+const { escapeHtml } = require('../utils/commandFormat');
 
 async function handleGuide(ctx) {
     const user = await new Promise(r => getUser(ctx.from.id, r));
@@ -43,17 +43,19 @@ async function handleGuide(ctx) {
         'Use /status to validate system health'
     ];
 
+    const formatLines = (items) => items.map((item) => `• ${escapeHtml(item)}`).join('\n');
+
     const guideSections = [
-        emphasize('Voice Call Bot Guide — stylized steps for smooth operations.'),
-        section('Making Calls', callSteps),
-        section('Phone Number Rules', formatRules),
-        section('Best Practices', bestPractices),
-        section('Admin Controls', adminControls),
-        section('Troubleshooting', troubleshooting),
-        section('Need Help?', [
-            tipLine('🆘', `Contact: @${escapeMarkdown(config.admin.username)}`),
-            buildLine('🧭', 'Version', '1.0.0')
-        ])
+        `<b>${escapeHtml('Voice Call Bot Guide — stylized steps for smooth operations.')}</b>`,
+        `<b>Making Calls</b>\n${formatLines(callSteps)}`,
+        `<b>Phone Number Rules</b>\n${formatLines(formatRules)}`,
+        `<b>Best Practices</b>\n${formatLines(bestPractices)}`,
+        `<b>Admin Controls</b>\n${formatLines(adminControls)}`,
+        `<b>Troubleshooting</b>\n${formatLines(troubleshooting)}`,
+        `<b>Need Help?</b>\n${formatLines([
+            `🆘 Contact: @${escapeHtml(config.admin.username || '')}`,
+            '🧭 Version: 1.0.0'
+        ])}`
     ];
 
     const guideText = guideSections.join('\n\n');
@@ -68,7 +70,7 @@ async function handleGuide(ctx) {
         .text('🔄 Menu', 'MENU');
 
     await ctx.reply(guideText, {
-        parse_mode: 'Markdown',
+        parse_mode: 'HTML',
         reply_markup: kb
     });
 }

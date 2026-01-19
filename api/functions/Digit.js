@@ -2148,19 +2148,49 @@ function createDigitCollectionService(options = {}) {
       timeout: Math.max(3, expectation?.timeout_s || 10),
       action: actionUrl,
       method: 'POST',
-      actionOnEmptyResult: true
+      actionOnEmptyResult: true,
+      bargeIn: true
     };
     if (expectation?.allow_terminator) {
       gatherOptions.finishOnKey = expectation?.terminator_char || '#';
     }
+    const sayOptions = options?.sayOptions && typeof options.sayOptions === 'object'
+      ? options.sayOptions
+      : null;
+    const sayWithOptions = (node, text) => {
+      if (!text) return;
+      if (sayOptions) {
+        node.say(sayOptions, text);
+      } else {
+        node.say(text);
+      }
+    };
+    const playWithNode = (node, url) => {
+      if (!url) return;
+      node.play(url);
+    };
+    const preambleUrl = options.preambleUrl || options.preamble_url;
+    const promptUrl = options.promptUrl || options.prompt_url;
+    const followupUrl = options.followupUrl || options.followup_url;
+
+    if (preambleUrl) {
+      playWithNode(response, preambleUrl);
+    } else if (options.preamble) {
+      sayWithOptions(response, options.preamble);
+    }
+
     const gather = response.gather(gatherOptions);
     const hasPromptOverride = Object.prototype.hasOwnProperty.call(options, 'prompt');
     const prompt = hasPromptOverride ? options.prompt : buildDigitPrompt(expectation);
-    if (prompt) {
-      gather.say(prompt);
+    if (promptUrl) {
+      playWithNode(gather, promptUrl);
+    } else if (prompt) {
+      sayWithOptions(gather, prompt);
     }
-    if (options.followup) {
-      response.say(options.followup);
+    if (followupUrl) {
+      playWithNode(response, followupUrl);
+    } else if (options.followup) {
+      sayWithOptions(response, options.followup);
     }
     return response.toString();
   }
@@ -2173,7 +2203,8 @@ function createDigitCollectionService(options = {}) {
     const client = twilioClient(config.twilio.accountSid, config.twilio.authToken);
     const twiml = buildTwilioGatherTwiml(callSid, expectation, options, hostname);
     await client.calls(callSid).update({ twiml });
-    markDigitPrompted(callSid, null, 0, 'gather', { prompt_text: options.prompt || '' });
+    const promptText = [options?.preamble, options?.prompt].filter(Boolean).join(' ');
+    markDigitPrompted(callSid, null, 0, 'gather', { prompt_text: promptText });
     return true;
   }
 
@@ -2784,6 +2815,10 @@ function createDigitCollectionService(options = {}) {
     payload.plan_id = plan.id;
     payload.plan_step_index = plan.index + 1;
     payload.plan_total_steps = plan.steps.length;
+    if (plan?.capture_mode === 'ivr_gather' && ['banking', 'card'].includes(plan.group_id)) {
+      const baseRetries = Number.isFinite(payload.max_retries) ? payload.max_retries : 0;
+      payload.max_retries = Math.max(baseRetries, 3);
+    }
 
     if (isCircuitOpen()) {
       await handleCircuitFallback(callSid, payload, true, false, 'system');
@@ -3094,6 +3129,7 @@ function createDigitCollectionService(options = {}) {
       last_completed_step: null,
       last_completed_fingerprint: null,
       last_completed_at: null,
+      step_attempts: {},
       state: PLAN_STATES.INIT,
       state_updated_at: new Date().toISOString()
     };
@@ -3158,6 +3194,21 @@ function createDigitCollectionService(options = {}) {
           ? collection.attempt_count
           : (Number.isFinite(expectation?.attempt_count) ? expectation.attempt_count : (collection.retries || 1))
       );
+      const planId = expectation?.plan_id;
+      if (planId && expectation?.plan_step_index && digitCollectionPlans.has(callSid)) {
+        const plan = digitCollectionPlans.get(callSid);
+        if (plan?.id === planId) {
+          if (!plan.step_attempts || typeof plan.step_attempts !== 'object') {
+            plan.step_attempts = {};
+          }
+          const stepKey = expectation.plan_step_index;
+          const currentAttempt = Number(plan.step_attempts[stepKey] || 0);
+          if (attemptCount > currentAttempt) {
+            plan.step_attempts[stepKey] = attemptCount;
+            digitCollectionPlans.set(callSid, plan);
+          }
+        }
+      }
       const candidate = buildDigitCandidate(collection, expectation, resolvedSource);
       collection.confidence = candidate.confidence;
       collection.confidence_signals = candidate.signals;
@@ -3740,6 +3791,7 @@ function createDigitCollectionService(options = {}) {
     buildTimeoutPrompt,
     buildTwilioGatherTwiml,
     buildPlanStepPrompt,
+    sendTwilioGather,
     clearCallState,
     clearDigitFallbackState,
     clearDigitPlan,

@@ -1072,10 +1072,10 @@ function registerSmsCommands(bot) {
             const args = ctx.message.text.split(' ');
             if (args.length < 2) {
                 return ctx.reply(
-                    '📱 *Usage:* `/smsconversation <phone_number>`\n\n' +
-                    '**Example:** `/smsconversation +1234567890`\n\n' +
+                    '📱 <b>Usage:</b> <code>/smsconversation &lt;phone_number&gt;</code>\n\n' +
+                    '<b>Example:</b> <code>/smsconversation +1234567890</code>\n\n' +
                     'This will show the SMS conversation history with the specified phone number.',
-                    { parse_mode: 'Markdown' }
+                    { parse_mode: 'HTML' }
                 );
             }
             
@@ -1128,10 +1128,10 @@ function registerSmsCommands(bot) {
             const args = ctx.message.text.split(' ');
             if (args.length < 2) {
                 return ctx.reply(
-                    '📱 *Usage:* `/smsstatus <message_sid>`\n\n' +
-                    '**Example:** `/smsstatus SM1234567890abcdef`\n\n' +
+                    '📱 <b>Usage:</b> <code>/smsstatus &lt;message_sid&gt;</code>\n\n' +
+                    '<b>Example:</b> <code>/smsstatus SM1234567890abcdef</code>\n\n' +
                     'This will show the delivery status of a specific SMS message.',
-                    { parse_mode: 'Markdown' }
+                    { parse_mode: 'HTML' }
                 );
             }
 

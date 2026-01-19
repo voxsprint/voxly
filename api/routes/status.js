@@ -30,34 +30,30 @@ class EnhancedWebhookService {
     this.liveConsoleMaxEvents = 5;
     this.liveConsoleMaxPreviewChars = 200;
     this.waveformFrames = [
-      '▁▁▁▁▁▁▁▁▁',
-      '▁▁▁▁▂▁▁▁▁',
-      '▁▁▁▂▂▂▁▁▁',
-      '▁▁▂▂▃▂▂▁▁',
-      '▁▁▂▃▃▃▂▁▁',
-      '▁▂▃▃▄▃▃▂▁',
-      '▁▂▃▄▅▄▃▂▁',
-      '▂▃▄▅▅▅▄▃▂',
-      '▂▃▄▅▆▅▄▃▂',
-      '▃▄▅▆▆▆▅▄▃',
+      '▁▁▁▂▁▁▁▁▁',
+      '▁▁▂▃▂▁▁▁▁',
+      '▁▂▃▄▃▂▁▁▁',
+      '▂▃▄▅▄▃▂▁▁',
+      '▂▄▅▆▅▄▃▂▁',
       '▃▄▅▆▇▆▅▄▃',
-      '▄▅▆▇▇▇▆▅▄',
+      '▃▄▆▇█▇▆▄▃',
       '▄▅▆▇█▇▆▅▄',
-      '▅▆▇███▇▆▅',
-      '▆▇█████▇▆',
-      '▆▇██████▇',
-      '▇███████▇',
-      '▇████████',
-      '█████████',
-      '▇████████',
-      '▆▇██████▇',
-      '▆▇█████▇▆',
-      '▅▆▇███▇▆▅',
-      '▄▅▆▇█▇▆▅▄'
+      '▄▅▆▇▇▇▆▅▄',
+      '▃▄▅▆▇▆▅▄▃',
+      '▂▄▅▆▅▄▃▂▁',
+      '▂▃▄▅▄▃▂▁▁',
+      '▁▂▃▄▃▂▁▁▁',
+      '▁▁▂▃▂▁▁▁▁',
+      '▁▂▄▅▄▂▃▂▁',
+      '▂▄▅▆▅▄▃▂▂',
+      '▂▃▄▅▆▅▄▃▂',
+      '▁▂▃▄▅▄▃▂▁',
+      '▁▁▂▃▄▃▂▁▁',
+      '▁▁▁▂▃▂▁▁▁'
     ];
     this.waveformUserFrames = [
-      '▁▁▁▁▁▁▁▁▁',
-      '▁▁▁▂▁▂▁▁▁',
+      '▁▁▁▁▂▁▁▁▁',
+      '▁▁▁▂▂▂▁▁▁',
       '▁▁▂▃▂▃▂▁▁',
       '▁▂▃▄▃▄▃▂▁',
       '▂▃▄▅▄▅▄▃▂',
@@ -69,11 +65,23 @@ class EnhancedWebhookService {
       '▂▃▄▅▄▅▄▃▂',
       '▁▂▃▄▃▄▃▂▁',
       '▁▁▂▃▂▃▂▁▁',
-      '▁▁▁▂▁▂▁▁▁'
+      '▁▁▁▂▂▂▁▁▁',
+      '▁▁▁▁▂▁▁▁▁'
     ];
-    this.waveformListeningFrames = ['▁▁▁▁▁▁▁▁▁', '▁▁▁▂▁▁▁▂▁', '▁▁▂▁▁▂▁▁▂', '▁▂▁▁▂▁▁▂▁'];
+    this.waveformListeningFrames = [
+      '▁▁▁▁▁▁▁▁▁',
+      '▁▁▁▂▁▁▂▁▁',
+      '▁▁▂▁▁▂▁▁▂',
+      '▁▂▁▁▂▁▁▂▁',
+      '▂▁▁▂▁▁▂▁▁'
+    ];
     this.waveformThinkingFrames = ['·   ', '··  ', '··· ', ' ···', '  ··', '   ·'];
-    this.waveformInterruptedFrames = ['▇▁▇▁▇▁▇', '▁▇▁▇▁▇▁', '▇▁▇▁▇▁▇', '█▁█▁█▁█'];
+    this.waveformInterruptedFrames = ['▇▁▇▁▇▁▇▁▇', '▁▇▁▇▁▇▁▇▁', '▇▁▇▁▇▁▇▁▇', '█▁█▁█▁█▁█'];
+    this.signalCarrier = 'VOICEDNUT LTE';
+    this.signalBarsMax = 5;
+    this.signalBarFilled = '▮';
+    this.signalBarEmpty = '▁';
+    this.signalBarGlyphs = ['▂', '▄', '▆', '▇', '█'];
     this.lastSentimentAt = new Map();
     this.sentimentCooldownMs = 10000;
     this.mediaSeen = new Map();
@@ -1284,6 +1292,7 @@ class EnhancedWebhookService {
       agent_responding: '🤖 Agent responding…',
       agent_speaking: '🔊 Agent speaking…',
       interrupted: '✋ Interrupted',
+      ending: '👋 Ending…',
       ended: '—'
     };
     return map[phaseKey] || phaseKey || '—';
@@ -1356,6 +1365,58 @@ class EnhancedWebhookService {
       default:
         return null;
     }
+  }
+
+  getSignalStrengthForPhase(phaseKey, level, index) {
+    const baseStrength = {
+      waiting: 2,
+      listening: 3,
+      user_speaking: 4,
+      thinking: 3,
+      agent_responding: 3,
+      agent_speaking: 4,
+      interrupted: 2,
+      ending: 2,
+      ended: 0
+    }[phaseKey] ?? 3;
+
+    const normalizedLevel = Number.isFinite(level) ? level : 0;
+    const audioBoost = Math.round(normalizedLevel * 2);
+    const wobble = Number.isFinite(index) ? (index % 3) - 1 : 0;
+    const strength = baseStrength + audioBoost + wobble;
+    return Math.max(0, Math.min(this.signalBarsMax, strength));
+  }
+
+  formatSignalBars(strength) {
+    const filled = Math.max(0, Math.min(this.signalBarsMax, Math.round(strength)));
+    const empty = Math.max(0, this.signalBarsMax - filled);
+    const bars = [];
+    for (let i = 0; i < filled; i += 1) {
+      const glyph = this.signalBarGlyphs[i] || this.signalBarFilled;
+      bars.push(glyph);
+    }
+    if (empty) {
+      bars.push(this.signalBarEmpty.repeat(empty));
+    }
+    return bars.join('');
+  }
+
+  buildSignalLine(entry) {
+    const phaseKey = entry?.phaseKey || 'waiting';
+    const strength = this.getSignalStrengthForPhase(phaseKey, entry?.waveformLevel, entry?.waveformIndex);
+    const bars = this.formatSignalBars(strength);
+    const isEnded = phaseKey === 'ended';
+    const isConnected = [
+      'listening',
+      'user_speaking',
+      'thinking',
+      'agent_responding',
+      'agent_speaking',
+      'interrupted',
+      'ending'
+    ].includes(phaseKey);
+    const badge = isEnded ? '🔴 OFFLINE' : (isConnected ? '🟢 LIVE' : '🟡 CONNECTING');
+    return `📶 ${this.signalCarrier} ${bars}  ${badge}`;
   }
 
   consoleButtons(callSid, entry) {
@@ -1536,8 +1597,10 @@ class EnhancedWebhookService {
     }
     const sentimentLine = entry.sentimentFlag ? `Mood: ${entry.sentimentFlag}` : null;
     const recentBlock = events.length ? events.map((e) => `• ${e}`).join('\n') : '• (no events yet)';
+    const signalLine = this.buildSignalLine(entry);
 
     return [
+      signalLine,
       `🎧 Live Call • ${entry.status}`,
       `👤 ${entry.customerName} | 📞 ${entry.phoneNumber}`,
       entry.template && entry.template !== '—' ? `🧩 ${entry.template}` : null,

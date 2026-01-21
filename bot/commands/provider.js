@@ -1,10 +1,26 @@
 const config = require('../config');
 const httpClient = require('../utils/httpClient');
+const { InlineKeyboard } = require('grammy');
 const { getUser, isAdmin } = require('../db/db');
-const { buildLine, section, escapeMarkdown } = require('../utils/ui');
+const { buildLine, section, escapeMarkdown, renderMenu } = require('../utils/ui');
+const { buildCallbackData } = require('../utils/actions');
 
 const ADMIN_HEADER_NAME = 'x-admin-token';
 const SUPPORTED_PROVIDERS = ['twilio', 'aws', 'vonage'];
+const STATUS_CACHE_TTL_MS = 8000;
+const statusCache = {
+    value: null,
+    fetchedAt: 0
+};
+
+function normalizeProviders(status = {}) {
+    const supportedValues = Array.isArray(status.supported_providers) && status.supported_providers.length > 0
+        ? status.supported_providers
+        : SUPPORTED_PROVIDERS;
+    const supported = Array.from(new Set(supportedValues.map((item) => String(item).toLowerCase()))).filter(Boolean);
+    const active = typeof status.provider === 'string' ? status.provider.toLowerCase() : '';
+    return { supported, active };
+}
 
 function formatProviderStatus(status) {
     if (!status) {
@@ -32,7 +48,28 @@ function formatProviderStatus(status) {
     return section('⚙️ Call Provider Settings', details);
 }
 
-async function fetchProviderStatus() {
+function buildProviderKeyboard(ctx, activeProvider = '', supportedProviders = []) {
+    const keyboard = new InlineKeyboard();
+    const providers = supportedProviders.length ? supportedProviders : SUPPORTED_PROVIDERS;
+    providers.forEach((provider, index) => {
+        const normalized = provider.toLowerCase();
+        const isActive = normalized === activeProvider;
+        const label = isActive ? `✅ ${normalized.toUpperCase()}` : normalized.toUpperCase();
+        keyboard.text(label, buildCallbackData(ctx, `PROVIDER_SET:${normalized}`));
+
+        const shouldInsertRow = index % 2 === 1 && index < providers.length - 1;
+        if (shouldInsertRow) {
+            keyboard.row();
+        }
+    });
+    keyboard.row().text('🔄 Refresh', buildCallbackData(ctx, 'PROVIDER_STATUS'));
+    return keyboard;
+}
+
+async function fetchProviderStatus({ force = false } = {}) {
+    if (!force && statusCache.value && Date.now() - statusCache.fetchedAt < STATUS_CACHE_TTL_MS) {
+        return statusCache.value;
+    }
     const response = await httpClient.get(null, `${config.apiUrl}/admin/provider`, {
         timeout: 10000,
         headers: {
@@ -40,7 +77,20 @@ async function fetchProviderStatus() {
             'Content-Type': 'application/json',
         },
     });
+    statusCache.value = response.data;
+    statusCache.fetchedAt = Date.now();
     return response.data;
+}
+
+function formatProviderError(error, actionLabel) {
+    if (error.response) {
+        const details = error.response.data?.details || error.response.data?.error || error.response.statusText;
+        return `❌ Failed to ${actionLabel}: ${escapeMarkdown(details || 'Unknown error')}`;
+    }
+    if (error.request) {
+        return '❌ No response from provider API. Please check the server.';
+    }
+    return `❌ Error: ${escapeMarkdown(error.message || 'Unknown error')}`;
 }
 
 async function updateProvider(provider) {
@@ -57,6 +107,37 @@ async function updateProvider(provider) {
         }
     );
     return response.data;
+}
+
+async function renderProviderMenu(ctx, { status, notice, forceRefresh = false } = {}) {
+    try {
+        let resolvedStatus = status;
+        let cachedNotice = null;
+        if (!resolvedStatus) {
+            try {
+                resolvedStatus = await fetchProviderStatus({ force: forceRefresh });
+            } catch (error) {
+                if (statusCache.value) {
+                    resolvedStatus = statusCache.value;
+                    cachedNotice = '⚠️ Showing cached provider status (API unavailable).';
+                } else {
+                    throw error;
+                }
+            }
+        }
+        const { supported, active } = normalizeProviders(resolvedStatus);
+        const keyboard = buildProviderKeyboard(ctx, active, supported);
+        let message = formatProviderStatus(resolvedStatus);
+        const notices = [notice, cachedNotice].filter(Boolean);
+        if (notices.length) {
+            message = `${notices.join('\n')}\n\n${message}`;
+        }
+        message += '\n\nTap a provider below to switch.';
+        await renderMenu(ctx, message, keyboard, { parseMode: 'Markdown' });
+    } catch (error) {
+        console.error('Provider status command error:', error);
+        await ctx.reply(formatProviderError(error, 'fetch provider status'));
+    }
 }
 
 async function ensureAuthorizedAdmin(ctx) {
@@ -82,18 +163,29 @@ async function ensureAuthorizedAdmin(ctx) {
 }
 
 async function handleProviderSwitch(ctx, requestedProvider) {
-    await ctx.reply(`🛠 Switching call provider to *${requestedProvider.toUpperCase()}*...`, { parse_mode: 'Markdown' });
+    try {
+        const status = await fetchProviderStatus();
+        const { supported } = normalizeProviders(status);
+        const normalized = String(requestedProvider || '').toLowerCase();
+        if (!normalized || !supported.includes(normalized)) {
+            const options = supported.map((item) => `• /provider ${item}`).join('\n');
+            await ctx.reply(
+                `❌ Unsupported provider "${escapeMarkdown(requestedProvider || '')}".\n\nUsage:\n• /provider status\n${options}`
+            );
+            return;
+        }
 
-    const result = await updateProvider(requestedProvider);
-    const status = await fetchProviderStatus();
-
-    const baseLine = result.changed === false
-        ? `ℹ️ Provider already set to *${status.provider?.toUpperCase() || requestedProvider.toUpperCase()}*.`
-        : `✅ Call provider set to *${status.provider?.toUpperCase() || requestedProvider.toUpperCase()}*.`;
-
-    const payload = `${baseLine}\n\n${formatProviderStatus(status)}`;
-
-    await ctx.reply(payload, { parse_mode: 'Markdown' });
+        const result = await updateProvider(normalized);
+        const refreshed = await fetchProviderStatus({ force: true });
+        const activeLabel = (refreshed.provider || normalized).toUpperCase();
+        const notice = result.changed === false
+            ? `ℹ️ Provider already set to *${activeLabel}*.`
+            : `✅ Call provider set to *${activeLabel}*.`;
+        await renderProviderMenu(ctx, { status: refreshed, notice });
+    } catch (error) {
+        console.error('Provider switch command error:', error);
+        await ctx.reply(formatProviderError(error, 'update provider'));
+    }
 }
 
 function registerProviderCommand(bot) {
@@ -108,35 +200,15 @@ function registerProviderCommand(bot) {
         }
 
         try {
-            const status = await fetchProviderStatus();
-            const supported = Array.isArray(status?.supported_providers) && status.supported_providers.length > 0
-                ? status.supported_providers.map((item) => item.toLowerCase())
-                : SUPPORTED_PROVIDERS;
-
             if (!requestedAction || requestedAction === 'status') {
-                await ctx.reply(formatProviderStatus(status), { parse_mode: 'Markdown' });
-                return;
-            }
-
-            if (!supported.includes(requestedAction)) {
-                const options = supported.map((item) => `• /provider ${item}`).join('\n');
-                await ctx.reply(
-                    `❌ Unsupported provider "${requestedAction}".\n\nUsage:\n• /provider status\n${options}`
-                );
+                await renderProviderMenu(ctx, { forceRefresh: true });
                 return;
             }
 
             await handleProviderSwitch(ctx, requestedAction);
         } catch (error) {
             console.error('Failed to manage provider via Telegram command:', error);
-            if (error.response) {
-                const details = error.response.data?.details || error.response.data?.error || error.response.statusText;
-                await ctx.reply(`❌ Failed to update provider: ${escapeMarkdown(details || 'Unknown error')}`);
-            } else if (error.request) {
-                await ctx.reply('❌ No response from API. Please check the server status.');
-            } else {
-                await ctx.reply(`❌ Error: ${error.message}`);
-            }
+            await ctx.reply(formatProviderError(error, 'update provider'));
         }
     });
 }
@@ -151,5 +223,7 @@ module.exports.fetchProviderStatus = fetchProviderStatus;
 module.exports.updateProvider = updateProvider;
 module.exports.formatProviderStatus = formatProviderStatus;
 module.exports.handleProviderSwitch = handleProviderSwitch;
+module.exports.renderProviderMenu = renderProviderMenu;
+module.exports.buildProviderKeyboard = buildProviderKeyboard;
 module.exports.SUPPORTED_PROVIDERS = SUPPORTED_PROVIDERS;
 module.exports.ADMIN_HEADER_NAME = ADMIN_HEADER_NAME;

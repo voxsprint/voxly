@@ -1,5 +1,6 @@
 const config = require('../config');
 const httpClient = require('../utils/httpClient');
+const { InlineKeyboard } = require('grammy');
 const { getUser, isAdmin } = require('../db/db');
 const {
     startOperation,
@@ -23,10 +24,322 @@ const {
     extractScriptVariables,
     SCRIPT_METADATA
 } = require('../utils/scripts');
-const { section: formatSection, buildLine, tipLine } = require('../utils/ui');
+const { section: formatSection, buildLine, tipLine, renderMenu, escapeMarkdown } = require('../utils/ui');
+const { buildCallbackData } = require('../utils/actions');
+const { getAccessProfile } = require('../utils/capabilities');
 
 async function smsAlert(ctx, text) {
     await ctx.reply(formatSection('⚠️ SMS Alert', [text]));
+}
+
+function buildBackToMenuKeyboard(ctx, action = 'SMS', label = '⬅️ Back to SMS Menu') {
+    return new InlineKeyboard().text(label, buildCallbackData(ctx, action));
+}
+
+async function maybeSendSmsAliasTip(ctx) {
+    if (!ctx.session) return;
+    ctx.session.hints = ctx.session.hints || {};
+    if (ctx.session.hints.smsMenuTipSent) return;
+    ctx.session.hints.smsMenuTipSent = true;
+    await ctx.reply('ℹ️ Tip: /sms is now the single entry point for all SMS actions.');
+}
+
+function formatSmsStatusMessage(msg = {}) {
+    const bodyPreview = msg.body ? escapeMarkdown(msg.body.substring(0, 100)) : '—';
+    const aiPreview = msg.ai_response ? escapeMarkdown(msg.ai_response.substring(0, 100)) : null;
+    let statusText =
+        `📱 *SMS Status Report*\n\n` +
+        `🆔 **Message SID:** \`${escapeMarkdown(msg.message_sid || '—')}\`\n` +
+        `📞 **To:** ${escapeMarkdown(msg.to_number || 'N/A')}\n` +
+        `📤 **From:** ${escapeMarkdown(msg.from_number || 'N/A')}\n` +
+        `📊 **Status:** ${escapeMarkdown(msg.status || 'unknown')}\n` +
+        `📅 **Created:** ${escapeMarkdown(new Date(msg.created_at || Date.now()).toLocaleString())}\n` +
+        `🔄 **Updated:** ${escapeMarkdown(new Date(msg.updated_at || Date.now()).toLocaleString())}\n` +
+        `📝 **Message:** ${bodyPreview}${msg.body && msg.body.length > 100 ? '…' : ''}\n`;
+
+    if (msg.error_code || msg.error_message) {
+        statusText += `\n❌ **Error:** ${escapeMarkdown(String(msg.error_code || ''))} - ${escapeMarkdown(msg.error_message || '')}`;
+    }
+    if (aiPreview) {
+        statusText += `\n🤖 **AI Response:** ${aiPreview}${msg.ai_response.length > 100 ? '…' : ''}`;
+    }
+    return statusText;
+}
+
+function buildSmsMenuKeyboard(ctx, isAdminUser) {
+    const keyboard = new InlineKeyboard()
+        .text('✉️ Send SMS', buildCallbackData(ctx, 'SMS_SEND'))
+        .text('⏰ Schedule SMS', buildCallbackData(ctx, 'SMS_SCHEDULE'))
+        .row()
+        .text('📬 Delivery Status', buildCallbackData(ctx, 'SMS_STATUS'));
+
+    if (isAdminUser) {
+        keyboard
+            .text('🧾 Conversation', buildCallbackData(ctx, 'SMS_CONVO'))
+            .row()
+            .text('🕒 Recent SMS', buildCallbackData(ctx, 'SMS_RECENT'))
+            .text('📊 SMS Stats', buildCallbackData(ctx, 'SMS_STATS'));
+    }
+
+    return keyboard;
+}
+
+async function renderSmsMenu(ctx) {
+    const access = await getAccessProfile(ctx);
+    const isAdminUser = access.isAdmin;
+    startOperation(ctx, 'sms-menu');
+    const keyboard = buildSmsMenuKeyboard(ctx, isAdminUser);
+    const title = access.user ? '💬 *SMS Center*' : '🔒 *SMS Center (Access limited)*';
+    const lines = [
+        'Choose an SMS action below.',
+        isAdminUser ? 'Admin tools are included.' : 'Admin-only tools are hidden.',
+        access.user ? 'Authorized access enabled.' : 'Limited access: request approval to send messages.',
+        access.user ? '' : '🔒 Actions are locked without approval.'
+    ].filter(Boolean);
+    await renderMenu(ctx, `${title}\n${lines.join('\n')}`, keyboard, { parseMode: 'Markdown' });
+}
+
+async function sendSmsStatusBySid(ctx, messageSid) {
+    const response = await httpClient.get(null, `${config.apiUrl}/api/sms/status/${messageSid}`, {
+        timeout: 10000
+    });
+    if (!response.data?.success) {
+        await ctx.reply(`❌ ${response.data?.error || 'Message not found'}`);
+        return;
+    }
+    const msg = response.data.message || {};
+    const statusText = formatSmsStatusMessage(msg);
+    await ctx.reply(statusText, { parse_mode: 'Markdown' });
+}
+
+async function smsStatusFlow(conversation, ctx) {
+    const opId = startOperation(ctx, 'sms-status');
+    const ensureActive = () => ensureOperationActive(ctx, opId);
+    try {
+        const user = await new Promise((resolve) => getUser(ctx.from.id, resolve));
+        ensureActive();
+        if (!user) {
+            await ctx.reply('❌ You are not authorized to use this bot.');
+            return;
+        }
+        await ctx.reply('📬 Enter the SMS message SID:');
+        const update = await conversation.wait();
+        ensureActive();
+        const messageSid = update?.message?.text?.trim();
+        if (!messageSid) {
+            await ctx.reply('❌ Message SID is required.');
+            return;
+        }
+        await sendSmsStatusBySid(ctx, messageSid);
+    } catch (error) {
+        console.error('SMS status flow error:', error);
+        await ctx.reply('❌ Error checking SMS status. Please try again.');
+    }
+}
+
+async function smsConversationFlow(conversation, ctx) {
+    const opId = startOperation(ctx, 'sms-conversation');
+    const ensureActive = () => ensureOperationActive(ctx, opId);
+    try {
+        const user = await new Promise((resolve) => getUser(ctx.from.id, resolve));
+        const adminStatus = await new Promise((resolve) => isAdmin(ctx.from.id, resolve));
+        ensureActive();
+        if (!user || !adminStatus) {
+            await ctx.reply('❌ This command is for administrators only.');
+            return;
+        }
+        await ctx.reply('📱 Enter the phone number (E.164 format):');
+        const update = await conversation.wait();
+        ensureActive();
+        const phoneNumber = update?.message?.text?.trim();
+        if (!phoneNumber || !isValidPhoneNumber(phoneNumber)) {
+            await ctx.reply('❌ Invalid phone number format. Use E.164 format: +1234567890');
+            return;
+        }
+        await ctx.reply(`🔍 Fetching conversation for ${phoneNumber}...`);
+        await viewSmsConversation(ctx, phoneNumber);
+    } catch (error) {
+        console.error('SMS conversation flow error:', error);
+        await ctx.reply('❌ Error viewing SMS conversation. Please try again.');
+    }
+}
+
+async function sendRecentSms(ctx, limit = 10) {
+    const response = await httpClient.get(null, `${config.apiUrl}/api/sms/messages/recent`, {
+        params: { limit },
+        timeout: 10000
+    });
+    if (!response.data?.success || !Array.isArray(response.data.messages) || response.data.messages.length === 0) {
+        await ctx.reply('ℹ️ No recent SMS messages found.');
+        return;
+    }
+    const messages = response.data.messages;
+    let messagesText = `📱 *Recent SMS Messages (${messages.length})*\n\n`;
+    messages.forEach((msg, index) => {
+        const time = new Date(msg.created_at).toLocaleString();
+        const direction = msg.direction === 'inbound' ? '📨' : '📤';
+        const toNumber = escapeMarkdown(msg.to_number || 'N/A');
+        const fromNumber = escapeMarkdown(msg.from_number || 'N/A');
+        const preview = escapeMarkdown((msg.body || '').substring(0, 80));
+        messagesText += `${index + 1}. ${direction} ${time}\n`;
+        messagesText += `   From: ${fromNumber}\n`;
+        messagesText += `   To: ${toNumber}\n`;
+        messagesText += `   Message: ${preview}${msg.body && msg.body.length > 80 ? '…' : ''}\n\n`;
+    });
+    await ctx.reply(messagesText, { parse_mode: 'Markdown' });
+}
+
+async function recentSmsFlow(conversation, ctx) {
+    const opId = startOperation(ctx, 'sms-recent');
+    const ensureActive = () => ensureOperationActive(ctx, opId);
+    try {
+        const user = await new Promise((resolve) => getUser(ctx.from.id, resolve));
+        const adminStatus = await new Promise((resolve) => isAdmin(ctx.from.id, resolve));
+        ensureActive();
+        if (!user || !adminStatus) {
+            await ctx.reply('❌ This command is for administrators only.');
+            return;
+        }
+        await ctx.reply('🕒 Enter number of messages to fetch (max 20).');
+        const update = await conversation.wait();
+        ensureActive();
+        const raw = update?.message?.text?.trim();
+        const limit = Math.min(Number(raw) || 10, 20);
+        await ctx.reply(`📱 Fetching last ${limit} SMS messages...`);
+        await sendRecentSms(ctx, limit);
+    } catch (error) {
+        console.error('Recent SMS flow error:', error);
+        await ctx.reply('❌ Error fetching recent SMS messages.');
+    }
+}
+
+async function smsStatsFlow(conversation, ctx) {
+    const opId = startOperation(ctx, 'sms-stats');
+    const ensureActive = () => ensureOperationActive(ctx, opId);
+    try {
+        const user = await new Promise((resolve) => getUser(ctx.from.id, resolve));
+        const adminStatus = await new Promise((resolve) => isAdmin(ctx.from.id, resolve));
+        ensureActive();
+        if (!user || !adminStatus) {
+            await ctx.reply('❌ SMS statistics are for administrators only.');
+            return;
+        }
+        await ctx.reply('📊 Fetching SMS statistics...');
+        await getSmsStats(ctx);
+    } catch (error) {
+        console.error('SMS stats flow error:', error);
+        await ctx.reply('❌ Error fetching SMS statistics.');
+    }
+}
+
+async function fetchBulkSmsStatus(ctx, { limit = 10, hours = 24 } = {}) {
+    const response = await httpClient.get(null, `${config.apiUrl}/api/sms/bulk/status`, {
+        params: { limit, hours },
+        timeout: 15000
+    });
+    return response.data;
+}
+
+function formatBulkSmsOperation(operation) {
+    const createdAt = new Date(operation.created_at).toLocaleString();
+    const total = Number(operation.total_recipients || 0);
+    const success = Number(operation.successful || 0);
+    const failed = Number(operation.failed || 0);
+    const preview = operation.message
+        ? escapeMarkdown(operation.message.substring(0, 60))
+        : '—';
+    return [
+        `🆔 ${operation.id}`,
+        `📅 ${createdAt}`,
+        `📨 ${success}/${total} sent (${failed} failed)`,
+        `📝 ${preview}${operation.message && operation.message.length > 60 ? '…' : ''}`
+    ].join('\n');
+}
+
+async function sendBulkSmsList(ctx, { limit = 10, hours = 24 } = {}) {
+    const data = await fetchBulkSmsStatus(ctx, { limit, hours });
+    const operations = data?.operations || [];
+    if (!operations.length) {
+        await ctx.reply('ℹ️ No bulk SMS jobs found in the selected window.');
+        return;
+    }
+    const blocks = operations.map((op) => formatBulkSmsOperation(op));
+    await ctx.reply(`📦 *Recent Bulk SMS Jobs*\n\n${blocks.join('\n\n')}`, { parse_mode: 'Markdown' });
+}
+
+async function sendBulkSmsStats(ctx, { hours = 24 } = {}) {
+    const data = await fetchBulkSmsStatus(ctx, { limit: 20, hours });
+    const summary = data?.summary;
+    if (!summary) {
+        await ctx.reply('ℹ️ Bulk SMS stats unavailable.');
+        return;
+    }
+    const lines = [
+        `Total jobs: ${summary.totalOperations || 0}`,
+        `Recipients: ${summary.totalRecipients || 0}`,
+        `Success: ${summary.totalSuccessful || 0}`,
+        `Failed: ${summary.totalFailed || 0}`,
+        `Success rate: ${summary.successRate || 0}%`
+    ];
+    await ctx.reply(`📊 *Bulk SMS Summary (last ${data.time_period_hours || hours}h)*\n${lines.join('\n')}`, { parse_mode: 'Markdown' });
+}
+
+async function bulkSmsStatusFlow(conversation, ctx) {
+    const opId = startOperation(ctx, 'bulk-sms-status');
+    const ensureActive = () => ensureOperationActive(ctx, opId);
+    try {
+        const user = await new Promise((resolve) => getUser(ctx.from.id, resolve));
+        const adminStatus = await new Promise((resolve) => isAdmin(ctx.from.id, resolve));
+        ensureActive();
+        if (!user || !adminStatus) {
+            await ctx.reply('❌ Bulk SMS status is for administrators only.');
+            return;
+        }
+        await ctx.reply('🆔 Enter the bulk SMS job ID:');
+        const update = await conversation.wait();
+        ensureActive();
+        const rawId = update?.message?.text?.trim();
+        if (!rawId) {
+            await ctx.reply('❌ Job ID is required.');
+            return;
+        }
+        const data = await fetchBulkSmsStatus(ctx, { limit: 50, hours: 72 });
+        const operations = data?.operations || [];
+        const match = operations.find((op) => String(op.id) === rawId);
+        if (!match) {
+            await ctx.reply('ℹ️ Job not found in recent history.');
+            return;
+        }
+        await ctx.reply(`📦 *Bulk SMS Job*\n\n${formatBulkSmsOperation(match)}`, { parse_mode: 'Markdown' });
+    } catch (error) {
+        console.error('Bulk SMS status flow error:', error);
+        await ctx.reply('❌ Error fetching bulk SMS status.');
+    }
+}
+
+function buildBulkSmsMenuKeyboard(ctx) {
+    return new InlineKeyboard()
+        .text('📤 Send Bulk SMS', buildCallbackData(ctx, 'BULK_SMS_SEND'))
+        .text('🕒 Recent Jobs', buildCallbackData(ctx, 'BULK_SMS_LIST'))
+        .row()
+        .text('🧾 Job Status', buildCallbackData(ctx, 'BULK_SMS_STATUS'))
+        .text('📊 Bulk Stats', buildCallbackData(ctx, 'BULK_SMS_STATS'));
+}
+
+async function renderBulkSmsMenu(ctx) {
+    const user = await new Promise((resolve) => getUser(ctx.from.id, resolve));
+    if (!user) {
+        return ctx.reply('❌ You are not authorized to use this bot.');
+    }
+    const adminStatus = await new Promise((resolve) => isAdmin(ctx.from.id, resolve));
+    if (!adminStatus) {
+        return ctx.reply('❌ Bulk SMS is for administrators only.');
+    }
+    startOperation(ctx, 'bulk-sms-menu');
+    const keyboard = buildBulkSmsMenuKeyboard(ctx);
+    const title = '📤 *SMS Sender*';
+    const lines = ['Manage bulk SMS sends below.'];
+    await renderMenu(ctx, `${title}\n${lines.join('\n')}`, keyboard, { parseMode: 'Markdown' });
 }
 
 // Simple phone number validation
@@ -474,7 +787,10 @@ Tap an option below to continue.`;
                 `📦 Segments: ${segmentInfo.segments} (${segmentInfo.encoding.toUpperCase()} ${segmentInfo.units}/${segmentInfo.per_segment})\n\n` +
                 `🔔 You'll receive delivery notifications`;
 
-            await ctx.reply(successMsg, { parse_mode: 'Markdown' });
+            await ctx.reply(successMsg, {
+                parse_mode: 'Markdown',
+                reply_markup: buildBackToMenuKeyboard(ctx, 'SMS')
+            });
         } else {
             await ctx.reply('⚠️ SMS was sent but response format unexpected. Check logs.');
         }
@@ -484,9 +800,6 @@ Tap an option below to continue.`;
             return;
         }
         console.error('SMS send error:', error);
-        if (error.response) {
-            console.error('SMS send error response data:', error.response.data);
-        }
         let errorMsg = '❌ *SMS Failed*\n\n';
 
         if (error.response) {
@@ -505,7 +818,10 @@ Tap an option below to continue.`;
             errorMsg += `Error: ${error.message}`;
         }
 
-        await ctx.reply(errorMsg, { parse_mode: 'Markdown' });
+        await ctx.reply(errorMsg, {
+            parse_mode: 'Markdown',
+            reply_markup: buildBackToMenuKeyboard(ctx, 'SMS')
+        });
     }
 }
 
@@ -603,7 +919,9 @@ async function bulkSmsFlow(conversation, ctx) {
             );
 
             if (!previewAction || previewAction.id === 'cancel') {
-                await ctx.reply('🛑 Bulk SMS cancelled.');
+                await ctx.reply('🛑 Bulk SMS cancelled.', {
+                    reply_markup: buildBackToMenuKeyboard(ctx, 'BULK_SMS', '⬅️ Back to SMS Sender')
+                });
                 return;
             }
 
@@ -663,7 +981,10 @@ async function bulkSmsFlow(conversation, ctx) {
                 `📦 Segments per SMS: ${segmentInfo.segments} (${segmentInfo.encoding.toUpperCase()} ${segmentInfo.units}/${segmentInfo.per_segment})\n\n` +
                 `🔔 Individual delivery reports will follow`;
 
-            await ctx.reply(successMsg, { parse_mode: 'Markdown' });
+            await ctx.reply(successMsg, {
+                parse_mode: 'Markdown',
+                reply_markup: buildBackToMenuKeyboard(ctx, 'BULK_SMS', '⬅️ Back to SMS Sender')
+            });
 
             if (hardFailed > 0) {
                 const failedResults = result.results.filter(r => !r.success && !r.suppressed && r.error !== 'invalid_phone_format');
@@ -676,7 +997,9 @@ async function bulkSmsFlow(conversation, ctx) {
                 }
             }
         } else {
-            await ctx.reply('⚠️ Bulk SMS completed but response format unexpected.');
+            await ctx.reply('⚠️ Bulk SMS completed but response format unexpected.', {
+                reply_markup: buildBackToMenuKeyboard(ctx, 'BULK_SMS', '⬅️ Back to SMS Sender')
+            });
         }
     } catch (error) {
         if (error instanceof OperationCancelledError || error?.name === 'AbortError' || error?.name === 'CanceledError') {
@@ -686,7 +1009,10 @@ async function bulkSmsFlow(conversation, ctx) {
         console.error('Bulk SMS error:', error);
         let errorMsg = '❌ *Bulk SMS Failed*\n\n';
         errorMsg += error.response ? `Error: ${error.response.data?.error || 'Unknown error'}` : `Error: ${error.message}`;
-        await ctx.reply(errorMsg, { parse_mode: 'Markdown' });
+        await ctx.reply(errorMsg, {
+            parse_mode: 'Markdown',
+            reply_markup: buildBackToMenuKeyboard(ctx, 'BULK_SMS', '⬅️ Back to SMS Sender')
+        });
     }
 }
 
@@ -806,7 +1132,10 @@ async function scheduleSmsFlow(conversation, ctx) {
                 `📱 To: ${number}\n\n` +
                 `🔔 You'll receive confirmation when sent`;
 
-            await ctx.reply(successMsg, { parse_mode: 'Markdown' });
+            await ctx.reply(successMsg, {
+                parse_mode: 'Markdown',
+                reply_markup: buildBackToMenuKeyboard(ctx, 'SMS')
+            });
         }
     } catch (error) {
         if (error instanceof OperationCancelledError || error?.name === 'AbortError' || error?.name === 'CanceledError') {
@@ -814,14 +1143,16 @@ async function scheduleSmsFlow(conversation, ctx) {
             return;
         }
         console.error('Schedule SMS error:', error);
-        await ctx.reply('❌ Failed to schedule SMS. Please try again.');
+        await ctx.reply('❌ Failed to schedule SMS. Please try again.', {
+            reply_markup: buildBackToMenuKeyboard(ctx, 'SMS')
+        });
     }
 }
 
 // FIXED: SMS conversation viewer - now gets data from database via API
 async function viewSmsConversation(ctx, phoneNumber) {
     try {
-        console.log(`Fetching SMS conversation for ${phoneNumber}`);
+        console.log('Fetching SMS conversation');
         
         // First try to get conversation from SMS service (in-memory)
         const response = await httpClient.get(
@@ -858,7 +1189,7 @@ async function viewSmsConversation(ctx, phoneNumber) {
             await ctx.reply(conversationText, { parse_mode: 'Markdown' });
         } else {
             // If no active conversation, check database for stored SMS messages
-            console.log('No active conversation found, checking database...');
+            console.log('No active conversation found, checking database');
             await viewStoredSmsConversation(ctx, phoneNumber);
         }
     } catch (error) {
@@ -1008,243 +1339,90 @@ async function getSmsStats(ctx) {
     }
 }
 
-// FIXED: SMS scripts - now properly handles the API response
-// Register SMS command handlers with conversation flows
+// Register SMS command handlers with menu entry points
 function registerSmsCommands(bot) {
-
-    // Main SMS command
     bot.command('sms', async ctx => {
         try {
-            const user = await new Promise(resolve => getUser(ctx.from.id, resolve));
-            if (!user) {
-                return ctx.reply('❌ You are not authorized to use this bot.');
-            }
-            await ctx.conversation.enter('sms-conversation');
+            await renderSmsMenu(ctx);
         } catch (error) {
             console.error('SMS command error:', error);
-            await ctx.reply('❌ Could not start SMS process. Please try again.');
+            await ctx.reply('❌ Could not open SMS menu. Please try again.');
         }
     });
 
-    // Bulk SMS command
-    bot.command('bulksms', async ctx => {
+    bot.command('smssender', async ctx => {
         try {
-            const user = await new Promise(resolve => getUser(ctx.from.id, resolve));
-            if (!user) { 
-                return ctx.reply('❌ You are not authorized to use this bot.');
-            }
-            const adminStatus = await new Promise(resolve => isAdmin(ctx.from.id, resolve));
-            if (!adminStatus) {
-                return ctx.reply('❌ Bulk SMS is for administrators only.');
-            }
-            await ctx.conversation.enter('bulk-sms-conversation');
+            await renderBulkSmsMenu(ctx);
         } catch (error) {
             console.error('Bulk SMS command error:', error);
-            await ctx.reply('❌ Could not start bulk SMS process.');
+            await ctx.reply('❌ Could not open bulk SMS menu.');
         }
     });
 
-    // Schedule SMS command
     bot.command('schedulesms', async ctx => {
         try {
-            const user = await new Promise(resolve => getUser(ctx.from.id, resolve));
-            if (!user) {
-                return ctx.reply('❌ You are not authorized to use this bot.');
-            }
-            await ctx.conversation.enter('schedule-sms-conversation');
+            await ctx.reply('ℹ️ /schedulesms is now under /sms. Opening SMS menu…');
+            await maybeSendSmsAliasTip(ctx);
+            await renderSmsMenu(ctx);
         } catch (error) {
             console.error('Schedule SMS command error:', error);
-            await ctx.reply('❌ Could not start SMS scheduling.');
+            await ctx.reply('❌ Could not open SMS menu.');
         }
     });
 
-    // FIXED: SMS conversation command
     bot.command('smsconversation', async ctx => {
         try {
-            const user = await new Promise(r => getUser(ctx.from.id, r));
-            if (!user) {
-                return ctx.reply('❌ You are not authorized to use this bot.');
-            }
-            
-            const adminStatus = await new Promise(r => isAdmin(ctx.from.id, r));
-            if (!adminStatus) {
-                return ctx.reply('❌ This command is for administrators only.');
-            }
-
-            const args = ctx.message.text.split(' ');
-            if (args.length < 2) {
-                return ctx.reply(
-                    '📱 <b>Usage:</b> <code>/smsconversation &lt;phone_number&gt;</code>\n\n' +
-                    '<b>Example:</b> <code>/smsconversation +1234567890</code>\n\n' +
-                    'This will show the SMS conversation history with the specified phone number.',
-                    { parse_mode: 'HTML' }
-                );
-            }
-            
-            const phoneNumber = args[1].trim();
-            if (!isValidPhoneNumber(phoneNumber)) {
-                return ctx.reply('❌ Invalid phone number format. Use E.164 format: +1234567890');
-            }
-            
-            await ctx.reply(`🔍 Searching for SMS conversation with ${phoneNumber}...`);
-            await viewSmsConversation(ctx, phoneNumber);
-            
+            await ctx.reply('ℹ️ /smsconversation is now under /sms. Opening SMS menu…');
+            await maybeSendSmsAliasTip(ctx);
+            await renderSmsMenu(ctx);
         } catch (error) {
             console.error('SMS conversation command error:', error);
-            await ctx.reply('❌ Error viewing SMS conversation. Please check the phone number format and try again.');
+            await ctx.reply('❌ Could not open SMS menu.');
         }
     });
 
-    // FIXED: SMS statistics command
     bot.command('smsstats', async ctx => {
         try {
-            const user = await new Promise(resolve => getUser(ctx.from.id, resolve));
-            if (!user) { 
-                return ctx.reply('❌ You are not authorized to use this bot.');
-            }
-
-            const adminStatus = await new Promise(resolve => isAdmin(ctx.from.id, resolve));
-            if (!adminStatus) {
-                return ctx.reply('❌ SMS statistics are for administrators only.');
-            }
-
-            await ctx.reply('📊 Fetching SMS statistics...');
-            await getSmsStats(ctx);
-            
+            await ctx.reply('ℹ️ /smsstats is now under /sms. Opening SMS menu…');
+            await maybeSendSmsAliasTip(ctx);
+            await renderSmsMenu(ctx);
         } catch (error) {
             console.error('SMS stats command error:', error);
-            await ctx.reply('❌ Error fetching SMS statistics. Please try again later.');
+            await ctx.reply('❌ Could not open SMS menu.');
         }
     });
 
-    // Script designer commands are managed through /scripts (see bot/commands/scripts.js)
-
-    // NEW: SMS delivery status check command
     bot.command('smsstatus', async ctx => {
         try {
-            const user = await new Promise(r => getUser(ctx.from.id, r));
-            if (!user) {
-                return ctx.reply('❌ You are not authorized to use this bot.');
-            }
-
             const args = ctx.message.text.split(' ');
-            if (args.length < 2) {
-                return ctx.reply(
-                    '📱 <b>Usage:</b> <code>/smsstatus &lt;message_sid&gt;</code>\n\n' +
-                    '<b>Example:</b> <code>/smsstatus SM1234567890abcdef</code>\n\n' +
-                    'This will show the delivery status of a specific SMS message.',
-                    { parse_mode: 'HTML' }
-                );
+            const messageSid = args.length > 1 ? args[1].trim() : '';
+            if (!messageSid) {
+                await ctx.reply('ℹ️ /smsstatus is now under /sms. Opening SMS menu…');
+                await maybeSendSmsAliasTip(ctx);
+                await renderSmsMenu(ctx);
+                return;
             }
-
-            const messageSid = args[1].trim();
-            
-            await ctx.reply(`🔍 Checking status for message: ${messageSid}...`);
-            
-            try {
-                const response = await httpClient.get(null, `${config.apiUrl}/api/sms/status/${messageSid}`, {
-                    timeout: 10000
-                });
-                
-                if (response.data.success) {
-                    const msg = response.data.message;
-                    const statusText =
-                        `📱 *SMS Status Report*\n\n` +
-                        `🆔 **Message SID:** \`${msg.message_sid}\`\n` +
-                        `📞 **To:** ${msg.to_number || 'N/A'}\n` +
-                        `📤 **From:** ${msg.from_number || 'N/A'}\n` +
-                        `📊 **Status:** ${msg.status}\n` +
-                        `📅 **Created:** ${new Date(msg.created_at).toLocaleString()}\n` +
-                        `🔄 **Updated:** ${new Date(msg.updated_at).toLocaleString()}\n` +
-                        `📝 **Message:** ${msg.body.substring(0, 100)}${msg.body.length > 100 ? '...' : ''}\n`;
-                        
-                    if (msg.error_code || msg.error_message) {
-                        statusText += `\n❌ **Error:** ${msg.error_code} - ${msg.error_message}`;
-                    }
-                    
-                    if (msg.ai_response) {
-                        statusText += `\n🤖 **AI Response:** ${msg.ai_response.substring(0, 100)}${msg.ai_response.length > 100 ? '...' : ''}`;
-                    }
-                    
-                    await ctx.reply(statusText, { parse_mode: 'Markdown' });
-                } else {
-                    await ctx.reply(`❌ ${response.data.error || 'Message not found'}`);
-                }
-            } catch (apiError) {
-                console.error('SMS status API error:', apiError);
-                await ctx.reply('❌ Error checking SMS status. Message may not exist or API is unavailable.');
-            }
-            
+            await sendSmsStatusBySid(ctx, messageSid);
         } catch (error) {
             console.error('SMS status command error:', error);
             await ctx.reply('❌ Error checking SMS status. Please try again.');
         }
     });
 
-    // NEW: Recent SMS messages command
     bot.command('recentsms', async ctx => {
         try {
-            const user = await new Promise(r => getUser(ctx.from.id, r));
-            if (!user) {
-                return ctx.reply('❌ You are not authorized to use this bot.');
-            }
-
-            const adminStatus = await new Promise(r => isAdmin(ctx.from.id, r));
-            if (!adminStatus) {
-                return ctx.reply('❌ This command is for administrators only.');
-            }
-            
             const args = ctx.message.text.split(' ');
-            const limit = args.length > 1 ? Math.min(parseInt(args[1]) || 10, 20) : 10;
-            
-            await ctx.reply(`📱 Fetching last ${limit} SMS messages...`);
-            
-            try {
-                const response = await httpClient.get(null, `${config.apiUrl}/api/sms/messages/recent`, {
-                    params: { limit },
-                    timeout: 10000
-                });
-                
-                if (response.data.success && response.data.messages.length > 0) {
-                    const messages = response.data.messages;
-                    
-                    let messagesText = `📱 *Recent SMS Messages (${messages.length})*\n\n`;
-                    
-                    messages.forEach((msg, index) => {
-                        const time = new Date(msg.created_at).toLocaleString();
-                        const direction = msg.direction === 'inbound' ? '📨' : '📤';
-                        const phone = msg.to_number || msg.from_number || 'Unknown';
-                        const statusIcon = msg.status === 'delivered' ? '✅' : 
-                                         msg.status === 'failed' ? '❌' : 
-                                         msg.status === 'pending' ? '⏳' : '❓';
-                        
-                        messagesText += 
-                            `${index + 1}. ${direction} ${phone} ${statusIcon}\n` +
-                            `   Status: ${msg.status} | ${time}\n` +
-                            `   Message: ${msg.body.substring(0, 60)}${msg.body.length > 60 ? '...' : ''}\n`;
-                            
-                        if (msg.error_message) {
-                            messagesText += `   Error: ${msg.error_message}\n`;
-                        }
-                        
-                        messagesText += '\n';
-                    });
-                    
-                    messagesText += `Use /smsstatus <message_sid> for detailed status info`;
-                    
-                    await ctx.reply(messagesText, { parse_mode: 'Markdown' });
-                } else {
-                    await ctx.reply('📱 No recent SMS messages found.');
-                }
-                
-            } catch (apiError) {
-                console.error('Recent SMS API error:', apiError);
-                await ctx.reply('❌ Error fetching recent SMS messages. API may be unavailable.');
+            const limit = args.length > 1 ? Math.min(parseInt(args[1]) || 10, 20) : null;
+            if (!limit) {
+                await ctx.reply('ℹ️ /recentsms is now under /sms. Opening SMS menu…');
+                await maybeSendSmsAliasTip(ctx);
+                await renderSmsMenu(ctx);
+                return;
             }
-            
+            await sendRecentSms(ctx, limit);
         } catch (error) {
             console.error('Recent SMS command error:', error);
-            await ctx.reply('❌ Error fetching recent SMS messages.');
+            await ctx.reply('❌ Error fetching recent SMS messages. Please try again later.');
         }
     });
 }
@@ -1253,9 +1431,18 @@ module.exports = {
     smsFlow,
     bulkSmsFlow,
     scheduleSmsFlow,
+    smsStatusFlow,
+    smsConversationFlow,
+    recentSmsFlow,
+    smsStatsFlow,
+    bulkSmsStatusFlow,
+    renderSmsMenu,
+    renderBulkSmsMenu,
+    sendRecentSms,
+    sendBulkSmsList,
+    sendBulkSmsStats,
     registerSmsCommands,
     viewSmsConversation,
     getSmsStats,
-    // Export new functions
     viewStoredSmsConversation
 };

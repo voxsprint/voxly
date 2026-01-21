@@ -20,9 +20,17 @@ const {
   safeReset,
   guardAgainstCommandInterrupt
 } = require('../utils/sessionState');
+function buildMainMenuReplyMarkup(ctx) {
+  return {
+    inline_keyboard: [[{ text: '⬅️ Main Menu', callback_data: buildCallbackData(ctx, 'MENU') }]]
+  };
+}
+
 async function notifyCallError(ctx, lines = []) {
   const body = Array.isArray(lines) ? lines : [lines];
-  await ctx.reply(section('❌ Call Alert', body));
+  await ctx.reply(section('❌ Call Alert', body), {
+    reply_markup: buildMainMenuReplyMarkup(ctx)
+  });
 }
 const { section, escapeMarkdown, tipLine, buildLine, renderMenu } = require('../utils/ui');
 const { buildCallbackData } = require('../utils/actions');
@@ -618,18 +626,27 @@ async function callFlow(conversation, ctx) {
         inline_keyboard: [[{ text: 'ℹ️ Details', callback_data: buildCallbackData(ctx, `CALL_DETAILS:${detailsKey}`) }]]
       };
     }
+    if (!replyOptions.reply_markup) {
+      replyOptions.reply_markup = buildMainMenuReplyMarkup(ctx);
+    } else if (replyOptions.reply_markup.inline_keyboard) {
+      replyOptions.reply_markup.inline_keyboard.push([
+        { text: '⬅️ Main Menu', callback_data: buildCallbackData(ctx, 'MENU') }
+      ]);
+    }
 
     await renderMenu(ctx, section('🔍 Call Brief', detailLines), replyOptions.reply_markup, {
       payload: { parse_mode: 'Markdown' }
     });
-    await ctx.reply('⏳ Making the call…');
+    await ctx.reply('⏳ Making the call…', {
+      reply_markup: buildMainMenuReplyMarkup(ctx)
+    });
 
     const payloadForLog = { ...payload };
     if (payloadForLog.prompt) {
       payloadForLog.prompt = `${payloadForLog.prompt.substring(0, 50)}${payloadForLog.prompt.length > 50 ? '...' : ''}`;
     }
 
-    console.log('Sending payload to API:', payloadForLog);
+    console.log('Sending call request to API');
 
     const controller = new AbortController();
     const release = registerAbortController(ctx, controller);
@@ -650,7 +667,9 @@ async function callFlow(conversation, ctx) {
     if (data?.success && data.call_sid) {
       flow.touch('completed');
     } else {
-      await ctx.reply('⚠️ Call was sent but response format unexpected. Check logs.');
+      await ctx.reply('⚠️ Call was sent but response format unexpected. Check logs.', {
+        reply_markup: buildMainMenuReplyMarkup(ctx)
+      });
     }
   } catch (error) {
     if (error instanceof OperationCancelledError || error?.name === 'AbortError' || error?.name === 'CanceledError') {
@@ -658,16 +677,10 @@ async function callFlow(conversation, ctx) {
       return;
     }
 
-    console.error('Call error details:', {
+    console.error('Call error:', {
       message: error.message,
       status: error.response?.status,
-      statusText: error.response?.statusText,
-      data: error.response?.data,
-      config: {
-        url: error.config?.url,
-        method: error.config?.method,
-        headers: error.config?.headers
-      }
+      statusText: error.response?.statusText
     });
 
     let handled = false;

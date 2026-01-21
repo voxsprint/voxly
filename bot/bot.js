@@ -28,6 +28,12 @@ const {
     finishActionMetric
 } = require('./utils/actions');
 const { normalizeReply, logCommandError } = require('./utils/ui');
+const {
+    getAccessProfile,
+    getCapabilityForCommand,
+    getCapabilityForAction,
+    requireCapability
+} = require('./utils/capabilities');
 
 const apiOrigins = new Set();
 try {
@@ -91,6 +97,25 @@ bot.use(async (ctx, next) => {
         }
         ctx.session.lastCommand = command;
         ctx.session.currentOp = null;
+    }
+    return next();
+});
+
+// Capability gating for slash commands
+bot.use(async (ctx, next) => {
+    const text = ctx.message?.text;
+    if (!text || !text.startsWith('/')) {
+        return next();
+    }
+    const command = text.split(' ')[0].slice(1).toLowerCase();
+    const capability = getCapabilityForCommand(command);
+    const access = await getAccessProfile(ctx);
+    await syncChatCommands(ctx, access);
+    if (capability) {
+        const allowed = await requireCapability(ctx, capability, { actionLabel: `/${command}`, profile: access });
+        if (!allowed) {
+            return;
+        }
     }
     return next();
 });
@@ -160,6 +185,11 @@ bot.callbackQuery(/^alert:/, async (ctx) => {
     const callSid = parts[2];
 
     try {
+        const allowed = await requireCapability(ctx, 'call', { actionLabel: 'Call controls' });
+        if (!allowed) {
+            await ctx.answerCallbackQuery({ text: 'Access required.', show_alert: false });
+            return;
+        }
         switch (action) {
             case 'mute':
                 await httpClient.post(ctx, `${API_BASE}/api/calls/${callSid}/operator`, { action: 'mute_alerts' }, { timeout: 8000 });
@@ -186,6 +216,11 @@ bot.callbackQuery(/^alert:/, async (ctx) => {
 // Live call console actions (proxy to API webhook handler)
 bot.callbackQuery(/^lc:/, async (ctx) => {
     try {
+        const allowed = await requireCapability(ctx, 'calllog_view', { actionLabel: 'Live call console' });
+        if (!allowed) {
+            await ctx.answerCallbackQuery({ text: 'Access required.', show_alert: false });
+            return;
+        }
         await ctx.answerCallbackQuery();
         await httpClient.post(ctx, `${config.apiUrl}/webhook/telegram`, ctx.update, { timeout: 8000 });
         return;
@@ -242,10 +277,36 @@ async function validateTemplatesApiConnectivity() {
 // Import dependencies
 const { getUser, isAdmin, expireInactiveUsers } = require('./db/db');
 const { callFlow, registerCallCommand } = require('./commands/call');
-const { smsFlow, bulkSmsFlow, scheduleSmsFlow, registerSmsCommands, getSmsStats } = require('./commands/sms');
+const {
+    smsFlow,
+    bulkSmsFlow,
+    scheduleSmsFlow,
+    smsStatusFlow,
+    smsConversationFlow,
+    recentSmsFlow,
+    smsStatsFlow,
+    bulkSmsStatusFlow,
+    renderSmsMenu,
+    renderBulkSmsMenu,
+    sendRecentSms,
+    sendBulkSmsList,
+    sendBulkSmsStats,
+    registerSmsCommands,
+    getSmsStats
+} = require('./commands/sms');
 const {
     emailFlow,
     bulkEmailFlow,
+    emailTemplatesFlow,
+    renderEmailMenu,
+    renderBulkEmailMenu,
+    emailStatusFlow,
+    bulkEmailStatusFlow,
+    bulkEmailHistoryFlow,
+    bulkEmailStatsFlow,
+    sendBulkEmailHistory,
+    sendBulkEmailStats,
+    emailHistoryFlow,
     registerEmailCommands,
     sendEmailStatusCard,
     sendEmailTimeline,
@@ -254,11 +315,17 @@ const {
 const { scriptsFlow, registerScriptsCommand } = require('./commands/scripts');
 const { personaFlow, registerPersonaCommand } = require('./commands/persona');
 const {
+    renderCalllogMenu,
+    calllogRecentFlow,
+    calllogSearchFlow,
+    calllogDetailsFlow,
+    calllogEventsFlow,
+    registerCalllogCommand
+} = require('./commands/calllog');
+const {
     registerProviderCommand,
-    fetchProviderStatus,
-    formatProviderStatus,
-    updateProvider,
-    SUPPORTED_PROVIDERS,
+    handleProviderSwitch,
+    renderProviderMenu
 } = require('./commands/provider');
 const {
     addUserFlow,
@@ -275,7 +342,6 @@ const { registerGuideCommand, handleGuide } = require('./commands/guide');
 const {
     registerApiCommands,
     handleStatusCommand,
-    handleTestApiCommand,
     handleHealthCommand
 } = require('./commands/api');
 
@@ -286,9 +352,23 @@ bot.use(wrapConversation(promoteFlow, "promote-conversation"));
 bot.use(wrapConversation(removeUserFlow, "remove-conversation"));
 bot.use(wrapConversation(scheduleSmsFlow, "schedule-sms-conversation"));
 bot.use(wrapConversation(smsFlow, "sms-conversation"));
+bot.use(wrapConversation(smsStatusFlow, "sms-status-conversation"));
+bot.use(wrapConversation(smsConversationFlow, "sms-thread-conversation"));
+bot.use(wrapConversation(recentSmsFlow, "sms-recent-conversation"));
+bot.use(wrapConversation(smsStatsFlow, "sms-stats-conversation"));
 bot.use(wrapConversation(bulkSmsFlow, "bulk-sms-conversation"));
+bot.use(wrapConversation(bulkSmsStatusFlow, "bulk-sms-status-conversation"));
 bot.use(wrapConversation(emailFlow, "email-conversation"));
+bot.use(wrapConversation(emailStatusFlow, "email-status-conversation"));
+bot.use(wrapConversation(emailTemplatesFlow, "email-templates-conversation"));
 bot.use(wrapConversation(bulkEmailFlow, "bulk-email-conversation"));
+bot.use(wrapConversation(bulkEmailStatusFlow, "bulk-email-status-conversation"));
+bot.use(wrapConversation(bulkEmailHistoryFlow, "bulk-email-history-conversation"));
+bot.use(wrapConversation(bulkEmailStatsFlow, "bulk-email-stats-conversation"));
+bot.use(wrapConversation(calllogRecentFlow, "calllog-recent-conversation"));
+bot.use(wrapConversation(calllogSearchFlow, "calllog-search-conversation"));
+bot.use(wrapConversation(calllogDetailsFlow, "calllog-details-conversation"));
+bot.use(wrapConversation(calllogEventsFlow, "calllog-events-conversation"));
 bot.use(wrapConversation(scriptsFlow, "scripts-conversation"));
 bot.use(wrapConversation(personaFlow, "persona-conversation"));
 
@@ -302,6 +382,7 @@ registerEmailCommands(bot);
 registerScriptsCommand(bot);
 registerUserListCommand(bot);
 registerPersonaCommand(bot);
+registerCalllogCommand(bot);
 
 
 // Register non-conversation commands
@@ -379,6 +460,7 @@ function resolveConversationFromPrefix(prefix) {
     if (prefix.startsWith('sms-script-')) return 'scripts-conversation';
     if (prefix === 'sms-script') return 'sms-conversation';
     if (prefix.startsWith('script-') || prefix === 'confirm') return 'scripts-conversation';
+    if (prefix.startsWith('email-template-')) return 'email-templates-conversation';
     if (prefix.startsWith('bulk-email-')) return 'bulk-email-conversation';
     if (prefix.startsWith('email-')) return 'email-conversation';
     if (prefix.startsWith('bulk-sms-')) return 'bulk-sms-conversation';
@@ -552,6 +634,11 @@ async function handleCallFollowUp(ctx, callSid, followAction) {
         return;
     }
 
+    const allowed = await requireCapability(ctx, 'call_followup', { actionLabel: 'Call follow-up' });
+    if (!allowed) {
+        return;
+    }
+
     if (ctx.callbackQuery?.message) {
         try {
             await ctx.editMessageReplyMarkup();
@@ -618,7 +705,7 @@ async function handleCallFollowUp(ctx, callSid, followAction) {
                 await ctx.conversation.enter('schedule-sms-conversation');
             } catch (error) {
                 console.error('Follow-up schedule flow error:', error);
-                await ctx.reply('❌ Unable to start scheduling flow. You can use /schedulesms manually.');
+                await ctx.reply('❌ Unable to start scheduling flow. You can use /sms to schedule manually.');
             }
             break;
         }
@@ -672,7 +759,7 @@ async function handleCallFollowUp(ctx, callSid, followAction) {
             break;
         }
         case 'skip': {
-            await ctx.reply('👍 Noted. Skipping the follow-up for now—you can revisit this call anytime from /calls.');
+            await ctx.reply('👍 Noted. Skipping the follow-up for now—you can revisit this call anytime from /calllog.');
             break;
         }
         case 'resend': {
@@ -706,6 +793,11 @@ async function handleCallFollowUp(ctx, callSid, followAction) {
 async function handleSmsFollowUp(ctx, phone, followAction) {
     if (!phone) {
         await ctx.reply('❌ Missing phone number for follow-up.');
+        return;
+    }
+
+    const allowed = await requireCapability(ctx, 'sms_send', { actionLabel: 'SMS follow-up' });
+    if (!allowed) {
         return;
     }
 
@@ -748,7 +840,7 @@ async function handleSmsFollowUp(ctx, phone, followAction) {
                 await ctx.conversation.enter('schedule-sms-conversation');
             } catch (error) {
                 console.error('Follow-up schedule SMS flow error:', error);
-                await ctx.reply('❌ Unable to start schedule flow. You can use /schedulesms manually.');
+                await ctx.reply('❌ Unable to start schedule flow. You can use /sms to schedule manually.');
             }
             break;
         }
@@ -779,67 +871,48 @@ async function handleSmsFollowUp(ctx, phone, followAction) {
 bot.command('start', async (ctx) => {
     try {
         expireInactiveUsers();
-        
-        let user = await new Promise(r => getUser(ctx.from.id, r));
-        if (!user) {
-            const adminUsername = (config.admin.username || '').replace(/^@/, '');
-            const kb = new InlineKeyboard()
-                .url('📱 Contact Admin', `https://t.me/${adminUsername}`);
-            
-            return renderMenu(
-                ctx,
-                '*Access Restricted* ⚠️\n\n' +
-                    'This bot requires authorization.\n' +
-                    'Please contact an administrator to get access.\n\n' +
-                    'You can still use /help to learn how the bot works.',
-                kb,
-                { parseMode: 'Markdown' }
-            );
-        }
 
-        const isOwner = await new Promise(r => isAdmin(ctx.from.id, r));
-        
-        // Prepare user information
-        const userStats = `👤 *User Information*
+        const access = await getAccessProfile(ctx);
+        const isOwner = access.isAdmin;
+        await syncChatCommands(ctx, access);
+
+        const userStats = access.user
+            ? `👤 *User Information*
 • ID: \`${ctx.from.id}\`
 • Username: @${ctx.from.username || 'none'}
-• Role: ${user.role}
-• Joined: ${new Date(user.timestamp).toLocaleDateString()}`;
+• Role: ${access.user.role}
+• Joined: ${new Date(access.user.timestamp).toLocaleDateString()}`
+            : `👤 *Guest Access*
+• ID: \`${ctx.from.id}\`
+• Username: @${ctx.from.username || 'none'}
+• Role: Guest`;
 
-        const welcomeText = isOwner ? 
-            '🛡️ *Welcome, Administrator!*\n\nYou have full access to all bot features.' :
-            '👋 *Welcome to Voicednut Bot!*\n\nYou can make voice calls using AI agents.';
+        const welcomeText = access.user
+            ? (isOwner
+                ? '🛡️ *Welcome, Administrator!*\n\nYou have full access to all bot features.'
+                : '👋 *Welcome to Voicednut Bot!*\n\nYou can make voice calls using AI agents.')
+            : '⚠️ *Limited Access*\n\nYou can explore menus, but execution requires approval.';
 
         const kb = new InlineKeyboard()
-          .text('📞 Call', buildCallbackData(ctx, 'CALL'))
-          .text('💬 SMS', buildCallbackData(ctx, 'SMS'))
+            .text(access.user ? '📞 Call' : '🔒 Call', buildCallbackData(ctx, 'CALL'))
+            .text(access.user ? '💬 SMS' : '🔒 SMS', buildCallbackData(ctx, 'SMS'))
             .row()
-            .text('📧 Email', buildCallbackData(ctx, 'EMAIL'))
-            .text('⏰ Schedule', buildCallbackData(ctx, 'SCHEDULE_SMS'))
-            .row()
-            .text('📋 Calls', buildCallbackData(ctx, 'CALLS'));
-
-        if (isOwner) {
-            kb.text('🧾 Threads', buildCallbackData(ctx, 'SMS_CONVO_HELP'));
-        }
-
-        kb.row()
-            .text('📜 SMS Status', buildCallbackData(ctx, 'SMS_STATUS_HELP'))
-            .text('📨 Email Status', buildCallbackData(ctx, 'EMAIL_STATUS_HELP'))
+            .text(access.user ? '📧 Email' : '🔒 Email', buildCallbackData(ctx, 'EMAIL'))
+            .text(access.user ? '📜 Call Log' : '🔒 Call Log', buildCallbackData(ctx, 'CALLLOG'))
             .row()
             .text('📚 Guide', buildCallbackData(ctx, 'GUIDE'))
-            .text('🏥 Health', buildCallbackData(ctx, 'HEALTH'))
-            .row()
             .text('ℹ️ Help', buildCallbackData(ctx, 'HELP'))
+            .row()
             .text('📋 Menu', buildCallbackData(ctx, 'MENU'));
+
+        if (access.user) {
+            kb.row().text('🏥 Health', buildCallbackData(ctx, 'HEALTH'));
+        }
 
         if (isOwner) {
             kb.row()
-                .text('📤 Bulk SMS', buildCallbackData(ctx, 'BULK_SMS'))
-                .text('📧 Bulk Email', buildCallbackData(ctx, 'BULK_EMAIL'))
-            .row()
-                .text('📊 SMS Stats', buildCallbackData(ctx, 'SMS_STATS'))
-                .text('📥 Recent', buildCallbackData(ctx, 'RECENT_SMS'))
+                .text('📤 SMS Sender', buildCallbackData(ctx, 'BULK_SMS'))
+                .text('📧 Mailer', buildCallbackData(ctx, 'BULK_EMAIL'))
             .row()
                 .text('👥 Users', buildCallbackData(ctx, 'USERS'))
                 .text('➕ Add', buildCallbackData(ctx, 'ADDUSER'))
@@ -850,12 +923,17 @@ bot.command('start', async (ctx) => {
                 .text('🧰 Scripts', buildCallbackData(ctx, 'SCRIPTS'))
                 .text('☎️ Provider', buildCallbackData(ctx, 'PROVIDER_STATUS'))
             .row()
-                .text('🔍 Status', buildCallbackData(ctx, 'STATUS'))
-                .text('🧪 Test API', buildCallbackData(ctx, 'TEST_API'));
+                .text('🔍 Status', buildCallbackData(ctx, 'STATUS'));
         }
 
-        const message = `${welcomeText}\n\n${userStats}\n\nUse the buttons below or type /help for available commands.`;
-        
+        if (!access.user) {
+            const adminUsername = (config.admin.username || '').replace(/^@/, '');
+            if (adminUsername) {
+                kb.row().url('📱 Request Access', `https://t.me/${adminUsername}`);
+            }
+        }
+
+        const message = `${welcomeText}\n\n${userStats}\n\nTip: SMS and Email actions are grouped under /sms and /email.\n\nUse the buttons below or type /help for available commands.`;
         await renderMenu(ctx, message, kb, { parseMode: 'Markdown' });
     } catch (error) {
         console.error('Start command error:', error);
@@ -903,24 +981,14 @@ bot.on('callback_query:data', async (ctx) => {
         await ctx.answerCallbackQuery();
         console.log(`Callback query received: ${action} from user ${ctx.from.id}`);
 
-        // Verify user authorization
-        const user = await new Promise(r => getUser(ctx.from.id, r));
-        if (!user) {
-            await ctx.reply("❌ You are not authorized to use this bot.");
-            return;
-        }
-
-        // Check admin permissions
-        const isAdminUser = user.role === 'ADMIN';
-        const adminActions = ['ADDUSER', 'PROMOTE', 'REMOVE', 'USERS', 'STATUS', 'TEST_API', 'SCRIPTS', 'SMS_STATS', 'RECENT_SMS', 'SMS_CONVO_HELP', 'PROVIDER_STATUS', 'BULK_SMS', 'BULK_EMAIL'];
-        const adminActionPrefixes = ['PROVIDER_SET:', 'EMAIL_BULK:'];
-
-        const requiresAdmin = adminActions.includes(action) || adminActionPrefixes.some((prefix) => action.startsWith(prefix));
-
-        if (requiresAdmin && !isAdminUser) {
-            await ctx.reply("❌ This action is for administrators only.");
-            finishMetric('forbidden');
-            return;
+        await getAccessProfile(ctx);
+        const requiredCapability = getCapabilityForAction(action);
+        if (requiredCapability) {
+            const allowed = await requireCapability(ctx, requiredCapability, { actionLabel: action });
+            if (!allowed) {
+                finishMetric('forbidden');
+                return;
+            }
         }
 
         const isMenuExemptAction = menuExemptPrefixes.some((prefix) => action.startsWith(prefix));
@@ -1037,7 +1105,7 @@ bot.on('callback_query:data', async (ctx) => {
             const [, provider] = action.split(':');
             await cancelActiveFlow(ctx, `callback:${action}`);
             resetSession(ctx);
-            await executeProviderSwitchCommand(ctx, provider?.toLowerCase());
+            await handleProviderSwitch(ctx, provider?.toLowerCase());
             finishMetric('ok');
             return;
         }
@@ -1107,12 +1175,27 @@ bot.on('callback_query:data', async (ctx) => {
             'ADDUSER': 'adduser-conversation',
             'PROMOTE': 'promote-conversation',
             'REMOVE': 'remove-conversation',
-            'SMS': 'sms-conversation',
-            'BULK_SMS': 'bulk-sms-conversation',
-            'EMAIL': 'email-conversation',
-            'BULK_EMAIL': 'bulk-email-conversation',
-            'SCHEDULE_SMS': 'schedule-sms-conversation',
-            'SCRIPTS': 'scripts-conversation'
+            'SMS_SEND': 'sms-conversation',
+            'SMS_SCHEDULE': 'schedule-sms-conversation',
+            'SMS_STATUS': 'sms-status-conversation',
+            'SMS_CONVO': 'sms-thread-conversation',
+            'SMS_RECENT': 'sms-recent-conversation',
+            'SMS_STATS': 'sms-stats-conversation',
+            'BULK_SMS_SEND': 'bulk-sms-conversation',
+            'BULK_SMS_STATUS': 'bulk-sms-status-conversation',
+            'EMAIL_SEND': 'email-conversation',
+            'EMAIL_STATUS': 'email-status-conversation',
+            'EMAIL_TEMPLATES': 'email-templates-conversation',
+            'BULK_EMAIL_SEND': 'bulk-email-conversation',
+            'BULK_EMAIL_STATUS': 'bulk-email-status-conversation',
+            'BULK_EMAIL_LIST': 'bulk-email-history-conversation',
+            'BULK_EMAIL_STATS': 'bulk-email-stats-conversation',
+            'CALLLOG_RECENT': 'calllog-recent-conversation',
+            'CALLLOG_SEARCH': 'calllog-search-conversation',
+            'CALLLOG_DETAILS': 'calllog-details-conversation',
+            'CALLLOG_EVENTS': 'calllog-events-conversation',
+            'SCRIPTS': 'scripts-conversation',
+            'PERSONA': 'persona-conversation'
         };
 
         if (conversations[action]) {
@@ -1120,7 +1203,20 @@ bot.on('callback_query:data', async (ctx) => {
             await cancelActiveFlow(ctx, `callback:${action}`);
             await clearMenuMessages(ctx);
             startOperation(ctx, action.toLowerCase());
-            await ctx.reply(`Starting ${action.toLowerCase()} process...`);
+            const conversationLabels = {
+                'CALLLOG_RECENT': 'call log (recent)',
+                'CALLLOG_SEARCH': 'call log (search)',
+                'CALLLOG_DETAILS': 'call details lookup',
+                'CALLLOG_EVENTS': 'call event lookup',
+                'BULK_EMAIL_LIST': 'bulk email history',
+                'BULK_EMAIL_STATS': 'bulk email stats',
+                'SMS_STATUS': 'SMS status',
+                'SMS_CONVO': 'SMS conversation',
+                'SMS_RECENT': 'recent SMS',
+                'SMS_STATS': 'SMS stats'
+            };
+            const label = conversationLabels[action] || action.toLowerCase().replace(/_/g, ' ');
+            await ctx.reply(`Starting ${label}...`);
             await ctx.conversation.enter(conversations[action]);
             finishMetric('ok');
             return;
@@ -1138,15 +1234,13 @@ bot.on('callback_query:data', async (ctx) => {
                 break;
                 
             case 'USERS':
-                if (isAdminUser) {
-                    try {
-                        await executeUsersCommand(ctx);
-                        finishMetric('ok');
-                    } catch (usersError) {
-                        console.error('Users callback error:', usersError);
-                        await ctx.reply('❌ Error displaying users list. Please try again.');
-                        finishMetric('error', { error: usersError?.message || String(usersError) });
-                    }
+                try {
+                    await executeUsersCommand(ctx);
+                    finishMetric('ok');
+                } catch (usersError) {
+                    console.error('Users callback error:', usersError);
+                    await ctx.reply('❌ Error displaying users list. Please try again.');
+                    finishMetric('error', { error: usersError?.message || String(usersError) });
                 }
                 break;
                 
@@ -1166,88 +1260,97 @@ bot.on('callback_query:data', async (ctx) => {
                 break;
                 
             case 'STATUS':
-                if (isAdminUser) {
-                    await handleStatusCommand(ctx);
-                    finishMetric('ok');
-                }
-                break;
-
-            case 'TEST_API':
-                if (isAdminUser) {
-                    await handleTestApiCommand(ctx);
-                    finishMetric('ok');
-                }
+                await handleStatusCommand(ctx);
+                finishMetric('ok');
                 break;
 
             case 'PROVIDER_STATUS':
-                if (isAdminUser) {
-                    await executeProviderStatusCommand(ctx);
-                    finishMetric('ok');
-                }
+                await renderProviderMenu(ctx, { forceRefresh: true });
+                finishMetric('ok');
                 break;
 
             case 'CALLS':
-                await executeCallsCommand(ctx);
+                await renderCalllogMenu(ctx);
+                finishMetric('ok');
+                break;
+
+            case 'CALLLOG':
+                await renderCalllogMenu(ctx);
                 finishMetric('ok');
                 break;
 
             case 'SMS':
-                await ctx.reply(`Starting SMS process...`);
-                await ctx.conversation.enter('sms-conversation');
+                await renderSmsMenu(ctx);
                 finishMetric('ok');
                 break;
-                
+
+            case 'EMAIL':
+                await renderEmailMenu(ctx);
+                finishMetric('ok');
+                break;
+
             case 'BULK_SMS':
-                if (isAdminUser) {
-                    await ctx.reply(`Starting bulk SMS process...`);
-                    await ctx.conversation.enter('bulk-sms-conversation');
-                    finishMetric('ok');
-                }
+                await renderBulkSmsMenu(ctx);
+                finishMetric('ok');
+                break;
+
+            case 'BULK_EMAIL':
+                await renderBulkEmailMenu(ctx);
+                finishMetric('ok');
                 break;
             
             case 'SCHEDULE_SMS':
-                await ctx.reply(`Starting SMS scheduling...`);
-                await ctx.conversation.enter('schedule-sms-conversation');
+                await renderSmsMenu(ctx);
                 finishMetric('ok');
                 break;
-            
-            case 'SMS_STATS':
-                if (isAdminUser) {
-                    await executeSmsStatsCommand(ctx);
-                    finishMetric('ok');
-                }
+
+            case 'BULK_SMS_LIST':
+                await sendBulkSmsList(ctx);
+                finishMetric('ok');
                 break;
 
-            case 'RECENT_SMS':
-                if (isAdminUser) {
-                    await executeRecentSmsCommand(ctx);
-                    finishMetric('ok');
-                }
+            case 'BULK_SMS_STATS':
+                await sendBulkSmsStats(ctx);
+                finishMetric('ok');
+                break;
+
+            case 'BULK_SMS_CANCEL':
+                await ctx.reply('⛔ Bulk SMS cancellation is not available yet.');
+                finishMetric('ok');
+                break;
+
+            case 'BULK_EMAIL_CANCEL':
+                await ctx.reply('⛔ Bulk email cancellation is not available yet.');
+                finishMetric('ok');
+                break;
+
+            case 'EMAIL_HISTORY':
+                await emailHistoryFlow(ctx);
+                finishMetric('ok');
                 break;
 
             case 'SMS_STATUS_HELP':
-                await ctx.reply(
-                    'Use <code>/smsstatus &lt;message_sid&gt;</code> to check delivery status.\nExample: <code>/smsstatus SM1234567890abcdef</code>',
-                    { parse_mode: 'HTML' }
-                );
+                await renderSmsMenu(ctx);
                 finishMetric('ok');
                 break;
 
             case 'SMS_CONVO_HELP':
-                if (isAdminUser) {
-                    await ctx.reply(
-                        'Use <code>/smsconversation &lt;phone_number&gt;</code> to view a thread.\nExample: <code>/smsconversation +1234567890</code>',
-                        { parse_mode: 'HTML' }
-                    );
-                    finishMetric('ok');
-                }
+                await renderSmsMenu(ctx);
+                finishMetric('ok');
                 break;
 
             case 'EMAIL_STATUS_HELP':
-                await ctx.reply(
-                    'Use <code>/emailstatus &lt;message_id&gt;</code> to check email status.\nExample: <code>/emailstatus email_1234...</code>',
-                    { parse_mode: 'HTML' }
-                );
+                await renderEmailMenu(ctx);
+                finishMetric('ok');
+                break;
+
+            case 'RECENT_SMS':
+                await sendRecentSms(ctx, 10);
+                finishMetric('ok');
+                break;
+
+            case 'TEST_API':
+                await ctx.reply('ℹ️ /testapi has been retired. Use /status for diagnostics.');
                 finishMetric('ok');
                 break;
                 
@@ -1310,58 +1413,6 @@ async function executeUsersCommand(ctx) {
     } catch (error) {
         console.error('executeUsersCommand error:', error);
         await ctx.reply('❌ Error fetching users list. Please try again.');
-    }
-}
-
-async function executeSmsStatsCommand(ctx) {
-    try {
-        await getSmsStats(ctx);
-    } catch (error) {
-        console.error('SMS stats callback error:', error);
-        await ctx.reply('❌ Error fetching SMS statistics.');
-    }
-}
-
-async function executeRecentSmsCommand(ctx) {
-    try {
-        const limit = 10;
-        const response = await httpClient.get(ctx, `${config.apiUrl}/api/sms/messages/recent`, {
-            params: { limit },
-            timeout: 10000
-        });
-
-        if (response.data.success && response.data.messages.length > 0) {
-            const messages = response.data.messages;
-            let messagesText = `📱 Recent SMS (${messages.length})\n\n`;
-
-            messages.forEach((msg, index) => {
-                const time = new Date(msg.created_at).toLocaleString();
-                const direction = msg.direction === 'inbound' ? '📨' : '📤';
-                const phone = msg.to_number || msg.from_number || 'Unknown';
-                const statusIcon = msg.status === 'delivered' ? '✅' :
-                    msg.status === 'failed' ? '❌' :
-                    msg.status === 'pending' ? '⏳' : '❓';
-                
-                messagesText +=
-                    `${index + 1}. ${direction} ${phone} ${statusIcon}\n` +
-                    `   Status: ${msg.status} | ${time}\n` +
-                    `   Message: ${msg.body.substring(0, 60)}${msg.body.length > 60 ? '...' : ''}\n`;
-                
-                if (msg.error_message) {
-                    messagesText += `   Error: ${msg.error_message}\n`;
-                }
-                
-                messagesText += '\n';
-            });
-
-            messagesText += 'Use /smsstatus <message_sid> for detailed status info';
-            await ctx.reply(messagesText, { parse_mode: 'Markdown' });
-        } else {
-            await ctx.reply('📱 No recent SMS messages found.');
-        }
-    } catch (error) {
-        console.error('Recent SMS callback error:', error);
-        await ctx.reply('❌ Error fetching recent SMS messages.');
     }
 }
 
@@ -1450,7 +1501,7 @@ async function executeCallsCommand(ctx) {
             message += `&nbsp;&nbsp;💬 ${transcriptCount} message${transcriptCount === 1 ? '' : 's'}\n\n`;
         });
 
-        message += 'Use /search &lt;call_id&gt; to view details';
+        message += 'Use /calllog to view details';
 
         await ctx.reply(message, { parse_mode: 'HTML' });
 
@@ -1485,83 +1536,6 @@ async function executeCallsCommand(ctx) {
     }
 }
 
-function buildProviderKeyboard(ctx, activeProvider = '') {
-    const keyboard = new InlineKeyboard();
-    SUPPORTED_PROVIDERS.forEach((provider, index) => {
-        const normalized = provider.toLowerCase();
-        const isActive = normalized === activeProvider;
-        const label = isActive ? `✅ ${normalized.toUpperCase()}` : normalized.toUpperCase();
-        keyboard.text(label, buildCallbackData(ctx, `PROVIDER_SET:${normalized}`));
-
-        const shouldInsertRow = index % 2 === 1 && index < SUPPORTED_PROVIDERS.length - 1;
-        if (shouldInsertRow) {
-            keyboard.row();
-        }
-    });
-
-    keyboard.row().text('🔄 Refresh', buildCallbackData(ctx, 'PROVIDER_STATUS'));
-    return keyboard;
-}
-
-async function executeProviderStatusCommand(ctx) {
-    try {
-        const status = await fetchProviderStatus();
-        const active = (status.provider || '').toLowerCase();
-        const keyboard = buildProviderKeyboard(ctx, active);
-
-        let message = formatProviderStatus(status);
-        message += '\n\nTap a provider below to switch.';
-
-        await renderMenu(ctx, message, keyboard, { parseMode: 'Markdown' });
-    } catch (error) {
-        console.error('Provider status command error:', error);
-        if (error.response) {
-            const details = error.response.data?.details || error.response.data?.error || error.response.statusText;
-            await ctx.reply(`❌ Failed to fetch provider status: ${details || 'Unknown error'}`);
-        } else if (error.request) {
-            await ctx.reply('❌ No response from provider API. Please check the server.');
-        } else {
-            await ctx.reply(`❌ Error fetching provider status: ${error.message}`);
-        }
-    }
-}
-
-async function executeProviderSwitchCommand(ctx, provider) {
-    const normalized = (provider || '').trim().toLowerCase();
-    if (!normalized || !SUPPORTED_PROVIDERS.includes(normalized)) {
-        await ctx.reply('❌ Unsupported provider selection.');
-        return;
-    }
-
-    try {
-        const result = await updateProvider(normalized);
-        const status = await fetchProviderStatus();
-        const active = (status.provider || '').toLowerCase();
-        const keyboard = buildProviderKeyboard(ctx, active);
-
-        const targetLabel = active ? active.toUpperCase() : normalized.toUpperCase();
-        let message = result.changed === false
-            ? `ℹ️ Provider already set to *${targetLabel}*.`
-            : `✅ Call provider set to *${targetLabel}*.`;
-
-        message += '\n\n';
-        message += formatProviderStatus(status);
-        message += '\n\nTap a provider below to switch again.';
-
-        await renderMenu(ctx, message, keyboard, { parseMode: 'Markdown' });
-    } catch (error) {
-        console.error('Provider switch command error:', error);
-        if (error.response) {
-            const details = error.response.data?.details || error.response.data?.error || error.response.statusText;
-            await ctx.reply(`❌ Failed to update provider: ${details || 'Unknown error'}`);
-        } else if (error.request) {
-            await ctx.reply('❌ No response from provider API. Please check the server.');
-        } else {
-            await ctx.reply(`❌ Error switching provider: ${error.message}`);
-        }
-    }
-}
-
 const TELEGRAM_COMMANDS = [
     { command: 'start', description: 'Start or restart the bot' },
     { command: 'help', description: 'Show available commands' },
@@ -1569,22 +1543,11 @@ const TELEGRAM_COMMANDS = [
     { command: 'guide', description: 'Show detailed usage guide' },
     { command: 'health', description: 'Check bot and API health' },
     { command: 'call', description: 'Start outbound voice call' },
-    { command: 'search', description: 'Search calls' },
-    { command: 'recent', description: 'List recent calls' },
-    { command: 'latency', description: 'Call latency breakdown' },
-    { command: 'version', description: 'Service version info' },
-    { command: 'digest', description: 'Daily call + notification digest' },
-    { command: 'sms', description: 'Send SMS message' },
-    { command: 'schedulesms', description: 'Schedule SMS message' },
-    { command: 'smsstatus', description: 'Check SMS delivery status' },
-    { command: 'smsconversation', description: 'View SMS conversation (admin only)' },
-    { command: 'recentsms', description: 'Recent SMS messages (admin only)' },
-    { command: 'smsstats', description: 'SMS statistics (admin only)' },
-    { command: 'email', description: 'Send an email message' },
-    { command: 'emailstatus', description: 'Check email status' },
-    { command: 'bulksms', description: 'Send bulk SMS (admin only)' },
-    { command: 'bulkemail', description: 'Send bulk email (admin only)' },
-    { command: 'emailbulk', description: 'Bulk email status (admin only)' },
+    { command: 'calllog', description: 'Call history and search' },
+    { command: 'sms', description: 'Open SMS center' },
+    { command: 'email', description: 'Open Email center' },
+    { command: 'smssender', description: 'Bulk SMS center (admin only)' },
+    { command: 'mailer', description: 'Bulk email center (admin only)' },
     { command: 'scripts', description: 'Manage call & SMS scripts (admin only)' },
     { command: 'persona', description: 'Manage personas (admin only)' },
     { command: 'provider', description: 'Manage call provider (admin only)' },
@@ -1592,9 +1555,43 @@ const TELEGRAM_COMMANDS = [
     { command: 'promote', description: 'Promote to ADMIN (admin only)' },
     { command: 'removeuser', description: 'Remove a USER (admin only)' },
     { command: 'users', description: 'List authorized users (admin only)' },
-    { command: 'status', description: 'System status (admin only)' },
-    { command: 'testapi', description: 'Test API connection (admin only)' }
+    { command: 'status', description: 'System status (admin only)' }
 ];
+
+const TELEGRAM_COMMANDS_GUEST = [
+    { command: 'start', description: 'Start or restart the bot' },
+    { command: 'help', description: 'Learn how the bot works' },
+    { command: 'menu', description: 'Browse the feature menu' },
+    { command: 'guide', description: 'View the user guide' }
+];
+
+const TELEGRAM_COMMANDS_USER = [
+    { command: 'start', description: 'Start or restart the bot' },
+    { command: 'help', description: 'Show available commands' },
+    { command: 'menu', description: 'Show quick action menu' },
+    { command: 'guide', description: 'Show detailed usage guide' },
+    { command: 'health', description: 'Check bot and API health' },
+    { command: 'call', description: 'Start outbound voice call' },
+    { command: 'calllog', description: 'Call history and search' },
+    { command: 'sms', description: 'Open SMS center' },
+    { command: 'email', description: 'Open Email center' }
+];
+
+async function syncChatCommands(ctx, access) {
+    if (!ctx.chat || ctx.chat.type !== 'private') {
+        return;
+    }
+    const commands = access.user
+        ? (access.isAdmin ? TELEGRAM_COMMANDS : TELEGRAM_COMMANDS_USER)
+        : TELEGRAM_COMMANDS_GUEST;
+    try {
+        await bot.api.setMyCommands(commands, {
+            scope: { type: 'chat', chat_id: ctx.chat.id }
+        });
+    } catch (error) {
+        console.warn('Failed to sync chat commands:', error?.message || error);
+    }
+}
 
 // Handle unknown commands and text messages
 bot.on('message:text', async (ctx) => {

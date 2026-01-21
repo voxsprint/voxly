@@ -5,6 +5,44 @@ const { ensureSession } = require('./sessionState');
 const DEFAULT_CALLBACK_TTL_MS = 15 * 60 * 1000;
 const DEFAULT_DEDUPE_TTL_MS = 8000;
 const SIGN_PREFIX = 'cb';
+const MENU_ACTION_LOG_INTERVAL = 25;
+const MENU_ACTIONS = new Set([
+  'CALL',
+  'CALLS',
+  'CALLLOG',
+  'CALLLOG_RECENT',
+  'CALLLOG_SEARCH',
+  'CALLLOG_DETAILS',
+  'CALLLOG_EVENTS',
+  'SMS',
+  'SMS_SEND',
+  'SMS_SCHEDULE',
+  'SMS_STATUS',
+  'SMS_CONVO',
+  'SMS_RECENT',
+  'SMS_STATS',
+  'EMAIL',
+  'EMAIL_SEND',
+  'EMAIL_STATUS',
+  'EMAIL_TEMPLATES',
+  'EMAIL_HISTORY',
+  'BULK_SMS',
+  'BULK_SMS_SEND',
+  'BULK_SMS_LIST',
+  'BULK_SMS_STATUS',
+  'BULK_SMS_STATS',
+  'BULK_EMAIL',
+  'BULK_EMAIL_SEND',
+  'BULK_EMAIL_STATUS',
+  'BULK_EMAIL_LIST',
+  'BULK_EMAIL_STATS',
+  'SCRIPTS',
+  'PROVIDER_STATUS',
+  'STATUS',
+  'USERS'
+]);
+const menuActionStats = {};
+let menuActionCount = 0;
 
 function getCallbackSecret() {
   return config.botToken || config.apiAuth?.hmacSecret || 'callback-secret';
@@ -159,6 +197,32 @@ function finishActionMetric(metric, status = 'ok', extra = {}) {
     ...extra
   };
   console.log(JSON.stringify(payload));
+  if (metric?.name === 'callback' && metric?.raw_action) {
+    const parsed = parseCallbackData(metric.raw_action);
+    const action = parsed.action || metric.raw_action;
+    if (MENU_ACTIONS.has(action)) {
+      const entry = menuActionStats[action] || { total: 0, error: 0 };
+      entry.total += 1;
+      if (status !== 'ok') {
+        entry.error += 1;
+      }
+      menuActionStats[action] = entry;
+      menuActionCount += 1;
+      if (menuActionCount % MENU_ACTION_LOG_INTERVAL === 0) {
+        const summary = Object.entries(menuActionStats)
+          .map(([key, value]) => ({
+            action: key,
+            total: value.total,
+            errorRate: value.total ? Math.round((value.error / value.total) * 100) : 0
+          }))
+          .sort((a, b) => b.errorRate - a.errorRate)
+          .slice(0, 5)
+          .map((row) => `${row.action}: ${row.errorRate}% (${row.total})`)
+          .join(' | ');
+        console.log(`📊 Menu action health: ${summary}`);
+      }
+    }
+  }
 }
 
 module.exports = {

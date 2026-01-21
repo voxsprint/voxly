@@ -5720,6 +5720,27 @@ app.get('/email/bulk/:jobId', async (req, res) => {
     }
 });
 
+app.get('/email/bulk/history', async (req, res) => {
+    try {
+        const limit = Math.min(parseInt(req.query.limit, 10) || 10, 50);
+        const offset = Math.max(parseInt(req.query.offset, 10) || 0, 0);
+        const jobs = await db.getEmailBulkJobs({ limit, offset });
+        res.json({ success: true, jobs: jobs.map(normalizeEmailJobForApi), limit, offset });
+    } catch (error) {
+        res.status(500).json({ success: false, error: error.message });
+    }
+});
+
+app.get('/email/bulk/stats', async (req, res) => {
+    try {
+        const hours = Math.min(Math.max(parseInt(req.query.hours, 10) || 24, 1), 720);
+        const stats = await db.getEmailBulkStats({ hours });
+        res.json({ success: true, stats, hours });
+    } catch (error) {
+        res.status(500).json({ success: false, error: error.message });
+    }
+});
+
 // Send single SMS endpoint
 app.post('/api/sms/send', async (req, res) => {
     try {

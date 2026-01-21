@@ -14,27 +14,19 @@ async function handleHelp(ctx) {
 
         const callList = [
             '📞 /call — launch a fresh voice session (requires access)',
-            '🔍 /search <term> — locate calls by number, intent, or ID',
-            '🕒 /recent [limit] — list recent calls (max 50)',
-            '⏱️ /latency <callSid> — see STT/GPT/TTS timing',
-            '🧭 /version — view API/service version info'
+            '📜 /calllog — browse recent calls, search, and events'
         ];
 
         const smsList = [
-            '💬 /sms — send a quick AI-powered SMS (requires access)',
-            '📅 /schedulesms — schedule an SMS in the future (requires access)',
-            '🧾 /smsconversation <phone> — view recent SMS threads (admin)',
-            '🔎 /smsstatus <message_sid> — delivery status for a message (requires access)'
+            '💬 /sms — open the SMS center (send, schedule, status, threads, stats)'
         ];
 
         const emailList = [
-            '📧 /email — send an email message (requires access)',
-            '📬 /emailstatus <message_id> — check email delivery (requires access)'
+            '📧 /email — open the Email center (send, status, templates)'
         ];
 
         const infoList = [
             '🩺 /health or /ping — check bot & API health',
-            '📰 /digest — 24h notifications + recent calls digest',
             '📚 /guide — view the master user guide (access required)',
             '📋 /menu — reopen quick actions (access required)',
             '❓ /help — show this message again'
@@ -50,8 +42,7 @@ async function handleHelp(ctx) {
 
         const exampleUsage = [
             '+1234567890 (not 123-456-7890)',
-            '/search refund',
-            '/recent 20',
+            '/calllog',
             '/health'
         ];
 
@@ -75,13 +66,9 @@ async function handleHelp(ctx) {
                 '⭐ /promote — elevate a teammate to admin',
                 '❌ /removeuser — cut access cleanly',
                 '👥 /users — list all authorized personnel',
-                '📣 /bulksms — broadcast smart SMS',
-                '📥 /recentsms [limit] — list recent SMS messages',
-                '📊 /smsstats — view SMS health & delivery',
-                '📦 /bulkemail — send bulk email',
-                '📬 /emailbulk <job_id> — bulk email job status',
+                '📣 /smssender — bulk SMS center',
+                '📦 /mailer — bulk email center',
                 '🧪 /status — deep system status',
-                '🧪 /testapi — hit the API health endpoint',
                 '🧰 /scripts — manage reusable prompts',
                 '🍃 /persona — sculpt adaptive agents',
                 '🔀 /provider — view or switch voice providers'
@@ -95,6 +82,9 @@ async function handleHelp(ctx) {
         );
 
         const unauthSections = [
+            `<b>${escapeHtml('⚠️ Access limited')}</b>\n${formatLines([
+                'You can browse menus, but actions require approval.'
+            ])}`,
             `<b>${escapeHtml('Welcome! Access is required to use most commands.')}</b>`,
             `<b>What this bot can do</b>\n${formatLines([
                 '🤖 Run AI-powered voice calls and SMS outreach',
@@ -105,6 +95,9 @@ async function handleHelp(ctx) {
                 `🆘 Contact admin: @${escapeHtml(config.admin.username || '')}`,
                 'Share your Telegram @ and reason to be approved.',
                 'Once approved, use /start to see your menu.'
+            ])}`,
+            `<b>${escapeHtml('🔒 Limited mode')}</b>\n${formatLines([
+                'Menus are visible, but execution is locked.'
             ])}`
         ];
 
@@ -132,7 +125,15 @@ async function handleHelp(ctx) {
                 }
                 return keyboard;
             })()
-            : new InlineKeyboard().url('📱 Contact Admin', `https://t.me/${adminUsername}`);
+            : (() => {
+                const keyboard = new InlineKeyboard()
+                    .text('📚 Guide', buildCallbackData(ctx, 'GUIDE'))
+                    .text('📋 Menu', buildCallbackData(ctx, 'MENU'));
+                if (adminUsername) {
+                    keyboard.row().url('🔓 Request Access', `https://t.me/${adminUsername}`);
+                }
+                return keyboard;
+            })();
 
         await renderMenu(ctx, helpText, kb, { parseMode: 'HTML' });
 

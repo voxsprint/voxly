@@ -2,6 +2,14 @@ const config = require('../config');
 const httpClient = require('../utils/httpClient');
 const { getUser, isAdmin } = require('../db/db');
 const { escapeMarkdown, buildLine } = require('../utils/ui');
+const { buildCallbackData } = require('../utils/actions');
+const { getDeniedAuditSummary } = require('../utils/capabilities');
+
+function buildMainMenuReplyMarkup(ctx) {
+    return {
+        inline_keyboard: [[{ text: '⬅️ Main Menu', callback_data: buildCallbackData(ctx, 'MENU') }]]
+    };
+}
 
 function parseRecentFilter(filter) {
     const trimmed = (filter || '').trim();
@@ -110,7 +118,10 @@ async function handleTestApiCommand(ctx) {
             message += `\n🚀 Enhanced Features: ✅ Active`;
         }
 
-        await ctx.reply(message, { parse_mode: 'Markdown' });
+        await ctx.reply(message, {
+            parse_mode: 'Markdown',
+            reply_markup: buildMainMenuReplyMarkup(ctx)
+        });
     } catch (error) {
         console.error('API test failed:', error);
 
@@ -129,7 +140,10 @@ async function handleTestApiCommand(ctx) {
             errorMessage += `Error: ${escapeMarkdown(error.message)}`;
         }
 
-        await ctx.reply(errorMessage, { parse_mode: 'Markdown' });
+        await ctx.reply(errorMessage, {
+            parse_mode: 'Markdown',
+            reply_markup: buildMainMenuReplyMarkup(ctx)
+        });
     }
 }
 
@@ -191,6 +205,22 @@ async function handleStatusCommand(ctx) {
         message += `${buildLine('📞', 'Active Calls', health.active_calls || 0)}\n`;
         message += `✨ Keeping the console lively with ${health.active_calls || 0} active connections.\n`;
 
+        const audit = getDeniedAuditSummary();
+        if (audit.total > 0) {
+            message += `${buildLine('🔒', `Access denials (${audit.windowSeconds}s)`, `${audit.total} across ${audit.users} user(s), ${audit.rateLimited} rate-limited`)}\n`;
+            if (audit.recent && audit.recent.length > 0) {
+                const recentLines = audit.recent.map((entry) => {
+                    const suffix = entry.userId ? String(entry.userId).slice(-4) : 'unknown';
+                    const who = `user#${suffix}`;
+                    const actionLabel = escapeMarkdown(entry.actionLabel || entry.capability || 'action');
+                    const role = escapeMarkdown(entry.role || 'unknown');
+                    const when = entry.timestamp ? new Date(entry.timestamp).toLocaleTimeString() : 'recent';
+                    return `• ${who} (${role}) blocked on ${actionLabel} at ${escapeMarkdown(when)}`;
+                });
+                message += `\n*🔐 Recent denials:*\n${recentLines.join('\n')}\n`;
+            }
+        }
+
         if (health.adaptation_engine) {
             message += `\n*🤖 AI Features:*\n`;
             message += `${buildLine('🧠', 'Adaptation Engine', '✅ Active')}\n`;
@@ -213,7 +243,10 @@ async function handleStatusCommand(ctx) {
         message += `\n${buildLine('⏰','Last Updated', escapeMarkdown(new Date(health.timestamp).toLocaleString()))}`;
         message += `\n${buildLine('📡','API Endpoint', escapeMarkdown(config.apiUrl))}`;
 
-        await ctx.reply(message, { parse_mode: 'Markdown' });
+        await ctx.reply(message, {
+            parse_mode: 'Markdown',
+            reply_markup: buildMainMenuReplyMarkup(ctx)
+        });
     } catch (error) {
         console.error('Status command error:', error);
 
@@ -236,7 +269,10 @@ async function handleStatusCommand(ctx) {
 
         errorMessage += `\n📡 API Endpoint: ${escapeMarkdown(config.apiUrl)}`;
 
-        await ctx.reply(errorMessage, { parse_mode: 'Markdown' });
+        await ctx.reply(errorMessage, {
+            parse_mode: 'Markdown',
+            reply_markup: buildMainMenuReplyMarkup(ctx)
+        });
     }
 }
 
@@ -330,26 +366,6 @@ async function handleLatencyCommand(ctx) {
     } catch (error) {
         console.error('Latency command error:', error?.message || error);
         await ctx.reply('❌ Failed to fetch latency. Please try again later.');
-    }
-}
-
-async function handleVersionCommand(ctx) {
-    try {
-        const user = await new Promise(r => getUser(ctx.from.id, r));
-        if (!user) return ctx.reply('❌ You are not authorized.');
-
-        const res = await httpClient.get(null, `${config.apiUrl}/api/version`, { timeout: 6000 });
-        const v = res.data;
-        const message = [
-            `🧭 Version: ${v.version || 'unknown'}`,
-            `📦 Service: ${v.name || 'api'}`,
-            `📡 Provider: ${v.provider || 'n/a'}`,
-            `⏰ ${new Date(v.timestamp).toLocaleString()}`
-        ].join('\n');
-        await ctx.reply(message);
-    } catch (error) {
-        console.error('Version command error:', error?.message || error);
-        await ctx.reply('❌ Failed to fetch version. Please try again later.');
     }
 }
 
@@ -447,7 +463,10 @@ async function handleHealthCommand(ctx) {
 
             message += `⏰ Checked: ${new Date().toLocaleTimeString()}`;
 
-            await ctx.reply(message, { parse_mode: 'Markdown' });
+            await ctx.reply(message, {
+                parse_mode: 'Markdown',
+                reply_markup: buildMainMenuReplyMarkup(ctx)
+            });
         } catch (apiError) {
             const responseTime = Date.now() - startTime;
 
@@ -465,22 +484,22 @@ async function handleHealthCommand(ctx) {
                 message += `📝 ${apiError.message}`;
             }
 
-            await ctx.reply(message, { parse_mode: 'Markdown' });
+            await ctx.reply(message, {
+                parse_mode: 'Markdown',
+                reply_markup: buildMainMenuReplyMarkup(ctx)
+            });
         }
     } catch (error) {
         console.error('Health command error:', error);
-        await ctx.reply(`🏥 *Health Check*\n\n🤖 Bot: ✅ Responsive\n🌐 API: ❌ Error\n⏰ Checked: ${new Date().toLocaleTimeString()}\n\n📝 ${error.message}`, { parse_mode: 'Markdown' });
+        await ctx.reply(`🏥 *Health Check*\n\n🤖 Bot: ✅ Responsive\n🌐 API: ❌ Error\n⏰ Checked: ${new Date().toLocaleTimeString()}\n\n📝 ${error.message}`, {
+            parse_mode: 'Markdown',
+            reply_markup: buildMainMenuReplyMarkup(ctx)
+        });
     }
 }
 
 function registerApiCommands(bot) {
-    bot.command('testapi', handleTestApiCommand);
     bot.command('status', handleStatusCommand);
-    bot.command('search', handleSearchCommand);
-    bot.command('recent', handleRecentCommand);
-    bot.command('latency', handleLatencyCommand);
-    bot.command('version', handleVersionCommand);
-    bot.command('digest', handleDigestCommand);
     bot.command(['health', 'ping'], handleHealthCommand);
 }
 
@@ -491,7 +510,6 @@ module.exports = {
     handleSearchCommand,
     handleRecentCommand,
     handleLatencyCommand,
-    handleVersionCommand,
     handleDigestCommand,
     handleHealthCommand
 };

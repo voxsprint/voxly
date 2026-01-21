@@ -16,10 +16,45 @@ const {
 } = require('../utils/sessionState');
 const { section, buildLine, tipLine, escapeMarkdown, emphasize, activateMenuMessage, renderMenu } = require('../utils/ui');
 const { buildCallbackData } = require('../utils/actions');
+const { getAccessProfile } = require('../utils/capabilities');
 const { askOptionWithButtons } = require('../utils/persona');
 
 function normalizeEmail(value) {
   return String(value || '').trim().toLowerCase();
+}
+
+function stripMarkdown(text = '') {
+  return String(text).replace(/[*_`[\]()>#+=|{}.!-]/g, '');
+}
+
+async function safeReply(ctx, text, options = {}) {
+  try {
+    return await ctx.reply(text, options);
+  } catch (error) {
+    if (/can't parse entities/i.test(error?.message || '')) {
+      const fallback = stripMarkdown(text);
+      const fallbackOptions = { ...options };
+      delete fallbackOptions.parse_mode;
+      return await ctx.reply(fallback, fallbackOptions);
+    }
+    throw error;
+  }
+}
+
+async function safeReplyMarkdown(ctx, text, options = {}) {
+  return safeReply(ctx, text, { parse_mode: 'Markdown', ...options });
+}
+
+function buildBackToMenuKeyboard(ctx, action = 'EMAIL', label = '⬅️ Back to Email Menu') {
+  return new InlineKeyboard().text(label, buildCallbackData(ctx, action));
+}
+
+async function maybeSendEmailAliasTip(ctx) {
+  if (!ctx.session) return;
+  ctx.session.hints = ctx.session.hints || {};
+  if (ctx.session.hints.emailMenuTipSent) return;
+  ctx.session.hints.emailMenuTipSent = true;
+  await ctx.reply('ℹ️ Tip: /email is now the single entry point for all Email actions.');
 }
 
 function extractEmailTemplateVariables(text = '') {
@@ -185,22 +220,22 @@ async function promptHtmlBody(conversation, ctx, ensureActive) {
     return null;
   }
   if (choice.id === 'paste') {
-    await ctx.reply(section('🧩 HTML Body', ['Paste HTML content.']), { parse_mode: 'Markdown' });
+    await safeReplyMarkdown(ctx, section('🧩 HTML Body', ['Paste HTML content.']));
     const update = await conversation.wait();
     ensureActive();
     return update?.message?.text?.trim() || null;
   }
-  await ctx.reply(section('📎 Upload HTML', ['Send the .html file now.']), { parse_mode: 'Markdown' });
+  await safeReplyMarkdown(ctx, section('📎 Upload HTML', ['Send the .html file now.']));
   const upload = await conversation.wait();
   ensureActive();
   const doc = upload?.message?.document;
   if (!doc?.file_id) {
-    await ctx.reply('❌ No document received.');
+    await safeReply(ctx, '❌ No document received.');
     return null;
   }
   const filename = doc.file_name || '';
   if (!filename.toLowerCase().endsWith('.html') && doc.mime_type !== 'text/html') {
-    await ctx.reply('❌ Please upload a valid .html file.');
+    await safeReply(ctx, '❌ Please upload a valid .html file.');
     return null;
   }
   return downloadHtmlFromTelegram(ctx, doc.file_id);
@@ -264,27 +299,27 @@ function formatEmailTemplateSummary(template) {
 }
 
 async function createEmailTemplateFlow(conversation, ctx, ensureActive) {
-  await ctx.reply(section('🆕 Create Email Template', [
+  await safeReplyMarkdown(ctx, section('🆕 Create Email Template', [
     'Provide a template ID (e.g., welcome_email).'
-  ]), { parse_mode: 'Markdown' });
+  ]));
   const idMsg = await conversation.wait();
   ensureActive();
   const templateId = idMsg?.message?.text?.trim();
   if (!templateId) {
-    await ctx.reply('❌ Template ID is required.');
+    await safeReply(ctx, '❌ Template ID is required.');
     return;
   }
 
-  await ctx.reply(section('🧾 Subject', ['Enter the email subject line.']), { parse_mode: 'Markdown' });
+  await safeReplyMarkdown(ctx, section('🧾 Subject', ['Enter the email subject line.']));
   const subjectMsg = await conversation.wait();
   ensureActive();
   const subject = subjectMsg?.message?.text?.trim();
   if (!subject) {
-    await ctx.reply('❌ Subject is required.');
+    await safeReply(ctx, '❌ Subject is required.');
     return;
   }
 
-  await ctx.reply(section('📝 Text Body', ['Enter the plain text body (or type skip).']), { parse_mode: 'Markdown' });
+  await safeReplyMarkdown(ctx, section('📝 Text Body', ['Enter the plain text body (or type skip).']));
   const textMsg = await conversation.wait();
   ensureActive();
   let textBody = textMsg?.message?.text?.trim();
@@ -301,18 +336,18 @@ async function createEmailTemplateFlow(conversation, ctx, ensureActive) {
     text: textBody
   });
   if (validation.errors.length) {
-    await ctx.reply(section('❌ Template validation failed', validation.errors), { parse_mode: 'Markdown' });
+    await safeReplyMarkdown(ctx, section('❌ Template validation failed', validation.errors));
     return;
   }
   if (validation.requiredVars.length) {
     const varsLine = validation.requiredVars.slice(0, 12).join(', ');
-    await ctx.reply(section('🧩 Detected variables', [varsLine]), { parse_mode: 'Markdown' });
+    await safeReplyMarkdown(ctx, section('🧩 Detected variables', [varsLine]));
   }
   if (validation.warnings.length) {
-    await ctx.reply(section('⚠️ Template warnings', validation.warnings), { parse_mode: 'Markdown' });
+    await safeReplyMarkdown(ctx, section('⚠️ Template warnings', validation.warnings));
     const proceed = await confirmAction(conversation, ctx, 'Continue with these warnings?', ensureActive);
     if (!proceed) {
-      await ctx.reply('ℹ️ Template creation cancelled.');
+      await safeReply(ctx, 'ℹ️ Template creation cancelled.');
       return;
     }
   }
@@ -325,21 +360,21 @@ async function createEmailTemplateFlow(conversation, ctx, ensureActive) {
   });
 
   await storeEmailTemplateVersion(template, ctx);
-  await ctx.reply(formatEmailTemplateSummary(template), { parse_mode: 'Markdown' });
+  await safeReplyMarkdown(ctx, formatEmailTemplateSummary(template));
 }
 
 async function editEmailTemplateFlow(conversation, ctx, template, ensureActive) {
-  await ctx.reply(section('✏️ Update Template', [
+  await safeReplyMarkdown(ctx, section('✏️ Update Template', [
     'Type skip to keep the current value.'
-  ]), { parse_mode: 'Markdown' });
+  ]));
 
-  await ctx.reply(section('🧾 Subject', [`Current: ${template.subject || '—'}`]), { parse_mode: 'Markdown' });
+  await safeReplyMarkdown(ctx, section('🧾 Subject', [`Current: ${template.subject || '—'}`]));
   const subjectMsg = await conversation.wait();
   ensureActive();
   let subject = subjectMsg?.message?.text?.trim();
   if (subject && subject.toLowerCase() === 'skip') subject = undefined;
 
-  await ctx.reply(section('📝 Text Body', ['Paste new text or type skip.']), { parse_mode: 'Markdown' });
+  await safeReplyMarkdown(ctx, section('📝 Text Body', ['Paste new text or type skip.']));
   const textMsg = await conversation.wait();
   ensureActive();
   let textBody = textMsg?.message?.text?.trim();
@@ -352,7 +387,7 @@ async function editEmailTemplateFlow(conversation, ctx, template, ensureActive) 
   if (htmlBody !== null) updates.html = htmlBody;
 
   if (!Object.keys(updates).length) {
-    await ctx.reply('ℹ️ No changes made.');
+    await safeReply(ctx, 'ℹ️ No changes made.');
     return;
   }
 
@@ -366,25 +401,25 @@ async function editEmailTemplateFlow(conversation, ctx, template, ensureActive) 
     text: proposedText
   });
   if (validation.errors.length) {
-    await ctx.reply(section('❌ Template validation failed', validation.errors), { parse_mode: 'Markdown' });
+    await safeReplyMarkdown(ctx, section('❌ Template validation failed', validation.errors));
     return;
   }
   if (validation.requiredVars.length) {
     const varsLine = validation.requiredVars.slice(0, 12).join(', ');
-    await ctx.reply(section('🧩 Detected variables', [varsLine]), { parse_mode: 'Markdown' });
+    await safeReplyMarkdown(ctx, section('🧩 Detected variables', [varsLine]));
   }
   if (validation.warnings.length) {
-    await ctx.reply(section('⚠️ Template warnings', validation.warnings), { parse_mode: 'Markdown' });
+    await safeReplyMarkdown(ctx, section('⚠️ Template warnings', validation.warnings));
     const proceed = await confirmAction(conversation, ctx, 'Continue with these warnings?', ensureActive);
     if (!proceed) {
-      await ctx.reply('ℹ️ Update cancelled.');
+      await safeReply(ctx, 'ℹ️ Update cancelled.');
       return;
     }
   }
 
   const updated = await updateEmailTemplate(ctx, template.template_id, updates);
   await storeEmailTemplateVersion(updated, ctx);
-  await ctx.reply(formatEmailTemplateSummary(updated), { parse_mode: 'Markdown' });
+  await safeReplyMarkdown(ctx, formatEmailTemplateSummary(updated));
 }
 
 async function selectEmailTemplateId(conversation, ctx, ensureActive) {
@@ -429,12 +464,12 @@ async function deleteEmailTemplateFlow(conversation, ctx, template) {
     { prefix: 'email-template-delete', columns: 2 }
   );
   if (confirmed?.id !== 'yes') {
-    await ctx.reply('Deletion cancelled.');
+    await safeReply(ctx, 'Deletion cancelled.');
     return;
   }
   await storeEmailTemplateVersion(template, ctx);
   await deleteEmailTemplate(ctx, template.template_id);
-  await ctx.reply(`🗑️ Template *${escapeMarkdown(template.template_id)}* deleted.`, { parse_mode: 'Markdown' });
+  await safeReplyMarkdown(ctx, `🗑️ Template *${escapeMarkdown(template.template_id)}* deleted.`);
 }
 
 async function previewEmailTemplate(conversation, ctx, template, ensureActive) {
@@ -444,14 +479,14 @@ async function previewEmailTemplate(conversation, ctx, template, ensureActive) {
     variables
   });
   if (!previewResponse.data?.success) {
-    await ctx.reply('❌ Preview failed.');
+    await safeReply(ctx, '❌ Preview failed.');
     return;
   }
   const preview = previewResponse.data;
-  await ctx.reply(section('🔍 Preview', [
+  await safeReplyMarkdown(ctx, section('🔍 Preview', [
     buildLine('🧾', 'Subject', escapeMarkdown(preview.subject || '—')),
     buildLine('📄', 'Text', escapeMarkdown((preview.text || '').slice(0, 140) || '—'))
-  ]), { parse_mode: 'Markdown' });
+  ]));
 }
 
 function formatEmailVersionSummary(version) {
@@ -463,7 +498,7 @@ async function showEmailTemplateVersions(conversation, ctx, template, ensureActi
   const versions = await listScriptVersions(template.template_id, 'email', 8);
   ensureActive();
   if (!versions.length) {
-    await ctx.reply('ℹ️ No saved versions yet. Versions are stored on edit/delete.');
+    await safeReply(ctx, 'ℹ️ No saved versions yet. Versions are stored on edit/delete.');
     return;
   }
   const options = versions.map((version) => ({
@@ -483,13 +518,13 @@ async function showEmailTemplateVersions(conversation, ctx, template, ensureActi
   }
   const versionNumber = Number(selection.id);
   if (Number.isNaN(versionNumber)) {
-    await ctx.reply('❌ Invalid version selected.');
+    await safeReply(ctx, '❌ Invalid version selected.');
     return;
   }
   const version = await getScriptVersion(template.template_id, 'email', versionNumber);
   ensureActive();
   if (!version?.payload) {
-    await ctx.reply('❌ Version payload not found.');
+    await safeReply(ctx, '❌ Version payload not found.');
     return;
   }
   const confirmRestore = await confirmAction(
@@ -499,7 +534,7 @@ async function showEmailTemplateVersions(conversation, ctx, template, ensureActi
     ensureActive
   );
   if (!confirmRestore) {
-    await ctx.reply('ℹ️ Restore cancelled.');
+    await safeReply(ctx, 'ℹ️ Restore cancelled.');
     return;
   }
   await storeEmailTemplateVersion(template, ctx);
@@ -509,18 +544,18 @@ async function showEmailTemplateVersions(conversation, ctx, template, ensureActi
     text: version.payload.text
   });
   await storeEmailTemplateVersion(restored, ctx);
-  await ctx.reply(`✅ Restored template to version #${versionNumber}.`, { parse_mode: 'Markdown' });
+  await safeReplyMarkdown(ctx, `✅ Restored template to version #${versionNumber}.`);
 }
 
 async function cloneEmailTemplateFlow(conversation, ctx, template, ensureActive) {
-  await ctx.reply(section('🧬 Clone Template', [
+  await safeReplyMarkdown(ctx, section('🧬 Clone Template', [
     `Enter a new template ID for the clone of ${escapeMarkdown(template.template_id)}.`
-  ]), { parse_mode: 'Markdown' });
+  ]));
   const update = await conversation.wait();
   ensureActive();
   const newId = update?.message?.text?.trim();
   if (!newId) {
-    await ctx.reply('❌ Template ID is required.');
+    await safeReply(ctx, '❌ Template ID is required.');
     return;
   }
   const validation = validateEmailTemplatePayload({
@@ -530,15 +565,15 @@ async function cloneEmailTemplateFlow(conversation, ctx, template, ensureActive)
     text: template.text
   });
   if (validation.errors.length) {
-    await ctx.reply(section('❌ Template validation failed', validation.errors), { parse_mode: 'Markdown' });
+    await safeReplyMarkdown(ctx, section('❌ Template validation failed', validation.errors));
     return;
   }
   if (validation.requiredVars.length) {
     const varsLine = validation.requiredVars.slice(0, 12).join(', ');
-    await ctx.reply(section('🧩 Detected variables', [varsLine]), { parse_mode: 'Markdown' });
+    await safeReplyMarkdown(ctx, section('🧩 Detected variables', [varsLine]));
   }
   if (validation.warnings.length) {
-    await ctx.reply(section('⚠️ Template warnings', validation.warnings), { parse_mode: 'Markdown' });
+    await safeReplyMarkdown(ctx, section('⚠️ Template warnings', validation.warnings));
   }
   const cloned = await createEmailTemplate(ctx, {
     template_id: newId,
@@ -547,7 +582,7 @@ async function cloneEmailTemplateFlow(conversation, ctx, template, ensureActive)
     text: template.text || undefined
   });
   await storeEmailTemplateVersion(cloned, ctx);
-  await ctx.reply(`✅ Template cloned as *${escapeMarkdown(cloned.template_id)}*.`, { parse_mode: 'Markdown' });
+  await safeReplyMarkdown(ctx, `✅ Template cloned as *${escapeMarkdown(cloned.template_id)}*.`);
 }
 
 async function exportEmailTemplate(ctx, template) {
@@ -563,24 +598,24 @@ async function exportEmailTemplate(ctx, template) {
     JSON.stringify(payload, null, 2),
     '```'
   ].join('\n');
-  await ctx.reply(text, { parse_mode: 'Markdown' });
+  await safeReplyMarkdown(ctx, text);
 }
 
 async function importEmailTemplateFlow(conversation, ctx, ensureActive) {
-  await ctx.reply(section('📥 Import Template', [
+  await safeReplyMarkdown(ctx, section('📥 Import Template', [
     'Paste JSON with template_id, subject, and text/html.',
     'Example: {"template_id":"welcome","subject":"Hi {{name}}","text":"Hello {{name}}"}'
-  ]), { parse_mode: 'Markdown' });
+  ]));
   const update = await conversation.wait();
   ensureActive();
   const raw = update?.message?.text?.trim();
   if (!raw) {
-    await ctx.reply('❌ Import cancelled.');
+    await safeReply(ctx, '❌ Import cancelled.');
     return;
   }
   const parsed = parseJsonInput(raw);
   if (!parsed || typeof parsed !== 'object') {
-    await ctx.reply('❌ Invalid JSON.');
+    await safeReply(ctx, '❌ Invalid JSON.');
     return;
   }
   const templateId = String(parsed.template_id || parsed.id || '').trim();
@@ -594,15 +629,15 @@ async function importEmailTemplateFlow(conversation, ctx, ensureActive) {
     text: textBody
   });
   if (validation.errors.length) {
-    await ctx.reply(section('❌ Template validation failed', validation.errors), { parse_mode: 'Markdown' });
+    await safeReplyMarkdown(ctx, section('❌ Template validation failed', validation.errors));
     return;
   }
   if (validation.requiredVars.length) {
     const varsLine = validation.requiredVars.slice(0, 12).join(', ');
-    await ctx.reply(section('🧩 Detected variables', [varsLine]), { parse_mode: 'Markdown' });
+    await safeReplyMarkdown(ctx, section('🧩 Detected variables', [varsLine]));
   }
   if (validation.warnings.length) {
-    await ctx.reply(section('⚠️ Template warnings', validation.warnings), { parse_mode: 'Markdown' });
+    await safeReplyMarkdown(ctx, section('⚠️ Template warnings', validation.warnings));
   }
   const created = await createEmailTemplate(ctx, {
     template_id: templateId,
@@ -611,16 +646,16 @@ async function importEmailTemplateFlow(conversation, ctx, ensureActive) {
     html: htmlBody || undefined
   });
   await storeEmailTemplateVersion(created, ctx);
-  await ctx.reply(formatEmailTemplateSummary(created), { parse_mode: 'Markdown' });
+  await safeReplyMarkdown(ctx, formatEmailTemplateSummary(created));
 }
 
 async function searchEmailTemplatesFlow(conversation, ctx, ensureActive) {
-  await ctx.reply(section('🔎 Search Templates', ['Enter a keyword to search.']), { parse_mode: 'Markdown' });
+  await safeReplyMarkdown(ctx, section('🔎 Search Templates', ['Enter a keyword to search.']));
   const update = await conversation.wait();
   ensureActive();
   const term = update?.message?.text?.trim();
   if (!term) {
-    await ctx.reply('❌ Search cancelled.');
+    await safeReply(ctx, '❌ Search cancelled.');
     return;
   }
   const templates = await fetchEmailTemplates(ctx);
@@ -631,7 +666,7 @@ async function searchEmailTemplatesFlow(conversation, ctx, ensureActive) {
     return id.includes(normalized) || subject.includes(normalized);
   });
   if (!matches.length) {
-    await ctx.reply('ℹ️ No templates matched your search.');
+    await safeReply(ctx, 'ℹ️ No templates matched your search.');
     return;
   }
   const options = matches.map((tpl) => ({
@@ -649,7 +684,7 @@ async function searchEmailTemplatesFlow(conversation, ctx, ensureActive) {
   if (!selection || selection.id === 'back') return;
   const template = await fetchEmailTemplate(ctx, selection.id);
   if (!template) {
-    await ctx.reply('❌ Template not found.');
+    await safeReply(ctx, '❌ Template not found.');
     return;
   }
   await showEmailTemplateDetail(conversation, ctx, template, ensureActive);
@@ -658,7 +693,7 @@ async function searchEmailTemplatesFlow(conversation, ctx, ensureActive) {
 async function showEmailTemplateDetail(conversation, ctx, template, ensureActive) {
   let viewing = true;
   while (viewing) {
-    await ctx.reply(formatEmailTemplateSummary(template), { parse_mode: 'Markdown' });
+    await safeReplyMarkdown(ctx, formatEmailTemplateSummary(template));
     const action = await askOptionWithButtons(
       conversation,
       ctx,
@@ -740,7 +775,7 @@ async function emailTemplatesFlow(conversation, ctx, options = {}) {
   try {
     const user = await new Promise((resolve) => getUser(ctx.from.id, resolve));
     if (!user) {
-      await ctx.reply(section('❌ Authorization', ['You are not authorized to use this bot.']), { parse_mode: 'Markdown' });
+      await safeReplyMarkdown(ctx, section('❌ Authorization', ['You are not authorized to use this bot.']));
       return;
     }
     let open = true;
@@ -780,7 +815,215 @@ async function emailTemplatesFlow(conversation, ctx, options = {}) {
     }
   } catch (error) {
     console.error('Email template flow error:', error);
-    await ctx.reply(section('❌ Email Template Error', [error.message || 'Failed to manage templates.']), { parse_mode: 'Markdown' });
+    await safeReplyMarkdown(ctx, section('❌ Email Template Error', [error.message || 'Failed to manage templates.']));
+  }
+}
+
+function buildEmailMenuKeyboard(ctx) {
+  const keyboard = new InlineKeyboard()
+    .text('✉️ Send Email', buildCallbackData(ctx, 'EMAIL_SEND'))
+    .text('📬 Delivery Status', buildCallbackData(ctx, 'EMAIL_STATUS'))
+    .row()
+    .text('🧩 Templates', buildCallbackData(ctx, 'EMAIL_TEMPLATES'))
+    .text('🕒 History', buildCallbackData(ctx, 'EMAIL_HISTORY'));
+  return keyboard;
+}
+
+async function renderEmailMenu(ctx) {
+  const access = await getAccessProfile(ctx);
+  startOperation(ctx, 'email-menu');
+  const keyboard = buildEmailMenuKeyboard(ctx);
+  const title = access.user ? '📧 *Email Center*' : '🔒 *Email Center (Access limited)*';
+  const lines = [
+    'Choose an email action below.',
+    access.user ? 'Authorized access enabled.' : 'Limited access: request approval to send emails.',
+    access.user ? '' : '🔒 Actions are locked without approval.'
+  ].filter(Boolean);
+  await renderMenu(ctx, `${title}\n${lines.join('\n')}`, keyboard, { parseMode: 'Markdown' });
+}
+
+async function emailStatusFlow(conversation, ctx) {
+  const opId = startOperation(ctx, 'email-status');
+  const ensureActive = () => ensureOperationActive(ctx, opId);
+  try {
+    const user = await new Promise((resolve) => getUser(ctx.from.id, resolve));
+    ensureActive();
+    if (!user) {
+      await ctx.reply('❌ You are not authorized to use this bot.');
+      return;
+    }
+    await ctx.reply('📬 Enter the email message ID:');
+    const update = await conversation.wait();
+    ensureActive();
+    const messageId = update?.message?.text?.trim();
+    if (!messageId) {
+      await ctx.reply('❌ Message ID is required.');
+      return;
+    }
+    await sendEmailStatusCard(ctx, messageId, { forceReply: true });
+  } catch (error) {
+    console.error('Email status flow error:', error);
+    await ctx.reply('❌ Failed to fetch email status.');
+  }
+}
+
+async function emailHistoryFlow(ctx) {
+  await ctx.reply('ℹ️ Email history is not yet available.');
+}
+
+function buildBulkEmailMenuKeyboard(ctx) {
+  return new InlineKeyboard()
+    .text('📤 Send Bulk Email', buildCallbackData(ctx, 'BULK_EMAIL_SEND'))
+    .text('🧾 Job Status', buildCallbackData(ctx, 'BULK_EMAIL_STATUS'))
+    .row()
+    .text('🕒 History', buildCallbackData(ctx, 'BULK_EMAIL_LIST'))
+    .text('📊 Stats', buildCallbackData(ctx, 'BULK_EMAIL_STATS'));
+}
+
+async function renderBulkEmailMenu(ctx) {
+  const user = await new Promise((resolve) => getUser(ctx.from.id, resolve));
+  const admin = await new Promise((resolve) => isAdmin(ctx.from.id, resolve));
+  if (!user || !admin) {
+    return ctx.reply('❌ Bulk email is for administrators only.');
+  }
+  startOperation(ctx, 'bulk-email-menu');
+  const keyboard = buildBulkEmailMenuKeyboard(ctx);
+  const title = '📬 *Mailer*';
+  const lines = ['Manage bulk email operations below.'];
+  await renderMenu(ctx, `${title}\n${lines.join('\n')}`, keyboard, { parseMode: 'Markdown' });
+}
+
+async function fetchBulkEmailHistory(ctx, { limit = 10, offset = 0 } = {}) {
+  const response = await httpClient.get(ctx, `${config.apiUrl}/email/bulk/history`, {
+    params: { limit, offset },
+    timeout: 15000
+  });
+  return response.data;
+}
+
+async function sendBulkEmailHistory(ctx, { limit = 10, offset = 0 } = {}) {
+  const data = await fetchBulkEmailHistory(ctx, { limit, offset });
+  const jobs = data?.jobs || [];
+  if (!jobs.length) {
+    await ctx.reply('ℹ️ No bulk email jobs found for that range.');
+    return;
+  }
+  const lines = jobs.map((job) => {
+    const created = job.created_at ? new Date(job.created_at).toLocaleString() : 'N/A';
+    return [
+      `🆔 ${escapeMarkdown(job.job_id || 'unknown')}`,
+      `📊 ${escapeMarkdown(job.status || 'unknown')}`,
+      `📨 ${job.sent || 0}/${job.total || 0} sent`,
+      `🕒 ${escapeMarkdown(created)}`
+    ].join('\n');
+  });
+  const page = Math.floor(offset / limit) + 1;
+  await ctx.reply(`📦 *Bulk Email History* (page ${page})\n\n${lines.join('\n\n')}`, {
+    parse_mode: 'Markdown',
+    reply_markup: buildBackToMenuKeyboard(ctx, 'BULK_EMAIL', '⬅️ Back to Mailer')
+  });
+}
+
+async function bulkEmailHistoryFlow(conversation, ctx) {
+  const opId = startOperation(ctx, 'bulk-email-history');
+  const ensureActive = () => ensureOperationActive(ctx, opId);
+  try {
+    const user = await new Promise((resolve) => getUser(ctx.from.id, resolve));
+    const admin = await new Promise((resolve) => isAdmin(ctx.from.id, resolve));
+    ensureActive();
+    if (!user || !admin) {
+      await ctx.reply('❌ Bulk email history is for administrators only.');
+      return;
+    }
+    await ctx.reply('🕒 Enter page and limit (e.g., `1 10`). Limit max 50.', { parse_mode: 'Markdown' });
+    const update = await conversation.wait();
+    ensureActive();
+    const raw = update?.message?.text?.trim() || '';
+    const parts = raw.split(/\s+/).filter(Boolean);
+    const page = Math.max(parseInt(parts[0], 10) || 1, 1);
+    const limit = Math.min(Math.max(parseInt(parts[1], 10) || 10, 1), 50);
+    const offset = (page - 1) * limit;
+    await sendBulkEmailHistory(ctx, { limit, offset });
+  } catch (error) {
+    await ctx.reply('❌ Failed to fetch bulk email history.');
+  }
+}
+
+async function fetchBulkEmailStats(ctx, { hours = 24 } = {}) {
+  const response = await httpClient.get(ctx, `${config.apiUrl}/email/bulk/stats`, {
+    params: { hours },
+    timeout: 15000
+  });
+  return response.data;
+}
+
+async function sendBulkEmailStats(ctx, { hours = 24 } = {}) {
+  const data = await fetchBulkEmailStats(ctx, { hours });
+  const stats = data?.stats;
+  if (!stats) {
+    await ctx.reply('ℹ️ Bulk email stats unavailable.');
+    return;
+  }
+  const lines = [
+    `Jobs: ${stats.total_jobs || 0}`,
+    `Recipients: ${stats.total_recipients || 0}`,
+    `Sent: ${stats.sent || 0}`,
+    `Failed: ${stats.failed || 0}`,
+    `Delivered: ${stats.delivered || 0}`,
+    `Bounced: ${stats.bounced || 0}`,
+    `Complaints: ${stats.complained || 0}`,
+    `Suppressed: ${stats.suppressed || 0}`
+  ];
+  await ctx.reply(`📊 *Bulk Email Stats (last ${data.hours || hours}h)*\n${lines.join('\n')}`, {
+    parse_mode: 'Markdown',
+    reply_markup: buildBackToMenuKeyboard(ctx, 'BULK_EMAIL', '⬅️ Back to Mailer')
+  });
+}
+
+async function bulkEmailStatsFlow(conversation, ctx) {
+  const opId = startOperation(ctx, 'bulk-email-stats');
+  const ensureActive = () => ensureOperationActive(ctx, opId);
+  try {
+    const user = await new Promise((resolve) => getUser(ctx.from.id, resolve));
+    const admin = await new Promise((resolve) => isAdmin(ctx.from.id, resolve));
+    ensureActive();
+    if (!user || !admin) {
+      await ctx.reply('❌ Bulk email stats are for administrators only.');
+      return;
+    }
+    await ctx.reply('📊 Enter timeframe in hours (e.g., 24 or 72).');
+    const update = await conversation.wait();
+    ensureActive();
+    const hours = Math.min(Math.max(parseInt(update?.message?.text?.trim(), 10) || 24, 1), 720);
+    await sendBulkEmailStats(ctx, { hours });
+  } catch (error) {
+    await ctx.reply('❌ Failed to fetch bulk email stats.');
+  }
+}
+
+async function bulkEmailStatusFlow(conversation, ctx) {
+  const opId = startOperation(ctx, 'bulk-email-status');
+  const ensureActive = () => ensureOperationActive(ctx, opId);
+  try {
+    const user = await new Promise((resolve) => getUser(ctx.from.id, resolve));
+    const admin = await new Promise((resolve) => isAdmin(ctx.from.id, resolve));
+    ensureActive();
+    if (!user || !admin) {
+      await ctx.reply('❌ Bulk email status is for administrators only.');
+      return;
+    }
+    await ctx.reply('🆔 Enter the bulk email job ID:');
+    const update = await conversation.wait();
+    ensureActive();
+    const jobId = update?.message?.text?.trim();
+    if (!jobId) {
+      await ctx.reply('❌ Job ID is required.');
+      return;
+    }
+    await sendBulkStatusCard(ctx, jobId, { forceReply: true });
+  } catch (error) {
+    console.error('Bulk email status flow error:', error);
+    await ctx.reply('❌ Failed to fetch bulk email status.');
   }
 }
 
@@ -1202,11 +1445,17 @@ async function emailFlow(conversation, ctx) {
     }
     await ctx.reply(section('✅ Email queued', [
       buildLine('🆔', 'Message', escapeMarkdown(messageId))
-    ]), { parse_mode: 'Markdown' });
+    ]), {
+      parse_mode: 'Markdown',
+      reply_markup: buildBackToMenuKeyboard(ctx, 'EMAIL')
+    });
     await sendEmailStatusCard(ctx, messageId, { forceReply: true });
   } catch (error) {
     console.error('Email flow error:', error);
-    await ctx.reply(section('❌ Email Error', [error.message || 'Failed to send email.']), { parse_mode: 'Markdown' });
+    await ctx.reply(section('❌ Email Error', [error.message || 'Failed to send email.']), {
+      parse_mode: 'Markdown',
+      reply_markup: buildBackToMenuKeyboard(ctx, 'EMAIL')
+    });
   }
 }
 
@@ -1349,42 +1598,36 @@ async function bulkEmailFlow(conversation, ctx) {
     await ctx.reply(section('✅ Bulk job queued', [
       buildLine('🆔', 'Job', escapeMarkdown(jobId)),
       buildLine('📨', 'Recipients', escapeMarkdown(String(recipients.length)))
-    ]), { parse_mode: 'Markdown' });
+    ]), {
+      parse_mode: 'Markdown',
+      reply_markup: buildBackToMenuKeyboard(ctx, 'BULK_EMAIL', '⬅️ Back to Bulk Email')
+    });
     await sendBulkStatusCard(ctx, jobId, { forceReply: true });
   } catch (error) {
     console.error('Bulk email flow error:', error);
-    await ctx.reply(section('❌ Bulk Email Error', [error.message || 'Failed to send bulk email.']), { parse_mode: 'Markdown' });
+    await ctx.reply(section('❌ Bulk Email Error', [error.message || 'Failed to send bulk email.']), {
+      parse_mode: 'Markdown',
+      reply_markup: buildBackToMenuKeyboard(ctx, 'BULK_EMAIL', '⬅️ Back to Bulk Email')
+    });
   }
 }
 
 function registerEmailCommands(bot) {
   bot.command('email', async (ctx) => {
     try {
-      const user = await new Promise((resolve) => getUser(ctx.from.id, resolve));
-      if (!user) {
-        return ctx.reply('❌ You are not authorized to use this bot.');
-      }
-      await ctx.conversation.enter('email-conversation');
+      await renderEmailMenu(ctx);
     } catch (error) {
       console.error('Email command error:', error);
-      await ctx.reply('❌ Could not start email flow.');
+      await ctx.reply('❌ Could not open email menu.');
     }
   });
 
-  bot.command('bulkemail', async (ctx) => {
+  bot.command('mailer', async (ctx) => {
     try {
-      const user = await new Promise((resolve) => getUser(ctx.from.id, resolve));
-      if (!user) {
-        return ctx.reply('❌ You are not authorized to use this bot.');
-      }
-      const admin = await new Promise((resolve) => isAdmin(ctx.from.id, resolve));
-      if (!admin) {
-        return ctx.reply('❌ Bulk email is for administrators only.');
-      }
-      await ctx.conversation.enter('bulk-email-conversation');
+      await renderBulkEmailMenu(ctx);
     } catch (error) {
       console.error('Bulk email command error:', error);
-      await ctx.reply('❌ Could not start bulk email flow.');
+      await ctx.reply('❌ Could not open bulk email menu.');
     }
   });
 
@@ -1396,10 +1639,10 @@ function registerEmailCommands(bot) {
       }
       const args = ctx.message?.text?.split(' ') || [];
       if (args.length < 2) {
-        return ctx.reply(
-          '📧 <b>Usage:</b> <code>/emailstatus &lt;message_id&gt;</code>\n\nExample: <code>/emailstatus email_1234...</code>',
-          { parse_mode: 'HTML' }
-        );
+        await ctx.reply('ℹ️ /emailstatus is now under /email. Opening Email menu…');
+        await maybeSendEmailAliasTip(ctx);
+        await renderEmailMenu(ctx);
+        return;
       }
       const messageId = args[1].trim();
       await sendEmailStatusCard(ctx, messageId, { forceReply: true });
@@ -1409,32 +1652,21 @@ function registerEmailCommands(bot) {
     }
   });
 
-  bot.command('emailbulk', async (ctx) => {
-    try {
-      const user = await new Promise((resolve) => getUser(ctx.from.id, resolve));
-      if (!user) {
-        return ctx.reply('❌ You are not authorized to use this bot.');
-      }
-      const args = ctx.message?.text?.split(' ') || [];
-      if (args.length < 2) {
-        return ctx.reply(
-          '📦 <b>Usage:</b> <code>/emailbulk &lt;bulk_job_id&gt;</code>\n\nExample: <code>/emailbulk bulk_1234...</code>',
-          { parse_mode: 'HTML' }
-        );
-      }
-      const jobId = args[1].trim();
-      await sendBulkStatusCard(ctx, jobId, { forceReply: true });
-    } catch (error) {
-      console.error('Bulk email status command error:', error);
-      await ctx.reply('❌ Failed to fetch bulk job status.');
-    }
-  });
 }
 
 module.exports = {
   emailFlow,
   bulkEmailFlow,
   emailTemplatesFlow,
+  renderEmailMenu,
+  renderBulkEmailMenu,
+  emailStatusFlow,
+  bulkEmailStatusFlow,
+  bulkEmailHistoryFlow,
+  bulkEmailStatsFlow,
+  sendBulkEmailHistory,
+  sendBulkEmailStats,
+  emailHistoryFlow,
   registerEmailCommands,
   sendEmailStatusCard,
   sendEmailTimeline,

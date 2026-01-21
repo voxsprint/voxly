@@ -1932,19 +1932,61 @@ class EnhancedDatabase {
        });
    }
 
-   async getEmailBulkJob(jobId) {
-       return new Promise((resolve, reject) => {
-           const sql = `SELECT * FROM email_bulk_jobs WHERE job_id = ?`;
-           this.db.get(sql, [jobId], (err, row) => {
-               if (err) {
-                   console.error('Error fetching email bulk job:', err);
-                   reject(err);
-               } else {
-                   resolve(row || null);
-               }
-           });
-       });
-   }
+  async getEmailBulkJob(jobId) {
+      return new Promise((resolve, reject) => {
+          const sql = `SELECT * FROM email_bulk_jobs WHERE job_id = ?`;
+          this.db.get(sql, [jobId], (err, row) => {
+              if (err) {
+                  console.error('Error fetching email bulk job:', err);
+                  reject(err);
+              } else {
+                  resolve(row || null);
+              }
+          });
+      });
+  }
+
+  async getEmailBulkJobs({ limit = 10, offset = 0 } = {}) {
+      return new Promise((resolve, reject) => {
+          const sql = `SELECT job_id, status, total, queued, sending, sent, failed, delivered, bounced, complained, suppressed, template_id, created_at, updated_at, completed_at
+                       FROM email_bulk_jobs
+                       ORDER BY created_at DESC
+                       LIMIT ? OFFSET ?`;
+          this.db.all(sql, [limit, offset], (err, rows) => {
+              if (err) {
+                  console.error('Error fetching email bulk jobs:', err);
+                  reject(err);
+              } else {
+                  resolve(rows || []);
+              }
+          });
+      });
+  }
+
+  async getEmailBulkStats({ hours = 24 } = {}) {
+      return new Promise((resolve, reject) => {
+          const window = `-${Math.max(hours, 1)} hours`;
+          const sql = `SELECT
+                           COUNT(*) as total_jobs,
+                           COALESCE(SUM(total), 0) as total_recipients,
+                           COALESCE(SUM(sent), 0) as sent,
+                           COALESCE(SUM(failed), 0) as failed,
+                           COALESCE(SUM(delivered), 0) as delivered,
+                           COALESCE(SUM(bounced), 0) as bounced,
+                           COALESCE(SUM(complained), 0) as complained,
+                           COALESCE(SUM(suppressed), 0) as suppressed
+                       FROM email_bulk_jobs
+                       WHERE created_at >= datetime('now', ?)`;
+          this.db.get(sql, [window], (err, row) => {
+              if (err) {
+                  console.error('Error fetching email bulk stats:', err);
+                  reject(err);
+              } else {
+                  resolve(row || null);
+              }
+          });
+      });
+  }
 
    async getEmailTemplate(templateId) {
        return new Promise((resolve, reject) => {

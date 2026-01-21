@@ -103,6 +103,17 @@ npm run setup --prefix bot
 - Use `/start` to begin
 - Use `/call` to make your first AI call
 
+## 🔐 Access gating & verification
+
+- Guests can open `/start`, `/menu`, `/help`, and `/guide` to see what the bot offers; actions such as `/call`, `/sms`, `/email`, and `/calllog` remain locked until an admin approves them.
+- Request access by contacting the admin (the bot provides a "Request Access" button wherever commands are locked), then reopen `/start` to see the granted menus.
+- Admins can monitor access-denied activity in `bot/logs/access-denied.log` and via `/status`, which reports the last few blocked attempts and rate-limited users.
+- **Manual verification checklist:**
+  1. Guest account: open `/start`, `/menu`, `/help`, and `/guide`; confirm only navigational UI renders and action buttons show lock/CTA.
+  2. Authorized user: run `/call`, `/sms`, `/email`, and `/calllog` to confirm flows still operate.
+  3. Admin: verify provider/users/bulk menus still appear and `/status` shows denial metrics after triggering a denied action.
+  4. Tail the log with `tail -f bot/logs/access-denied.log` to watch automatic audit entries.
+
 ## ⚙️ Configuration
 
 ### API Server Configuration (`api/.env`)
@@ -227,8 +238,9 @@ CREATE TABLE transcripts (
 
 - `/start` - Start or restart the bot
 - `/call` - Start a new voice call
-- `/transcript <call_sid>` - Get call transcript
-- `/calls [limit]` - List recent calls
+- `/calllog` - Browse call history, search, and events
+- `/sms` - Open SMS center
+- `/email` - Open Email center
 - `/health` - Check bot and API health
 - `/guide` - Show detailed usage guide
 - `/help` - Show available commands
@@ -241,7 +253,11 @@ CREATE TABLE transcripts (
 - `/removeuser` - Remove user access
 - `/users` - List all authorized users
 - `/status` - Full system status check
-- `/test_api` - Test API connection
+- `/smssender` - Bulk SMS center
+- `/mailer` - Bulk email center
+- `/scripts` - Script designer (call/SMS/email)
+- `/persona` - Manage personas
+- `/provider` - Voice provider controls
 
 ## 📁 Project Structure
 

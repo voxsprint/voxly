@@ -1,14 +1,11 @@
 const { InlineKeyboard } = require('grammy');
 const config = require('../config');
-const { getUser } = require('../db/db');
 const { escapeHtml, renderMenu } = require('../utils/ui');
 const { buildCallbackData } = require('../utils/actions');
+const { getAccessProfile } = require('../utils/capabilities');
 
 async function handleGuide(ctx) {
-    const user = await new Promise(r => getUser(ctx.from.id, r));
-    if (!user) {
-        return ctx.reply('❌ You are not authorized to use this bot.');
-    }
+    const access = await getAccessProfile(ctx);
     const callSteps = [
         '1️⃣ Start a call via /call or the 📞 button',
         '2️⃣ Provide the number in E.164 format (+1234567890)',
@@ -59,16 +56,33 @@ async function handleGuide(ctx) {
         ])}`
     ];
 
+    if (!access.user) {
+        guideSections.unshift(
+            `<b>${escapeHtml('Limited Access')}</b>\n${formatLines([
+                'You can explore menus, but actions require approval.',
+                'Use the contact above to request access.'
+            ])}`
+        );
+    }
+
     const guideText = guideSections.join('\n\n');
 
     const kb = new InlineKeyboard()
-        .text('📞 Call', buildCallbackData(ctx, 'CALL'))
         .text('📋 Commands', buildCallbackData(ctx, 'HELP'))
-        .row()
-        .text('💬 SMS', buildCallbackData(ctx, 'SMS'))
-        .text('📧 Email', buildCallbackData(ctx, 'EMAIL'))
-        .row()
         .text('🔄 Menu', buildCallbackData(ctx, 'MENU'));
+
+    if (access.user) {
+        kb.row()
+            .text('📞 Call', buildCallbackData(ctx, 'CALL'))
+            .text('💬 SMS', buildCallbackData(ctx, 'SMS'))
+            .row()
+            .text('📧 Email', buildCallbackData(ctx, 'EMAIL'));
+    } else {
+        const adminUsername = (config.admin.username || '').replace(/^@/, '');
+        if (adminUsername) {
+            kb.row().url('🔓 Request Access', `https://t.me/${adminUsername}`);
+        }
+    }
 
     await renderMenu(ctx, guideText, kb, { parseMode: 'HTML' });
 }

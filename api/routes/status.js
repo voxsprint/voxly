@@ -1,5 +1,6 @@
 const axios = require('axios');
 const config = require('../config');
+const { renderSignalBars } = require('./signalBars');
 // Keep status logs readable with emoji prefixes; avoid duplication
 if (!console.__emojiWrapped) {
   const baseLog = console.log.bind(console);
@@ -62,11 +63,12 @@ class EnhancedWebhookService {
     ];
     this.waveformThinkingFrames = ['·  ', '·· ', '···', ' ··', '  ·'];
     this.waveformInterruptedFrames = ['▅▁▅▁', '▁▅▁▅', '▇▁▇▁', '█▁█▁'];
-    this.signalCarrier = String(config.liveConsole?.carrier || 'VOICEDNUT LTE');
+    const carrierRaw = String(config.liveConsole?.carrier || 'VOICEDNUT LTE').trim();
+    const carrierParts = carrierRaw.split(/\s+/).filter(Boolean);
+    this.signalNetworkLabel = String(config.liveConsole?.networkLabel || carrierParts.pop() || 'LTE');
+    this.signalCarrierName = carrierParts.length ? carrierParts.join(' ') : 'VOICEDNUT';
     this.signalBarsMax = 5;
-    this.signalBarFilled = '▮';
     this.signalBarEmpty = '░';
-    this.signalBarGlyphs = ['▂', '▄', '▆', '▇', '█'];
     this.signalSmoothing = 0.35;
     this.lastSentimentAt = new Map();
     this.sentimentCooldownMs = 10000;
@@ -1389,32 +1391,16 @@ class EnhancedWebhookService {
     return Math.max(0, Math.min(this.signalBarsMax, Math.round(next)));
   }
 
-  formatSignalBars(strength) {
-    const filled = Math.max(0, Math.min(this.signalBarsMax, Math.round(strength)));
-    const bars = this.signalBarGlyphs.map((glyph, index) => (
-      index < filled ? glyph : this.signalBarEmpty
-    ));
-    return bars.join('');
+  renderSignalBars(strength, max = this.signalBarsMax) {
+    return renderSignalBars(strength, max, this.signalBarEmpty);
   }
 
   buildSignalLine(entry) {
     const phaseKey = entry?.phaseKey || 'waiting';
     const rawLevel = this.getRawSignalLevel(entry);
     const strength = this.getSmoothedSignalLevel(entry, rawLevel);
-    const bars = this.formatSignalBars(strength);
-    const isEnded = phaseKey === 'ended';
-    const isConnected = [
-      'listening',
-      'user_speaking',
-      'thinking',
-      'agent_responding',
-      'agent_speaking',
-      'interrupted',
-      'ending'
-    ].includes(phaseKey);
-    const liveBadge = strength >= 4 ? '🟢 LIVE' : (strength >= 2 ? '🟡 LIVE' : '🟠 LIVE');
-    const badge = isEnded ? '🔴 OFFLINE' : (isConnected ? liveBadge : '🟡 CONNECTING');
-    return `📶 ${this.signalCarrier} ${bars} ${badge}`;
+    const bars = this.renderSignalBars(Number.isFinite(strength) ? strength : 0, this.signalBarsMax);
+    return `${this.signalCarrierName} ${bars}  ${this.signalNetworkLabel}`;
   }
 
   formatEventTimeline(events = []) {

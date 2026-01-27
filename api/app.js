@@ -2579,6 +2579,12 @@ async function endCallForProvider(callSid) {
   throw new Error(`Unsupported provider ${provider}`);
 }
 
+if (webhookService?.setCallTerminator) {
+  webhookService.setCallTerminator(async (callSid) => {
+    await endCallForProvider(callSid);
+  });
+}
+
 function estimateSpeechDurationMs(text = '') {
   const words = String(text || '').trim().split(/\s+/).filter(Boolean).length;
   const baseMs = 1200;
@@ -4623,13 +4629,63 @@ app.post('/webhook/telegram', async (req, res) => {
     if (prefix === 'lc') {
       action = parts[1];
       callSid = parts[2];
-    } else if (prefix === 'recap' || prefix === 'retry') {
+    } else if (prefix === 'recap' || prefix === 'retry' || prefix === 'inb') {
       action = parts[1];
       callSid = parts[2];
     } else {
       callSid = parts[1];
     }
-    if (!prefix || !callSid || (prefix === 'lc' && !action)) {
+    if (!prefix || !callSid || ((prefix === 'lc' || prefix === 'inb') && !action)) {
+      webhookService.answerCallbackQuery(cb.id, 'Unsupported action').catch(() => {});
+      return;
+    }
+
+    if (prefix === 'inb') {
+      const chatId = cb.message?.chat?.id;
+      const gate = webhookService.getInboundGate(callSid);
+      if (!gate) {
+        webhookService.answerCallbackQuery(cb.id, 'Prompt expired').catch(() => {});
+        return;
+      }
+      if (gate.status === 'answered' || gate.status === 'declined') {
+        webhookService.answerCallbackQuery(cb.id, 'Already handled').catch(() => {});
+        return;
+      }
+      if (action === 'answer') {
+        webhookService.clearInboundGateTimer?.(callSid);
+        webhookService.setInboundGate(callSid, 'answered', {
+          chatId,
+          messageId: gate.messageId || cb.message?.message_id
+        });
+        await webhookService.resolveInboundPrompt(callSid, 'answered');
+        await webhookService.openInboundConsole(callSid, chatId);
+        webhookService.answerCallbackQuery(cb.id, 'Live console opened').catch(() => {});
+        return;
+      }
+      if (action === 'decline') {
+        webhookService.clearInboundGateTimer?.(callSid);
+        webhookService.setInboundGate(callSid, 'declined', {
+          chatId,
+          messageId: gate.messageId || cb.message?.message_id
+        });
+        await webhookService.resolveInboundPrompt(callSid, 'declined');
+        webhookService.answerCallbackQuery(cb.id, 'Call declined').catch(() => {});
+        try {
+          await db.updateCallState(callSid, 'admin_declined', {
+            at: new Date().toISOString(),
+            by: chatId
+          });
+        } catch (stateError) {
+          console.error('Failed to log admin decline:', stateError);
+        }
+        try {
+          await endCallForProvider(callSid);
+        } catch (endError) {
+          console.error('Failed to decline call:', endError);
+          await webhookService.sendTelegramMessage(chatId, `❌ Failed to decline call: ${endError.message || endError}`);
+        }
+        return;
+      }
       webhookService.answerCallbackQuery(cb.id, 'Unsupported action').catch(() => {});
       return;
     }
@@ -4762,6 +4818,16 @@ app.post('/webhook/telegram', async (req, res) => {
       const label = redacted ? 'Preview hidden' : 'Preview revealed';
       await logConsoleAction(callSid, 'privacy', { redacted });
       webhookService.answerCallbackQuery(cb.id, label).catch(() => {});
+      return;
+    }
+
+    if (action === 'actions') {
+      const expanded = webhookService.toggleConsoleActions(callSid);
+      if (expanded === null) {
+        webhookService.answerCallbackQuery(cb.id, 'Console not active').catch(() => {});
+        return;
+      }
+      webhookService.answerCallbackQuery(cb.id, expanded ? 'Actions expanded' : 'Actions hidden').catch(() => {});
       return;
     }
 

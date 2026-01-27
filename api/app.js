@@ -75,6 +75,14 @@ const inboundRateBuckets = new Map();
 const streamStartTimes = new Map();
 const sttFailureCounts = new Map();
 const activeStreamConnections = new Map();
+const streamStartSeen = new Map(); // callSid -> streamSid (dedupe starts)
+const streamStopSeen = new Set(); // callSid:streamSid (dedupe stops)
+const streamRetryState = new Map(); // callSid -> { attempts, nextDelayMs }
+const streamAuthBypass = new Map(); // callSid -> { reason, at }
+const streamStatusDedupe = new Map(); // callSid:streamSid:event -> ts
+const streamLastMediaAt = new Map(); // callSid -> timestamp
+const sttLastFrameAt = new Map(); // callSid -> timestamp
+const streamWatchdogState = new Map(); // callSid -> { noMediaNotifiedAt, noMediaEscalatedAt, sttNotifiedAt }
 const providerHealth = new Map();
 let callJobProcessing = false;
 
@@ -89,6 +97,16 @@ function stableStringify(value) {
   const keys = Object.keys(value).filter((key) => value[key] !== undefined).sort();
   const entries = keys.map((key) => `${JSON.stringify(key)}:${stableStringify(value[key])}`);
   return `{${entries.join(',')}}`;
+}
+
+function purgeStreamStatusDedupe(callSid) {
+  if (!callSid) return;
+  const prefix = `${callSid}:`;
+  for (const key of streamStatusDedupe.keys()) {
+    if (key.startsWith(prefix)) {
+      streamStatusDedupe.delete(key);
+    }
+  }
 }
 
 function normalizeBodyForSignature(req) {
@@ -404,25 +422,33 @@ function buildStreamAuthToken(callSid, timestamp) {
   return crypto.createHmac('sha256', secret).update(payload).digest('hex');
 }
 
-function resolveStreamAuthParams(req) {
-  if (req?.query && Object.keys(req.query).length) {
-    return req.query;
-  }
-  const url = req?.url || '';
-  const queryIndex = url.indexOf('?');
-  if (queryIndex === -1) return {};
-  const params = new URLSearchParams(url.slice(queryIndex + 1));
+function resolveStreamAuthParams(req, extraParams = null) {
   const result = {};
-  for (const [key, value] of params.entries()) {
-    result[key] = value;
+  if (req?.query && Object.keys(req.query).length) {
+    Object.assign(result, req.query);
+  } else {
+    const url = req?.url || '';
+    const queryIndex = url.indexOf('?');
+    if (queryIndex !== -1) {
+      const params = new URLSearchParams(url.slice(queryIndex + 1));
+      for (const [key, value] of params.entries()) {
+        result[key] = value;
+      }
+    }
+  }
+  if (extraParams && typeof extraParams === 'object') {
+    for (const [key, value] of Object.entries(extraParams)) {
+      if (value === undefined || value === null || value === '') continue;
+      result[key] = String(value);
+    }
   }
   return result;
 }
 
-function verifyStreamAuth(callSid, req) {
+function verifyStreamAuth(callSid, req, extraParams = null) {
   const secret = config.streamAuth?.secret;
   if (!secret) return { ok: true, skipped: true, reason: 'missing_secret' };
-  const params = resolveStreamAuthParams(req);
+  const params = resolveStreamAuthParams(req, extraParams);
   const token = params.token || params.signature;
   const timestamp = Number(params.ts || params.timestamp);
   if (!token || !Number.isFinite(timestamp)) {
@@ -793,6 +819,7 @@ function clearFirstMediaWatchdog(callSid) {
 
 function markStreamMediaSeen(callSid) {
   if (!callSid || streamFirstMediaSeen.has(callSid)) return;
+  streamLastMediaAt.set(callSid, Date.now());
   streamFirstMediaSeen.add(callSid);
   clearFirstMediaWatchdog(callSid);
   const startedAt = streamStartTimes.get(callSid);
@@ -838,6 +865,170 @@ function scheduleFirstMediaWatchdog(callSid, host, callConfig) {
   streamFirstMediaTimers.set(callSid, timer);
 }
 
+const STREAM_RETRY_SETTINGS = {
+  maxAttempts: 1,
+  baseDelayMs: 1500,
+  maxDelayMs: 8000
+};
+
+function shouldRetryStream(reason = '') {
+  return ['no_media', 'stream_not_connected', 'stream_auth_failed', 'watchdog_no_media'].includes(reason);
+}
+
+async function scheduleStreamReconnect(callSid, host, reason = 'unknown') {
+  if (!callSid || !config.twilio?.accountSid || !config.twilio?.authToken) return false;
+  const state = streamRetryState.get(callSid) || {
+    attempts: 0,
+    nextDelayMs: STREAM_RETRY_SETTINGS.baseDelayMs
+  };
+  if (state.attempts >= STREAM_RETRY_SETTINGS.maxAttempts) {
+    return false;
+  }
+  state.attempts += 1;
+  const delayMs = Math.min(state.nextDelayMs, STREAM_RETRY_SETTINGS.maxDelayMs);
+  state.nextDelayMs = Math.min(state.nextDelayMs * 2, STREAM_RETRY_SETTINGS.maxDelayMs);
+  streamRetryState.set(callSid, state);
+  const jitterMs = Math.floor(Math.random() * 250);
+
+  webhookService.addLiveEvent(callSid, `🔁 Retrying stream (${state.attempts}/${STREAM_RETRY_SETTINGS.maxAttempts})`, { force: true });
+  setTimeout(async () => {
+    try {
+      const twiml = buildTwilioStreamTwiml(host, { callSid });
+      const client = twilio(config.twilio.accountSid, config.twilio.authToken);
+      await client.calls(callSid).update({ twiml });
+      await db.updateCallState(callSid, 'stream_retry', {
+        attempt: state.attempts,
+        reason,
+        at: new Date().toISOString()
+      }).catch(() => {});
+    } catch (error) {
+      console.error(`Stream retry failed for ${callSid}:`, error?.message || error);
+      await db.updateCallState(callSid, 'stream_retry_failed', {
+        attempt: state.attempts,
+        reason,
+        at: new Date().toISOString(),
+        error: error?.message || String(error)
+      }).catch(() => {});
+    }
+  }, delayMs + jitterMs);
+
+  return true;
+}
+
+const STREAM_WATCHDOG_INTERVAL_MS = 5000;
+const STREAM_STALL_DEFAULTS = {
+  noMediaMs: 20000,
+  noMediaEscalationMs: 45000,
+  sttStallMs: 25000,
+  sttEscalationMs: 60000
+};
+
+function resolveStreamConnectedAt(callSid) {
+  if (!callSid) return null;
+  const startedAt = streamStartTimes.get(callSid);
+  if (Number.isFinite(startedAt)) {
+    return startedAt;
+  }
+  const connection = activeStreamConnections.get(callSid);
+  if (connection?.connectedAt) {
+    const parsed = Date.parse(connection.connectedAt);
+    if (Number.isFinite(parsed)) {
+      return parsed;
+    }
+  }
+  return null;
+}
+
+function resolveStreamWatchdogThresholds(callConfig) {
+  const sloFirstMedia = Number(config.callSlo?.firstMediaMs) || 4000;
+  const inboundFirstMedia = Number(callConfig?.firstMediaTimeoutMs || config.inbound?.firstMediaTimeoutMs);
+  const noMediaMs = Number.isFinite(inboundFirstMedia) && inboundFirstMedia > 0
+    ? inboundFirstMedia
+    : Math.max(STREAM_STALL_DEFAULTS.noMediaMs, sloFirstMedia * 3);
+  const noMediaEscalationMs = Math.max(STREAM_STALL_DEFAULTS.noMediaEscalationMs, noMediaMs * 2);
+  const sttStallMs = Math.max(STREAM_STALL_DEFAULTS.sttStallMs, sloFirstMedia * 6);
+  const sttEscalationMs = Math.max(STREAM_STALL_DEFAULTS.sttEscalationMs, sttStallMs * 2);
+  return { noMediaMs, noMediaEscalationMs, sttStallMs, sttEscalationMs };
+}
+
+function getStreamWatchdogState(callSid) {
+  if (!callSid) return null;
+  const state = streamWatchdogState.get(callSid) || {};
+  streamWatchdogState.set(callSid, state);
+  return state;
+}
+
+async function handleStreamStallNotice(callSid, message, stateKey, state) {
+  if (!callSid || !state || state[stateKey]) return false;
+  state[stateKey] = Date.now();
+  webhookService.addLiveEvent(callSid, message, { force: true });
+  return true;
+}
+
+async function runStreamWatchdog() {
+  const host = config.server?.hostname;
+  if (!host) return;
+  const now = Date.now();
+
+  for (const [callSid, callConfig] of callConfigurations.entries()) {
+    if (!callSid || callEndLocks.has(callSid)) continue;
+    const state = getStreamWatchdogState(callSid);
+    if (!state) continue;
+    const connectedAt = resolveStreamConnectedAt(callSid);
+    if (!connectedAt) continue;
+    const thresholds = resolveStreamWatchdogThresholds(callConfig);
+    const noMediaElapsed = now - connectedAt;
+
+    if (!streamFirstMediaSeen.has(callSid) && noMediaElapsed > thresholds.noMediaMs) {
+      const notified = await handleStreamStallNotice(
+        callSid,
+        '⚠️ Stream stalled. Attempting recovery…',
+        'noMediaNotifiedAt',
+        state
+      );
+      if (notified) {
+        await db?.updateCallState?.(callSid, 'stream_stalled', {
+          at: new Date().toISOString(),
+          phase: 'no_media',
+          elapsed_ms: noMediaElapsed
+        }).catch(() => {});
+        void handleStreamTimeout(callSid, host, { allowHangup: false, reason: 'watchdog_no_media' });
+        continue;
+      }
+      if (!state.noMediaEscalatedAt && noMediaElapsed > thresholds.noMediaEscalationMs) {
+        state.noMediaEscalatedAt = now;
+        webhookService.addLiveEvent(callSid, '⚠️ Stream still offline. Ending call.', { force: true });
+        void handleStreamTimeout(callSid, host, { allowHangup: true, reason: 'watchdog_no_media' });
+      }
+      continue;
+    }
+
+    const lastMediaAt = streamLastMediaAt.get(callSid);
+    if (!lastMediaAt) continue;
+    const sttElapsed = now - (sttLastFrameAt.get(callSid) || lastMediaAt);
+    if (sttElapsed > thresholds.sttStallMs) {
+      const notified = await handleStreamStallNotice(
+        callSid,
+        '⚠️ Speech pipeline stalled. Switching to keypad…',
+        'sttNotifiedAt',
+        state
+      );
+      if (notified) {
+        await db?.updateCallState?.(callSid, 'stt_stalled', {
+          at: new Date().toISOString(),
+          elapsed_ms: sttElapsed
+        }).catch(() => {});
+        const session = activeCalls.get(callSid);
+        void activateDtmfFallback(callSid, callConfig, session?.gptService, session?.interactionCount || 0, 'stt_stall');
+      } else if (!state.sttEscalatedAt && sttElapsed > thresholds.sttEscalationMs) {
+        state.sttEscalatedAt = now;
+        webhookService.addLiveEvent(callSid, '⚠️ Speech still unavailable. Ending call.', { force: true });
+        void handleStreamTimeout(callSid, host, { allowHangup: true, reason: 'stt_stall' });
+      }
+    }
+  }
+}
+
 async function handleStreamTimeout(callSid, host, options = {}) {
   if (!callSid || streamTimeoutCalls.has(callSid)) return;
   const allowHangup = options.allowHangup !== false;
@@ -864,6 +1055,12 @@ async function handleStreamTimeout(callSid, host, options = {}) {
         }).catch(() => {});
         return;
       }
+    }
+
+    if (shouldRetryStream(options.reason) && await scheduleStreamReconnect(callSid, host, options.reason)) {
+      console.warn(`Stream retry scheduled for ${callSid} (${options.reason || 'unspecified'})`);
+      releaseLock = true;
+      return;
     }
 
     if (!allowHangup) {
@@ -1393,19 +1590,28 @@ function buildTwilioStreamTwiml(hostname, options = {}) {
   const connect = response.connect();
   const host = hostname || config.server.hostname;
   const params = new URLSearchParams();
+  const streamParameters = {};
   if (options.from) params.set('from', String(options.from));
   if (options.to) params.set('to', String(options.to));
+  if (options.from) streamParameters.from = String(options.from);
+  if (options.to) streamParameters.to = String(options.to);
   if (options.callSid && config.streamAuth?.secret) {
     const timestamp = String(Date.now());
     const token = buildStreamAuthToken(options.callSid, timestamp);
     if (token) {
       params.set('token', token);
       params.set('ts', timestamp);
+      streamParameters.token = token;
+      streamParameters.ts = timestamp;
     }
   }
   const query = params.toString();
   const url = `wss://${host}/connection${query ? `?${query}` : ''}`;
-  connect.stream({ url, track: TWILIO_STREAM_TRACK });
+  const streamOptions = { url, track: TWILIO_STREAM_TRACK };
+  if (Object.keys(streamParameters).length) {
+    streamOptions.parameters = streamParameters;
+  }
+  connect.stream(streamOptions);
   return response.toString();
 }
 
@@ -2701,6 +2907,7 @@ app.ws('/connection', (ws, req) => {
     let marks = [];
     let interactionCount = 0;
     let isInitialized = false;
+    let streamAuthOk = false;
 
     const handleSttFailure = async (tag, error) => {
       if (!callSid) return;
@@ -2743,16 +2950,29 @@ app.ws('/connection', (ws, req) => {
             ws.close();
             return;
           }
-          const authResult = verifyStreamAuth(callSid, req);
+          const customParams = msg.start?.customParameters || {};
+          const authResult = verifyStreamAuth(callSid, req, customParams);
           if (!authResult.ok) {
-            console.warn(`Stream auth failed for ${callSid} (${authResult.reason})`);
+            console.warn('Stream auth failed', { callSid, streamSid, reason: authResult.reason });
             db.updateCallState(callSid, 'stream_auth_failed', {
               reason: authResult.reason,
+              stream_sid: streamSid || null,
               at: new Date().toISOString()
             }).catch(() => {});
-            ws.close();
+            if (authResult.reason !== 'missing_token') {
+              ws.close();
+              return;
+            }
+            streamAuthBypass.set(callSid, { reason: authResult.reason, at: new Date().toISOString() });
+            webhookService.addLiveEvent(callSid, '⚠️ Stream auth token missing; continuing without auth', { force: true });
+          }
+          streamAuthOk = authResult.ok || authResult.skipped || authResult.reason === 'missing_token';
+          const priorStreamSid = streamStartSeen.get(callSid);
+          if (priorStreamSid && priorStreamSid === streamSid) {
+            console.log(`Duplicate stream start ignored for ${callSid} (${streamSid})`);
             return;
           }
+          streamStartSeen.set(callSid, streamSid || 'unknown');
           const existingConnection = activeStreamConnections.get(callSid);
           if (existingConnection && existingConnection.ws !== ws && existingConnection.ws.readyState === 1) {
             console.warn(`Replacing existing stream for ${callSid}`);
@@ -2782,8 +3002,7 @@ app.ws('/connection', (ws, req) => {
           
           streamService.setStreamSid(streamSid);
 
-          const streamParams = resolveStreamAuthParams(req);
-          const customParams = msg.start?.customParameters || {};
+          const streamParams = resolveStreamAuthParams(req, customParams);
           const fromValue = streamParams.from || streamParams.From || customParams.from || customParams.From;
           const toValue = streamParams.to || streamParams.To || customParams.to || customParams.To;
           const directionHint = streamParams.direction || customParams.direction || callDirections.get(callSid);
@@ -3200,8 +3419,12 @@ app.ws('/connection', (ws, req) => {
           }
 
         } else if (event === 'media') {
+          if (!streamAuthOk) {
+            return;
+          }
           if (isInitialized && transcriptionService) {
             const now = Date.now();
+            streamLastMediaAt.set(callSid, now);
             if (shouldSampleUserAudioLevel(callSid, now)) {
               const level = estimateAudioLevelFromBase64(msg?.media?.payload || '');
               updateUserAudioLevel(callSid, level, now);
@@ -3217,6 +3440,7 @@ app.ws('/connection', (ws, req) => {
           if (digits) {
             clearSilenceTimer(callSid);
             markStreamMediaSeen(callSid);
+            streamLastMediaAt.set(callSid, Date.now());
             const callConfig = callConfigurations.get(callSid);
             const captureActive = isCaptureActiveConfig(callConfig);
             let isDigitIntent = callConfig?.digit_intent?.mode === 'dtmf' || captureActive;
@@ -3275,9 +3499,19 @@ app.ws('/connection', (ws, req) => {
           }
         } else if (event === 'stop') {
           console.log(`Adaptive call stream ${streamSid} ended`.red);
+          const stopKey = `${callSid || 'unknown'}:${streamSid || 'unknown'}`;
+          if (streamStopSeen.has(stopKey)) {
+            console.log(`Duplicate stream stop ignored for ${stopKey}`);
+            return;
+          }
+          streamStopSeen.add(stopKey);
           clearFirstMediaWatchdog(callSid);
           streamFirstMediaSeen.delete(callSid);
           streamStartTimes.delete(callSid);
+          if (pendingStreams.has(callSid)) {
+            clearTimeout(pendingStreams.get(callSid));
+            pendingStreams.delete(callSid);
+          }
           if (callSid && activeStreamConnections.get(callSid)?.streamSid === streamSid) {
             activeStreamConnections.delete(callSid);
           }
@@ -3293,6 +3527,21 @@ app.ws('/connection', (ws, req) => {
             return;
           }
 
+          const authBypass = streamAuthBypass.get(callSid);
+          if (authBypass && !streamFirstMediaSeen.has(callSid)) {
+            console.warn(`Stream stopped before auth for ${callSid} (${authBypass.reason})`);
+            webhookService.addLiveEvent(callSid, '⚠️ Stream stopped before auth; attempting recovery', { force: true });
+            await db.updateCallState(callSid, 'stream_stopped_before_auth', {
+              reason: authBypass.reason,
+              stream_sid: streamSid || null,
+              at: new Date().toISOString()
+            }).catch(() => {});
+            void handleStreamTimeout(callSid, host, { allowHangup: false, reason: 'stream_auth_failed' });
+            clearCallEndLock(callSid);
+            clearSilenceTimer(callSid);
+            return;
+          }
+
           await handleCallEnd(callSid, callStartTime);
           
           // Clean up
@@ -3302,6 +3551,15 @@ app.ws('/connection', (ws, req) => {
             callFunctionSystems.delete(callSid);
             callDirections.delete(callSid);
             console.log(`Cleaned up adaptive configuration for call: ${callSid}`);
+          }
+          if (callSid) {
+            streamStartSeen.delete(callSid);
+            streamAuthBypass.delete(callSid);
+            streamRetryState.delete(callSid);
+            purgeStreamStatusDedupe(callSid);
+            streamLastMediaAt.delete(callSid);
+            sttLastFrameAt.delete(callSid);
+            streamWatchdogState.delete(callSid);
           }
           if (digitService) {
             digitService.clearCallState(callSid);
@@ -3318,6 +3576,9 @@ app.ws('/connection', (ws, req) => {
   
     transcriptionService.on('utterance', async (text) => {
       clearSilenceTimer(callSid);
+      if (callSid) {
+        sttLastFrameAt.set(callSid, Date.now());
+      }
       if (text && text.trim().length > 0) {
         webhookService.setLiveCallPhase(callSid, 'user_speaking').catch(() => {});
       }
@@ -3337,6 +3598,9 @@ app.ws('/connection', (ws, req) => {
         return; 
       }
       clearSilenceTimer(callSid);
+      if (callSid) {
+        sttLastFrameAt.set(callSid, Date.now());
+      }
 
       const callConfig = callConfigurations.get(callSid);
       const isDigitIntent = callConfig?.digit_intent?.mode === 'dtmf';
@@ -3476,6 +3740,22 @@ app.ws('/connection', (ws, req) => {
       sttFailureCounts.delete(callSid);
       if (callSid && activeStreamConnections.get(callSid)?.ws === ws) {
         activeStreamConnections.delete(callSid);
+      }
+      if (callSid) {
+        if (pendingStreams.has(callSid)) {
+          clearTimeout(pendingStreams.get(callSid));
+          pendingStreams.delete(callSid);
+        }
+        streamStartSeen.delete(callSid);
+        streamAuthBypass.delete(callSid);
+        streamRetryState.delete(callSid);
+        purgeStreamStatusDedupe(callSid);
+        streamLastMediaAt.delete(callSid);
+        sttLastFrameAt.delete(callSid);
+        streamWatchdogState.delete(callSid);
+        if (streamSid) {
+          streamStopSeen.delete(`${callSid}:${streamSid}`);
+        }
       }
     });
 
@@ -3981,6 +4261,13 @@ async function handleCallEnd(callSid, callStartTime) {
     streamTimeoutCalls.delete(callSid);
     clearFirstMediaWatchdog(callSid);
     streamFirstMediaSeen.delete(callSid);
+    streamLastMediaAt.delete(callSid);
+    sttLastFrameAt.delete(callSid);
+    streamWatchdogState.delete(callSid);
+    streamStartSeen.delete(callSid);
+    streamAuthBypass.delete(callSid);
+    streamRetryState.delete(callSid);
+    purgeStreamStatusDedupe(callSid);
     const terminalStatuses = new Set(['completed', 'no-answer', 'no_answer', 'busy', 'failed', 'canceled']);
     const normalizeStatus = (value) => String(value || '').toLowerCase().replace(/_/g, '-');
     const initialCallDetails = await db.getCall(callSid);
@@ -4257,6 +4544,7 @@ async function handleTwilioIncoming(req, res) {
           console.warn(`Stream status check failed for ${callSid}: ${err?.message || err}`);
         }
         console.warn(`Stream not established for ${callSid} after ${timeoutMs}ms (status=${statusValue || 'unknown'}).`);
+        webhookService.addLiveEvent(callSid, '⚠️ Stream not connected yet. Attempting recovery…', { force: true });
         void handleStreamTimeout(callSid, host, { allowHangup: false, reason: 'stream_not_connected' });
       }, timeoutMs);
       pendingStreams.set(callSid, timeout);
@@ -4274,27 +4562,37 @@ async function handleTwilioIncoming(req, res) {
     }
     const connect = response.connect();
     const streamParams = new URLSearchParams();
+    const streamParameters = {};
     if (req.body?.From) streamParams.set('from', String(req.body.From));
     if (req.body?.To) streamParams.set('to', String(req.body.To));
     streamParams.set('direction', directionLabel);
+    if (req.body?.From) streamParameters.from = String(req.body.From);
+    if (req.body?.To) streamParameters.to = String(req.body.To);
+    streamParameters.direction = directionLabel;
     if (callSid && config.streamAuth?.secret) {
       const timestamp = String(Date.now());
       const token = buildStreamAuthToken(callSid, timestamp);
       if (token) {
         streamParams.set('token', token);
         streamParams.set('ts', timestamp);
+        streamParameters.token = token;
+        streamParameters.ts = timestamp;
       }
     }
     const streamQuery = streamParams.toString();
     const streamUrl = `wss://${host}/connection${streamQuery ? `?${streamQuery}` : ''}`;
     // Request both audio + DTMF events from Twilio Media Streams
-    connect.stream({
+    const streamOptions = {
       url: streamUrl,
       track: TWILIO_STREAM_TRACK,
       statusCallback: `https://${host}/webhook/twilio-stream`,
       statusCallbackMethod: 'POST',
       statusCallbackEvent: ['start', 'end']
-    });
+    };
+    if (Object.keys(streamParameters).length) {
+      streamOptions.parameters = streamParameters;
+    }
+    connect.stream(streamOptions);
 
     res.type('text/xml');
     res.end(response.toString());
@@ -5710,9 +6008,41 @@ app.post('/webhook/twilio-stream', (req, res) => {
     const callSid = payload.CallSid || payload.callSid || 'unknown';
     const streamSid = payload.StreamSid || payload.streamSid || 'unknown';
     const eventType = payload.EventType || payload.eventType || payload.event || 'unknown';
-    console.log(`Twilio stream status: callSid=${callSid} streamSid=${streamSid} event=${eventType}`);
-    if (Object.keys(payload).length > 0) {
-      console.log(`Twilio stream payload: ${JSON.stringify(payload)}`);
+    const dedupeKey = `${callSid}:${streamSid}:${eventType}`;
+    const now = Date.now();
+    const lastSeen = streamStatusDedupe.get(dedupeKey);
+    if (!lastSeen || now - lastSeen > 2000) {
+      streamStatusDedupe.set(dedupeKey, now);
+      console.log('Twilio stream status', {
+        callSid,
+        streamSid,
+        eventType,
+        status: payload.StreamStatus || payload.streamStatus || null
+      });
+    }
+
+    if (eventType === 'start') {
+      if (callSid !== 'unknown' && streamSid !== 'unknown') {
+        const existing = activeStreamConnections.get(callSid);
+        if (!existing) {
+          activeStreamConnections.set(callSid, {
+            ws: null,
+            streamSid,
+            connectedAt: new Date().toISOString()
+          });
+        }
+        db.updateCallState(callSid, 'stream_status_start', {
+          stream_sid: streamSid,
+          at: new Date().toISOString()
+        }).catch(() => {});
+      }
+    } else if (eventType === 'end') {
+      if (callSid !== 'unknown') {
+        db.updateCallState(callSid, 'stream_status_end', {
+          stream_sid: streamSid,
+          at: new Date().toISOString()
+        }).catch(() => {});
+      }
     }
   } catch (err) {
     console.error('Twilio stream status webhook error:', err);
@@ -8177,6 +8507,13 @@ setInterval(() => {
 processCallJobs().catch(error => {
     console.error('❌ Initial call job processor error:', error);
 });
+
+// Stream watchdog to recover stalled calls
+setInterval(() => {
+    runStreamWatchdog().catch(error => {
+        console.error('❌ Stream watchdog error:', error);
+    });
+}, STREAM_WATCHDOG_INTERVAL_MS);
 
 // Start email queue processor
 setInterval(() => {

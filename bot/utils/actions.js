@@ -40,7 +40,12 @@ const MENU_ACTIONS = new Set([
   'PROVIDER_STATUS',
   'STATUS',
   'USERS',
-  'USERS_LIST'
+  'USERS_LIST',
+  'CALLER_FLAGS',
+  'CALLER_FLAGS_LIST',
+  'CALLER_FLAGS_ALLOW',
+  'CALLER_FLAGS_BLOCK',
+  'CALLER_FLAGS_SPAM'
 ]);
 const menuActionStats = {};
 let menuActionCount = 0;

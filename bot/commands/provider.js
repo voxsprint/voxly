@@ -83,6 +83,10 @@ async function fetchProviderStatus({ force = false } = {}) {
 }
 
 function formatProviderError(error, actionLabel) {
+    const authMessage = httpClient.getUserMessage(error, null);
+    if (authMessage && (error.response?.status === 401 || error.response?.status === 403)) {
+        return `❌ Failed to ${actionLabel}: ${escapeMarkdown(authMessage)}`;
+    }
     if (error.response) {
         const details = error.response.data?.details || error.response.data?.error || error.response.statusText;
         return `❌ Failed to ${actionLabel}: ${escapeMarkdown(details || 'Unknown error')}`;

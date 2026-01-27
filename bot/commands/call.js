@@ -119,13 +119,13 @@ async function selectCallScript(conversation, ctx, ensureActive) {
     scripts = await fetchCallScripts();
     ensureActive();
   } catch (error) {
-    await ctx.reply(error.message || '❌ Failed to load call scripts.');
-    return null;
+    await ctx.reply(httpClient.getUserMessage(error, 'Unable to load call scripts.'));
+    return { status: 'error' };
   }
 
   if (!scripts.length) {
-    await ctx.reply('ℹ️ No call scripts available. Use /scripts to create one.');
-    return null;
+    await ctx.reply('ℹ️ No call scripts found. Use /scripts to create one.');
+    return { status: 'empty' };
   }
 
   const options = scripts.map((script) => ({ id: script.id.toString(), label: `📄 ${script.name}` }));
@@ -141,7 +141,7 @@ async function selectCallScript(conversation, ctx, ensureActive) {
   ensureActive();
 
   if (selection.id === 'back') {
-    return null;
+    return { status: 'back' };
   }
 
   const scriptId = Number(selection.id);
@@ -155,18 +155,18 @@ async function selectCallScript(conversation, ctx, ensureActive) {
     script = await fetchCallScriptById(scriptId);
     ensureActive();
   } catch (error) {
-    await ctx.reply(error.message || '❌ Failed to load script.');
-    return null;
+    await ctx.reply(httpClient.getUserMessage(error, 'Unable to load the selected script.'));
+    return { status: 'error' };
   }
 
   if (!script) {
     await ctx.reply('❌ Script not found.');
-    return null;
+    return { status: 'error' };
   }
 
   if (!script.first_message) {
     await ctx.reply('⚠️ This script does not define a first message. Please edit it before using.');
-    return null;
+    return { status: 'error' };
   }
 
   const placeholderSet = new Set();
@@ -235,6 +235,7 @@ async function selectCallScript(conversation, ctx, ensureActive) {
   }
 
   return {
+    status: 'ok',
     payloadUpdates,
     summary,
     meta: {
@@ -244,6 +245,23 @@ async function selectCallScript(conversation, ctx, ensureActive) {
       scriptVoiceModel: script.voice_model || null
     }
   };
+}
+
+async function promptScriptFallback(conversation, ctx, reason = 'empty') {
+  const message = reason === 'empty'
+    ? '⚠️ No call scripts found. You can create one with /scripts or build a custom persona now.'
+    : 'No script selected. You can build a custom persona or cancel.';
+  const selection = await askOptionWithButtons(
+    conversation,
+    ctx,
+    message,
+    [
+      { id: 'custom', label: '🛠️ Build custom persona' },
+      { id: 'cancel', label: '❌ Cancel' }
+    ],
+    { prefix: 'call-script-fallback', columns: 1 }
+  );
+  return selection?.id || null;
 }
 
 async function buildCustomCallConfig(conversation, ctx, ensureActive, businessOptions) {
@@ -486,9 +504,26 @@ async function callFlow(conversation, ctx) {
 
     let configuration = null;
     if (configurationMode.id === 'script') {
-      configuration = await selectCallScript(conversation, ctx, ensureActive);
-      if (!configuration) {
-        await ctx.reply('ℹ️ No script selected. Switching to custom persona builder.');
+      const selection = await selectCallScript(conversation, ctx, ensureActive);
+      if (selection?.status === 'ok') {
+        configuration = selection;
+      } else if (selection?.status === 'empty' || selection?.status === 'back') {
+        const fallbackChoice = await promptScriptFallback(
+          conversation,
+          ctx,
+          selection?.status === 'empty' ? 'empty' : 'back'
+        );
+        ensureActive();
+        if (fallbackChoice !== 'custom') {
+          await ctx.reply('❌ Call setup cancelled.');
+          return;
+        }
+      } else if (selection?.status === 'error') {
+        await safeReset(ctx, 'call_script_error', {
+          message: '⚠️ Unable to load call scripts.',
+          menuHint: '📋 Check API credentials or use /call to try again.'
+        });
+        return;
       }
     }
     flow.touch('mode-selected');
@@ -695,8 +730,8 @@ async function callFlow(conversation, ctx) {
       } else if (status === 400) {
         await notifyCallError(ctx, 'Invalid request. Check the provided details and try again.');
         handled = true;
-      } else if (status === 401) {
-        await notifyCallError(ctx, 'Authentication failed. Please verify your API credentials.');
+      } else if (status === 401 || status === 403) {
+        await notifyCallError(ctx, 'Not authorized. Check the ADMIN token / API secret.');
         handled = true;
       } else if (status === 503) {
         await notifyCallError(ctx, 'Service unavailable. Please try again shortly.');
@@ -709,10 +744,10 @@ async function callFlow(conversation, ctx) {
         handled = true;
       }
     } else if (error.request) {
-      await notifyCallError(ctx, 'Temporary network issue. Retrying shortly.');
+      await notifyCallError(ctx, httpClient.getUserMessage(error, 'API unreachable. Please try again.'));
       handled = true;
     } else {
-      await notifyCallError(ctx, `Unexpected error: ${escapeMarkdown(error.message)}`);
+      await notifyCallError(ctx, httpClient.getUserMessage(error, `Unexpected error: ${escapeMarkdown(error.message)}`));
       handled = true;
     }
 

@@ -63,6 +63,7 @@ async function handleHelp(ctx) {
         if (isOwner) {
             const adminList = [
                 '👥 /users — manage authorized personnel',
+                '📵 /callerflags — manage inbound caller flags',
                 '📣 /smssender — bulk SMS center',
                 '📦 /mailer — bulk email center',
                 '🧪 /status — deep system status',
@@ -116,6 +117,7 @@ async function handleHelp(ctx) {
                 if (isOwner) {
                     keyboard.row()
                         .text('👥 Users', buildCallbackData(ctx, 'USERS'))
+                        .text('📵 Caller Flags', buildCallbackData(ctx, 'CALLER_FLAGS'))
                         .row()
                         .text('☎️ Provider', buildCallbackData(ctx, 'PROVIDER_STATUS'));
                 }

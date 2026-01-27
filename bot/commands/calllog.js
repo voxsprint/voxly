@@ -129,7 +129,7 @@ async function calllogRecentFlow(conversation, ctx) {
             reply_markup: buildMainMenuKeyboard(ctx)
         });
     } catch (error) {
-        await ctx.reply('❌ Failed to fetch recent calls. Please try again.', {
+        await ctx.reply(httpClient.getUserMessage(error, 'Failed to fetch recent calls.'), {
             reply_markup: buildMainMenuKeyboard(ctx)
         });
     }
@@ -178,7 +178,7 @@ async function calllogSearchFlow(conversation, ctx) {
             reply_markup: buildMainMenuKeyboard(ctx)
         });
     } catch (error) {
-        await ctx.reply('❌ Search failed. Please try again later.', {
+        await ctx.reply(httpClient.getUserMessage(error, 'Search failed. Please try again later.'), {
             reply_markup: buildMainMenuKeyboard(ctx)
         });
     }
@@ -230,7 +230,7 @@ async function calllogDetailsFlow(conversation, ctx) {
             reply_markup: buildMainMenuKeyboard(ctx)
         });
     } catch (error) {
-        await ctx.reply('❌ Failed to fetch call details.', {
+        await ctx.reply(httpClient.getUserMessage(error, 'Failed to fetch call details.'), {
             reply_markup: buildMainMenuKeyboard(ctx)
         });
     }
@@ -275,7 +275,7 @@ async function calllogEventsFlow(conversation, ctx) {
             reply_markup: buildMainMenuKeyboard(ctx)
         });
     } catch (error) {
-        await ctx.reply('❌ Failed to fetch recent events.', {
+        await ctx.reply(httpClient.getUserMessage(error, 'Failed to fetch recent events.'), {
             reply_markup: buildMainMenuKeyboard(ctx)
         });
     }
@@ -286,7 +286,7 @@ function registerCalllogCommand(bot) {
         try {
             await renderCalllogMenu(ctx);
         } catch (error) {
-            await ctx.reply('❌ Could not open call log.');
+            await ctx.reply(httpClient.getUserMessage(error, 'Could not open call log.'));
         }
     });
 }

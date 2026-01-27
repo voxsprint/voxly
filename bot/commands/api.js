@@ -11,6 +11,11 @@ function buildMainMenuReplyMarkup(ctx) {
     };
 }
 
+async function replyApiError(ctx, error, fallback, options = {}) {
+    const message = httpClient.getUserMessage(error, fallback);
+    return ctx.reply(message, options);
+}
+
 function parseRecentFilter(filter) {
     const trimmed = (filter || '').trim();
     if (!trimmed) return null;
@@ -124,24 +129,7 @@ async function handleTestApiCommand(ctx) {
         });
     } catch (error) {
         console.error('API test failed:', error);
-
-        let errorMessage = `❌ *API Test Failed*\n\nURL: ${escapeMarkdown(config.apiUrl)}\n`;
-
-        if (error.response) {
-            errorMessage += `Status: ${escapeMarkdown(String(error.response.status))} - ${escapeMarkdown(error.response.statusText)}\n`;
-            errorMessage += `Error: ${escapeMarkdown(error.response.data?.error || error.message)}`;
-        } else if (error.code === 'ECONNREFUSED') {
-            errorMessage += `Error: Connection refused - API server may be down`;
-        } else if (error.code === 'ENOTFOUND') {
-            errorMessage += `Error: Host not found - Check API URL`;
-        } else if (error.code === 'ETIMEDOUT') {
-            errorMessage += `Error: Request timeout - API server is not responding`;
-        } else {
-            errorMessage += `Error: ${escapeMarkdown(error.message)}`;
-        }
-
-        await ctx.reply(errorMessage, {
-            parse_mode: 'Markdown',
+        await replyApiError(ctx, error, 'API test failed.', {
             reply_markup: buildMainMenuReplyMarkup(ctx)
         });
     }
@@ -267,28 +255,8 @@ async function handleStatusCommand(ctx) {
         });
     } catch (error) {
         console.error('Status command error:', error);
-
-        let errorMessage = `❌ *System Status Check Failed*\n\n`;
-        errorMessage += `🤖 Bot: ✅ Online (you're seeing this message)\n`;
-        errorMessage += `🌐 API: ❌ Connection failed\n\n`;
-
-        if (error.response) {
-            errorMessage += `📊 API Status: ${escapeMarkdown(String(error.response.status))} - ${escapeMarkdown(error.response.statusText)}\n`;
-            errorMessage += `📝 Error Details: ${escapeMarkdown(error.response.data?.error || 'Unknown API error')}\n`;
-        } else if (error.code === 'ECONNREFUSED') {
-            errorMessage += `📝 Error: API server connection refused\n`;
-            errorMessage += `💡 Suggestion: Check if the API server is running\n`;
-        } else if (error.code === 'ENOTFOUND') {
-            errorMessage += `📝 Error: API server not found\n`;
-            errorMessage += `💡 Suggestion: Verify API URL configuration\n`;
-        } else {
-            errorMessage += `📝 Error: ${escapeMarkdown(error.message)}\n`;
-        }
-
-        errorMessage += `\n📡 API Endpoint: ${escapeMarkdown(config.apiUrl)}`;
-
-        await ctx.reply(errorMessage, {
-            parse_mode: 'Markdown',
+        const message = `${httpClient.getUserMessage(error, 'System status check failed.')}\nAPI: ${config.apiUrl}`;
+        await ctx.reply(message, {
             reply_markup: buildMainMenuReplyMarkup(ctx)
         });
     }
@@ -326,7 +294,7 @@ async function handleSearchCommand(ctx) {
         await ctx.reply(lines.join('\n\n'));
     } catch (error) {
         console.error('Search command error:', error?.message || error);
-        await ctx.reply('❌ Search failed. Please try again later.');
+        await replyApiError(ctx, error, 'Search failed. Please try again later.');
     }
 }
 
@@ -357,7 +325,7 @@ async function handleRecentCommand(ctx) {
         await ctx.reply(`${header}${lines.join('\n\n')}`);
     } catch (error) {
         console.error('Recent command error:', error?.message || error);
-        await ctx.reply('❌ Failed to fetch recent calls. Please try again later.');
+        await replyApiError(ctx, error, 'Failed to fetch recent calls. Please try again later.');
     }
 }
 
@@ -383,7 +351,7 @@ async function handleLatencyCommand(ctx) {
         await ctx.reply(lines.join('\n'));
     } catch (error) {
         console.error('Latency command error:', error?.message || error);
-        await ctx.reply('❌ Failed to fetch latency. Please try again later.');
+        await replyApiError(ctx, error, 'Failed to fetch latency. Please try again later.');
     }
 }
 
@@ -441,7 +409,7 @@ async function handleDigestCommand(ctx) {
         await ctx.reply(lines.join('\n'));
     } catch (error) {
         console.error('Digest command error:', error?.message || error);
-        await ctx.reply('❌ Failed to fetch digest. Please try again later.');
+        await replyApiError(ctx, error, 'Failed to fetch digest. Please try again later.');
     }
 }
 
@@ -486,31 +454,14 @@ async function handleHealthCommand(ctx) {
                 reply_markup: buildMainMenuReplyMarkup(ctx)
             });
         } catch (apiError) {
-            const responseTime = Date.now() - startTime;
-
-            let message = `🏥 *Health Check*\n\n`;
-            message += `🤖 Bot: ✅ Responsive\n`;
-            message += `🌐 API: ❌ Connection failed\n`;
-            message += `⚡ Response Time: ${responseTime}ms (timeout)\n`;
-            message += `⏰ Checked: ${new Date().toLocaleTimeString()}\n\n`;
-
-            if (apiError.code === 'ECONNREFUSED') {
-                message += `📝 API server appears to be down`;
-            } else if (apiError.code === 'ETIMEDOUT') {
-                message += `📝 API server is not responding (timeout)`;
-            } else {
-                message += `📝 ${apiError.message}`;
-            }
-
+            const message = `${httpClient.getUserMessage(apiError, 'API unreachable.')}\nAPI: ${config.apiUrl}`;
             await ctx.reply(message, {
-                parse_mode: 'Markdown',
                 reply_markup: buildMainMenuReplyMarkup(ctx)
             });
         }
     } catch (error) {
         console.error('Health command error:', error);
-        await ctx.reply(`🏥 *Health Check*\n\n🤖 Bot: ✅ Responsive\n🌐 API: ❌ Error\n⏰ Checked: ${new Date().toLocaleTimeString()}\n\n📝 ${error.message}`, {
-            parse_mode: 'Markdown',
+        await replyApiError(ctx, error, 'Health check failed.', {
             reply_markup: buildMainMenuReplyMarkup(ctx)
         });
     }

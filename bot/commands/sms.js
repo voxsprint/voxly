@@ -32,6 +32,11 @@ async function smsAlert(ctx, text) {
     await ctx.reply(formatSection('⚠️ SMS Alert', [text]));
 }
 
+async function replyApiError(ctx, error, fallback) {
+    const message = httpClient.getUserMessage(error, fallback);
+    await ctx.reply(message);
+}
+
 function buildBackToMenuKeyboard(ctx, action = 'SMS', label = '⬅️ Back to SMS Menu') {
     return new InlineKeyboard().text(label, buildCallbackData(ctx, action));
 }
@@ -100,16 +105,20 @@ async function renderSmsMenu(ctx) {
 }
 
 async function sendSmsStatusBySid(ctx, messageSid) {
-    const response = await httpClient.get(null, `${config.apiUrl}/api/sms/status/${messageSid}`, {
-        timeout: 10000
-    });
-    if (!response.data?.success) {
-        await ctx.reply(`❌ ${response.data?.error || 'Message not found'}`);
-        return;
+    try {
+        const response = await httpClient.get(null, `${config.apiUrl}/api/sms/status/${messageSid}`, {
+            timeout: 10000
+        });
+        if (!response.data?.success) {
+            await ctx.reply(`❌ ${response.data?.error || 'Message not found'}`);
+            return;
+        }
+        const msg = response.data.message || {};
+        const statusText = formatSmsStatusMessage(msg);
+        await ctx.reply(statusText, { parse_mode: 'Markdown' });
+    } catch (error) {
+        await replyApiError(ctx, error, 'Unable to fetch SMS status.');
     }
-    const msg = response.data.message || {};
-    const statusText = formatSmsStatusMessage(msg);
-    await ctx.reply(statusText, { parse_mode: 'Markdown' });
 }
 
 async function smsStatusFlow(conversation, ctx) {
@@ -133,7 +142,7 @@ async function smsStatusFlow(conversation, ctx) {
         await sendSmsStatusBySid(ctx, messageSid);
     } catch (error) {
         console.error('SMS status flow error:', error);
-        await ctx.reply('❌ Error checking SMS status. Please try again.');
+        await replyApiError(ctx, error, 'Error checking SMS status. Please try again.');
     }
 }
 
@@ -160,33 +169,37 @@ async function smsConversationFlow(conversation, ctx) {
         await viewSmsConversation(ctx, phoneNumber);
     } catch (error) {
         console.error('SMS conversation flow error:', error);
-        await ctx.reply('❌ Error viewing SMS conversation. Please try again.');
+        await replyApiError(ctx, error, 'Error viewing SMS conversation. Please try again.');
     }
 }
 
 async function sendRecentSms(ctx, limit = 10) {
-    const response = await httpClient.get(null, `${config.apiUrl}/api/sms/messages/recent`, {
-        params: { limit },
-        timeout: 10000
-    });
-    if (!response.data?.success || !Array.isArray(response.data.messages) || response.data.messages.length === 0) {
-        await ctx.reply('ℹ️ No recent SMS messages found.');
-        return;
+    try {
+        const response = await httpClient.get(null, `${config.apiUrl}/api/sms/messages/recent`, {
+            params: { limit },
+            timeout: 10000
+        });
+        if (!response.data?.success || !Array.isArray(response.data.messages) || response.data.messages.length === 0) {
+            await ctx.reply('ℹ️ No recent SMS messages found.');
+            return;
+        }
+        const messages = response.data.messages;
+        let messagesText = `📱 *Recent SMS Messages (${messages.length})*\n\n`;
+        messages.forEach((msg, index) => {
+            const time = new Date(msg.created_at).toLocaleString();
+            const direction = msg.direction === 'inbound' ? '📨' : '📤';
+            const toNumber = escapeMarkdown(msg.to_number || 'N/A');
+            const fromNumber = escapeMarkdown(msg.from_number || 'N/A');
+            const preview = escapeMarkdown((msg.body || '').substring(0, 80));
+            messagesText += `${index + 1}. ${direction} ${time}\n`;
+            messagesText += `   From: ${fromNumber}\n`;
+            messagesText += `   To: ${toNumber}\n`;
+            messagesText += `   Message: ${preview}${msg.body && msg.body.length > 80 ? '…' : ''}\n\n`;
+        });
+        await ctx.reply(messagesText, { parse_mode: 'Markdown' });
+    } catch (error) {
+        await replyApiError(ctx, error, 'Unable to fetch recent SMS messages.');
     }
-    const messages = response.data.messages;
-    let messagesText = `📱 *Recent SMS Messages (${messages.length})*\n\n`;
-    messages.forEach((msg, index) => {
-        const time = new Date(msg.created_at).toLocaleString();
-        const direction = msg.direction === 'inbound' ? '📨' : '📤';
-        const toNumber = escapeMarkdown(msg.to_number || 'N/A');
-        const fromNumber = escapeMarkdown(msg.from_number || 'N/A');
-        const preview = escapeMarkdown((msg.body || '').substring(0, 80));
-        messagesText += `${index + 1}. ${direction} ${time}\n`;
-        messagesText += `   From: ${fromNumber}\n`;
-        messagesText += `   To: ${toNumber}\n`;
-        messagesText += `   Message: ${preview}${msg.body && msg.body.length > 80 ? '…' : ''}\n\n`;
-    });
-    await ctx.reply(messagesText, { parse_mode: 'Markdown' });
 }
 
 async function recentSmsFlow(conversation, ctx) {
@@ -209,7 +222,7 @@ async function recentSmsFlow(conversation, ctx) {
         await sendRecentSms(ctx, limit);
     } catch (error) {
         console.error('Recent SMS flow error:', error);
-        await ctx.reply('❌ Error fetching recent SMS messages.');
+        await replyApiError(ctx, error, 'Error fetching recent SMS messages.');
     }
 }
 
@@ -228,7 +241,7 @@ async function smsStatsFlow(conversation, ctx) {
         await getSmsStats(ctx);
     } catch (error) {
         console.error('SMS stats flow error:', error);
-        await ctx.reply('❌ Error fetching SMS statistics.');
+        await replyApiError(ctx, error, 'Error fetching SMS statistics.');
     }
 }
 
@@ -257,31 +270,39 @@ function formatBulkSmsOperation(operation) {
 }
 
 async function sendBulkSmsList(ctx, { limit = 10, hours = 24 } = {}) {
-    const data = await fetchBulkSmsStatus(ctx, { limit, hours });
-    const operations = data?.operations || [];
-    if (!operations.length) {
-        await ctx.reply('ℹ️ No bulk SMS jobs found in the selected window.');
-        return;
+    try {
+        const data = await fetchBulkSmsStatus(ctx, { limit, hours });
+        const operations = data?.operations || [];
+        if (!operations.length) {
+            await ctx.reply('ℹ️ No bulk SMS jobs found in the selected window.');
+            return;
+        }
+        const blocks = operations.map((op) => formatBulkSmsOperation(op));
+        await ctx.reply(`📦 *Recent Bulk SMS Jobs*\n\n${blocks.join('\n\n')}`, { parse_mode: 'Markdown' });
+    } catch (error) {
+        await replyApiError(ctx, error, 'Failed to fetch bulk SMS jobs.');
     }
-    const blocks = operations.map((op) => formatBulkSmsOperation(op));
-    await ctx.reply(`📦 *Recent Bulk SMS Jobs*\n\n${blocks.join('\n\n')}`, { parse_mode: 'Markdown' });
 }
 
 async function sendBulkSmsStats(ctx, { hours = 24 } = {}) {
-    const data = await fetchBulkSmsStatus(ctx, { limit: 20, hours });
-    const summary = data?.summary;
-    if (!summary) {
-        await ctx.reply('ℹ️ Bulk SMS stats unavailable.');
-        return;
+    try {
+        const data = await fetchBulkSmsStatus(ctx, { limit: 20, hours });
+        const summary = data?.summary;
+        if (!summary) {
+            await ctx.reply('ℹ️ Bulk SMS stats unavailable.');
+            return;
+        }
+        const lines = [
+            `Total jobs: ${summary.totalOperations || 0}`,
+            `Recipients: ${summary.totalRecipients || 0}`,
+            `Success: ${summary.totalSuccessful || 0}`,
+            `Failed: ${summary.totalFailed || 0}`,
+            `Success rate: ${summary.successRate || 0}%`
+        ];
+        await ctx.reply(`📊 *Bulk SMS Summary (last ${data.time_period_hours || hours}h)*\n${lines.join('\n')}`, { parse_mode: 'Markdown' });
+    } catch (error) {
+        await replyApiError(ctx, error, 'Failed to fetch bulk SMS statistics.');
     }
-    const lines = [
-        `Total jobs: ${summary.totalOperations || 0}`,
-        `Recipients: ${summary.totalRecipients || 0}`,
-        `Success: ${summary.totalSuccessful || 0}`,
-        `Failed: ${summary.totalFailed || 0}`,
-        `Success rate: ${summary.successRate || 0}%`
-    ];
-    await ctx.reply(`📊 *Bulk SMS Summary (last ${data.time_period_hours || hours}h)*\n${lines.join('\n')}`, { parse_mode: 'Markdown' });
 }
 
 async function bulkSmsStatusFlow(conversation, ctx) {
@@ -313,7 +334,7 @@ async function bulkSmsStatusFlow(conversation, ctx) {
         await ctx.reply(`📦 *Bulk SMS Job*\n\n${formatBulkSmsOperation(match)}`, { parse_mode: 'Markdown' });
     } catch (error) {
         console.error('Bulk SMS status flow error:', error);
-        await ctx.reply('❌ Error fetching bulk SMS status.');
+        await replyApiError(ctx, error, 'Error fetching bulk SMS status.');
     }
 }
 
@@ -800,28 +821,7 @@ Tap an option below to continue.`;
             return;
         }
         console.error('SMS send error:', error);
-        let errorMsg = '❌ *SMS Failed*\n\n';
-
-        if (error.response) {
-            const status = error.response.status;
-            const errorData = error.response.data;
-            if (status === 400) {
-                errorMsg += `Bad Request: ${errorData?.error || 'Invalid data'}`;
-            } else if (status === 500) {
-                errorMsg += `Server Error: ${errorData?.error || 'Internal server error'}`;
-            } else {
-                errorMsg += `HTTP ${status}: ${errorData?.error || error.response.statusText}`;
-            }
-        } else if (error.request) {
-            errorMsg += `Network Error: Cannot reach API server\nURL: ${config.apiUrl}`;
-        } else {
-            errorMsg += `Error: ${error.message}`;
-        }
-
-        await ctx.reply(errorMsg, {
-            parse_mode: 'Markdown',
-            reply_markup: buildBackToMenuKeyboard(ctx, 'SMS')
-        });
+        await replyApiError(ctx, error, 'SMS failed. Please try again.');
     }
 }
 
@@ -1007,12 +1007,7 @@ async function bulkSmsFlow(conversation, ctx) {
             return;
         }
         console.error('Bulk SMS error:', error);
-        let errorMsg = '❌ *Bulk SMS Failed*\n\n';
-        errorMsg += error.response ? `Error: ${error.response.data?.error || 'Unknown error'}` : `Error: ${error.message}`;
-        await ctx.reply(errorMsg, {
-            parse_mode: 'Markdown',
-            reply_markup: buildBackToMenuKeyboard(ctx, 'BULK_SMS', '⬅️ Back to SMS Sender')
-        });
+        await replyApiError(ctx, error, 'Bulk SMS failed. Please try again.');
     }
 }
 
@@ -1143,9 +1138,7 @@ async function scheduleSmsFlow(conversation, ctx) {
             return;
         }
         console.error('Schedule SMS error:', error);
-        await ctx.reply('❌ Failed to schedule SMS. Please try again.', {
-            reply_markup: buildBackToMenuKeyboard(ctx, 'SMS')
-        });
+        await replyApiError(ctx, error, 'Failed to schedule SMS. Please try again.');
     }
 }
 
@@ -1252,7 +1245,7 @@ async function viewStoredSmsConversation(ctx, phoneNumber) {
         }
     } catch (error) {
         console.error('Error fetching stored SMS conversation:', error);
-        await ctx.reply('❌ No conversation found with this phone number');
+        await replyApiError(ctx, error, 'No conversation found with this phone number.');
     }
 }
 
@@ -1331,10 +1324,10 @@ async function getSmsStats(ctx) {
                     
                 await ctx.reply(basicStatsText, { parse_mode: 'Markdown' });
             } else {
-                await ctx.reply('❌ Error fetching SMS statistics. Service may be down.');
+                await ctx.reply('Error fetching SMS statistics. Service may be down.');
             }
         } catch (fallbackError) {
-            await ctx.reply('❌ Error fetching SMS statistics. API server unreachable.');
+            await replyApiError(ctx, fallbackError, 'Error fetching SMS statistics. API server unreachable.');
         }
     }
 }

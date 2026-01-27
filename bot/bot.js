@@ -72,7 +72,9 @@ function wrapConversation(handler, name) {
                 return;
             }
             console.error(`Conversation error in ${name}:`, error);
-            await ctx.reply('❌ An error occurred during the conversation. Please try again.');
+            const fallback = '❌ An error occurred during the conversation. Please try again.';
+            const message = error?.userMessage || fallback;
+            await ctx.reply(message);
         }
     }, name);
 }
@@ -169,7 +171,9 @@ bot.use(async (ctx, next) => {
     } catch (error) {
         logCommandError(ctx, error);
         try {
-            await ctx.reply('⚠️ Sorry, something went wrong while handling that command. Please try again.');
+            const fallback = '⚠️ Sorry, something went wrong while handling that command. Please try again.';
+            const message = error?.userMessage || fallback;
+            await ctx.reply(message);
         } catch (replyError) {
             console.error('Failed to send command fallback:', replyError);
         }
@@ -335,6 +339,14 @@ const {
     renderUsersMenu,
     sendUsersList
 } = require('./commands/users');
+const {
+    registerCallerFlagsCommand,
+    renderCallerFlagsMenu,
+    sendCallerFlagsList,
+    callerFlagAllowFlow,
+    callerFlagBlockFlow,
+    callerFlagSpamFlow
+} = require('./commands/callerFlags');
 const { registerHelpCommand, handleHelp } = require('./commands/help');
 const { registerMenuCommand, handleMenu } = require('./commands/menu');
 const { registerGuideCommand, handleGuide } = require('./commands/guide');
@@ -370,6 +382,9 @@ bot.use(wrapConversation(calllogDetailsFlow, "calllog-details-conversation"));
 bot.use(wrapConversation(calllogEventsFlow, "calllog-events-conversation"));
 bot.use(wrapConversation(scriptsFlow, "scripts-conversation"));
 bot.use(wrapConversation(personaFlow, "persona-conversation"));
+bot.use(wrapConversation(callerFlagAllowFlow, "callerflag-allow-conversation"));
+bot.use(wrapConversation(callerFlagBlockFlow, "callerflag-block-conversation"));
+bot.use(wrapConversation(callerFlagSpamFlow, "callerflag-spam-conversation"));
 
 // Register command handlers
 registerCallCommand(bot);
@@ -379,6 +394,7 @@ registerScriptsCommand(bot);
 registerUserListCommand(bot);
 registerPersonaCommand(bot);
 registerCalllogCommand(bot);
+registerCallerFlagsCommand(bot);
 
 
 // Register non-conversation commands
@@ -911,6 +927,8 @@ bot.command('start', async (ctx) => {
                 .text('📧 Mailer', buildCallbackData(ctx, 'BULK_EMAIL'))
             .row()
                 .text('👥 Users', buildCallbackData(ctx, 'USERS'))
+                .text('📵 Caller Flags', buildCallbackData(ctx, 'CALLER_FLAGS'))
+            .row()
                 .text('🧰 Scripts', buildCallbackData(ctx, 'SCRIPTS'))
             .row()
                 .text('☎️ Provider', buildCallbackData(ctx, 'PROVIDER_STATUS'))
@@ -1186,7 +1204,10 @@ bot.on('callback_query:data', async (ctx) => {
             'CALLLOG_DETAILS': 'calllog-details-conversation',
             'CALLLOG_EVENTS': 'calllog-events-conversation',
             'SCRIPTS': 'scripts-conversation',
-            'PERSONA': 'persona-conversation'
+            'PERSONA': 'persona-conversation',
+            'CALLER_FLAGS_ALLOW': 'callerflag-allow-conversation',
+            'CALLER_FLAGS_BLOCK': 'callerflag-block-conversation',
+            'CALLER_FLAGS_SPAM': 'callerflag-spam-conversation'
         };
 
         if (conversations[action]) {
@@ -1204,7 +1225,10 @@ bot.on('callback_query:data', async (ctx) => {
                 'SMS_STATUS': 'SMS status',
                 'SMS_CONVO': 'SMS conversation',
                 'SMS_RECENT': 'recent SMS',
-                'SMS_STATS': 'SMS stats'
+                'SMS_STATS': 'SMS stats',
+                'CALLER_FLAGS_ALLOW': 'caller allowlist',
+                'CALLER_FLAGS_BLOCK': 'caller blocklist',
+                'CALLER_FLAGS_SPAM': 'spam flag'
             };
             const label = conversationLabels[action] || action.toLowerCase().replace(/_/g, ' ');
             await ctx.reply(`Starting ${label}...`);
@@ -1243,6 +1267,28 @@ bot.on('callback_query:data', async (ctx) => {
                     console.error('Users list callback error:', usersError);
                     await ctx.reply('❌ Error displaying users list. Please try again.');
                     finishMetric('error', { error: usersError?.message || String(usersError) });
+                }
+                break;
+
+            case 'CALLER_FLAGS':
+                try {
+                    await renderCallerFlagsMenu(ctx);
+                    finishMetric('ok');
+                } catch (flagsError) {
+                    console.error('Caller flags menu error:', flagsError);
+                    await ctx.reply('❌ Error displaying caller flags menu. Please try again.');
+                    finishMetric('error', { error: flagsError?.message || String(flagsError) });
+                }
+                break;
+
+            case 'CALLER_FLAGS_LIST':
+                try {
+                    await sendCallerFlagsList(ctx);
+                    finishMetric('ok');
+                } catch (flagsError) {
+                    console.error('Caller flags list error:', flagsError);
+                    await ctx.reply('❌ Error fetching caller flags. Please try again.');
+                    finishMetric('error', { error: flagsError?.message || String(flagsError) });
                 }
                 break;
                 
@@ -1370,7 +1416,9 @@ bot.on('callback_query:data', async (ctx) => {
 
     } catch (error) {
         console.error('Callback query error:', error);
-        await ctx.reply("❌ An error occurred processing your request. Please try again.");
+        const fallback = '❌ An error occurred processing your request. Please try again.';
+        const message = error?.userMessage || fallback;
+        await ctx.reply(message);
         finishMetric('error', { error: error?.message || String(error) });
     }
 });
@@ -1510,6 +1558,7 @@ const TELEGRAM_COMMANDS = [
     { command: 'scripts', description: 'Manage call & SMS scripts (admin only)' },
     { command: 'persona', description: 'Manage personas (admin only)' },
     { command: 'provider', description: 'Manage call provider (admin only)' },
+    { command: 'callerflags', description: 'Manage caller flags (admin only)' },
     { command: 'users', description: 'Manage users (admin only)' },
     { command: 'status', description: 'System status (admin only)' }
 ];

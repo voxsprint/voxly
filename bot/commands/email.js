@@ -45,6 +45,11 @@ async function safeReplyMarkdown(ctx, text, options = {}) {
   return safeReply(ctx, text, { parse_mode: 'Markdown', ...options });
 }
 
+async function replyApiError(ctx, error, fallback) {
+  const message = httpClient.getUserMessage(error, fallback);
+  return safeReply(ctx, message);
+}
+
 function buildBackToMenuKeyboard(ctx, action = 'EMAIL', label = '⬅️ Back to Email Menu') {
   return new InlineKeyboard().text(label, buildCallbackData(ctx, action));
 }
@@ -428,7 +433,7 @@ async function selectEmailTemplateId(conversation, ctx, ensureActive) {
     templates = await fetchEmailTemplates(ctx);
     ensureActive();
   } catch (error) {
-    await ctx.reply('⚠️ Unable to load templates. Enter the script_id manually.');
+    await replyApiError(ctx, error, 'Unable to load templates. Enter the script_id manually.');
     return null;
   }
   if (!templates.length) {
@@ -815,7 +820,7 @@ async function emailTemplatesFlow(conversation, ctx, options = {}) {
     }
   } catch (error) {
     console.error('Email template flow error:', error);
-    await safeReplyMarkdown(ctx, section('❌ Email Template Error', [error.message || 'Failed to manage templates.']));
+    await replyApiError(ctx, error, 'Failed to manage templates.');
   }
 }
 
@@ -863,7 +868,7 @@ async function emailStatusFlow(conversation, ctx) {
     await sendEmailStatusCard(ctx, messageId, { forceReply: true });
   } catch (error) {
     console.error('Email status flow error:', error);
-    await ctx.reply('❌ Failed to fetch email status.');
+    await replyApiError(ctx, error, 'Failed to fetch email status.');
   }
 }
 
@@ -902,26 +907,30 @@ async function fetchBulkEmailHistory(ctx, { limit = 10, offset = 0 } = {}) {
 }
 
 async function sendBulkEmailHistory(ctx, { limit = 10, offset = 0 } = {}) {
-  const data = await fetchBulkEmailHistory(ctx, { limit, offset });
-  const jobs = data?.jobs || [];
-  if (!jobs.length) {
-    await ctx.reply('ℹ️ No bulk email jobs found for that range.');
-    return;
+  try {
+    const data = await fetchBulkEmailHistory(ctx, { limit, offset });
+    const jobs = data?.jobs || [];
+    if (!jobs.length) {
+      await ctx.reply('ℹ️ No bulk email jobs found for that range.');
+      return;
+    }
+    const lines = jobs.map((job) => {
+      const created = job.created_at ? new Date(job.created_at).toLocaleString() : 'N/A';
+      return [
+        `🆔 ${escapeMarkdown(job.job_id || 'unknown')}`,
+        `📊 ${escapeMarkdown(job.status || 'unknown')}`,
+        `📨 ${job.sent || 0}/${job.total || 0} sent`,
+        `🕒 ${escapeMarkdown(created)}`
+      ].join('\n');
+    });
+    const page = Math.floor(offset / limit) + 1;
+    await ctx.reply(`📦 *Bulk Email History* (page ${page})\n\n${lines.join('\n\n')}`, {
+      parse_mode: 'Markdown',
+      reply_markup: buildBackToMenuKeyboard(ctx, 'BULK_EMAIL', '⬅️ Back to Mailer')
+    });
+  } catch (error) {
+    await replyApiError(ctx, error, 'Failed to fetch bulk email history.');
   }
-  const lines = jobs.map((job) => {
-    const created = job.created_at ? new Date(job.created_at).toLocaleString() : 'N/A';
-    return [
-      `🆔 ${escapeMarkdown(job.job_id || 'unknown')}`,
-      `📊 ${escapeMarkdown(job.status || 'unknown')}`,
-      `📨 ${job.sent || 0}/${job.total || 0} sent`,
-      `🕒 ${escapeMarkdown(created)}`
-    ].join('\n');
-  });
-  const page = Math.floor(offset / limit) + 1;
-  await ctx.reply(`📦 *Bulk Email History* (page ${page})\n\n${lines.join('\n\n')}`, {
-    parse_mode: 'Markdown',
-    reply_markup: buildBackToMenuKeyboard(ctx, 'BULK_EMAIL', '⬅️ Back to Mailer')
-  });
 }
 
 async function bulkEmailHistoryFlow(conversation, ctx) {
@@ -945,7 +954,7 @@ async function bulkEmailHistoryFlow(conversation, ctx) {
     const offset = (page - 1) * limit;
     await sendBulkEmailHistory(ctx, { limit, offset });
   } catch (error) {
-    await ctx.reply('❌ Failed to fetch bulk email history.');
+    await replyApiError(ctx, error, 'Failed to fetch bulk email history.');
   }
 }
 
@@ -958,26 +967,30 @@ async function fetchBulkEmailStats(ctx, { hours = 24 } = {}) {
 }
 
 async function sendBulkEmailStats(ctx, { hours = 24 } = {}) {
-  const data = await fetchBulkEmailStats(ctx, { hours });
-  const stats = data?.stats;
-  if (!stats) {
-    await ctx.reply('ℹ️ Bulk email stats unavailable.');
-    return;
+  try {
+    const data = await fetchBulkEmailStats(ctx, { hours });
+    const stats = data?.stats;
+    if (!stats) {
+      await ctx.reply('ℹ️ Bulk email stats unavailable.');
+      return;
+    }
+    const lines = [
+      `Jobs: ${stats.total_jobs || 0}`,
+      `Recipients: ${stats.total_recipients || 0}`,
+      `Sent: ${stats.sent || 0}`,
+      `Failed: ${stats.failed || 0}`,
+      `Delivered: ${stats.delivered || 0}`,
+      `Bounced: ${stats.bounced || 0}`,
+      `Complaints: ${stats.complained || 0}`,
+      `Suppressed: ${stats.suppressed || 0}`
+    ];
+    await ctx.reply(`📊 *Bulk Email Stats (last ${data.hours || hours}h)*\n${lines.join('\n')}`, {
+      parse_mode: 'Markdown',
+      reply_markup: buildBackToMenuKeyboard(ctx, 'BULK_EMAIL', '⬅️ Back to Mailer')
+    });
+  } catch (error) {
+    await replyApiError(ctx, error, 'Failed to fetch bulk email stats.');
   }
-  const lines = [
-    `Jobs: ${stats.total_jobs || 0}`,
-    `Recipients: ${stats.total_recipients || 0}`,
-    `Sent: ${stats.sent || 0}`,
-    `Failed: ${stats.failed || 0}`,
-    `Delivered: ${stats.delivered || 0}`,
-    `Bounced: ${stats.bounced || 0}`,
-    `Complaints: ${stats.complained || 0}`,
-    `Suppressed: ${stats.suppressed || 0}`
-  ];
-  await ctx.reply(`📊 *Bulk Email Stats (last ${data.hours || hours}h)*\n${lines.join('\n')}`, {
-    parse_mode: 'Markdown',
-    reply_markup: buildBackToMenuKeyboard(ctx, 'BULK_EMAIL', '⬅️ Back to Mailer')
-  });
 }
 
 async function bulkEmailStatsFlow(conversation, ctx) {
@@ -997,7 +1010,7 @@ async function bulkEmailStatsFlow(conversation, ctx) {
     const hours = Math.min(Math.max(parseInt(update?.message?.text?.trim(), 10) || 24, 1), 720);
     await sendBulkEmailStats(ctx, { hours });
   } catch (error) {
-    await ctx.reply('❌ Failed to fetch bulk email stats.');
+    await replyApiError(ctx, error, 'Failed to fetch bulk email stats.');
   }
 }
 
@@ -1023,7 +1036,7 @@ async function bulkEmailStatusFlow(conversation, ctx) {
     await sendBulkStatusCard(ctx, jobId, { forceReply: true });
   } catch (error) {
     console.error('Bulk email status flow error:', error);
-    await ctx.reply('❌ Failed to fetch bulk email status.');
+    await replyApiError(ctx, error, 'Failed to fetch bulk email status.');
   }
 }
 
@@ -1605,10 +1618,7 @@ async function bulkEmailFlow(conversation, ctx) {
     await sendBulkStatusCard(ctx, jobId, { forceReply: true });
   } catch (error) {
     console.error('Bulk email flow error:', error);
-    await ctx.reply(section('❌ Bulk Email Error', [error.message || 'Failed to send bulk email.']), {
-      parse_mode: 'Markdown',
-      reply_markup: buildBackToMenuKeyboard(ctx, 'BULK_EMAIL', '⬅️ Back to Bulk Email')
-    });
+    await replyApiError(ctx, error, 'Failed to send bulk email.');
   }
 }
 
@@ -1648,7 +1658,7 @@ function registerEmailCommands(bot) {
       await sendEmailStatusCard(ctx, messageId, { forceReply: true });
     } catch (error) {
       console.error('Email status command error:', error);
-      await ctx.reply('❌ Failed to fetch email status.');
+      await replyApiError(ctx, error, 'Failed to fetch email status.');
     }
   });
 

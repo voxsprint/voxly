@@ -33,6 +33,8 @@ async function handleMenu(ctx) {
                 .text('📧 Mailer', buildCallbackData(ctx, 'BULK_EMAIL'))
                 .row()
                 .text('👥 Users', buildCallbackData(ctx, 'USERS'))
+                .text('📵 Caller Flags', buildCallbackData(ctx, 'CALLER_FLAGS'))
+                .row()
                 .text('🧰 Scripts', buildCallbackData(ctx, 'SCRIPTS'))
                 .row()
                 .text('☎️ Provider', buildCallbackData(ctx, 'PROVIDER_STATUS'))

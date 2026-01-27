@@ -42,7 +42,8 @@ const CAPABILITY_RULES = {
   persona_manage: ['admin'],
   provider_manage: ['admin'],
   users_manage: ['admin'],
-  status_admin: ['admin']
+  status_admin: ['admin'],
+  caller_flags_manage: ['admin']
 };
 
 const COMMAND_CAPABILITIES = {
@@ -59,6 +60,7 @@ const COMMAND_CAPABILITIES = {
   persona: 'persona_manage',
   provider: 'provider_manage',
   users: 'users_manage',
+  callerflags: 'caller_flags_manage',
   status: 'status_admin',
   health: 'health',
   ping: 'health'
@@ -91,6 +93,7 @@ const ACTION_CAPABILITIES = [
   { match: (action) => action === 'PROVIDER_STATUS', cap: 'provider_manage' },
   { match: (action) => action.startsWith('PROVIDER_SET:'), cap: 'provider_manage' },
   { match: (action) => ['USERS', 'USERS_LIST', 'ADDUSER', 'PROMOTE', 'REMOVE'].includes(action), cap: 'users_manage' },
+  { match: (action) => ['CALLER_FLAGS', 'CALLER_FLAGS_LIST', 'CALLER_FLAGS_ALLOW', 'CALLER_FLAGS_BLOCK', 'CALLER_FLAGS_SPAM'].includes(action), cap: 'caller_flags_manage' },
   { match: (action) => action.startsWith('CALL_DETAILS:'), cap: 'calllog_view' },
   { match: (action) => action.startsWith('tr:'), cap: 'calllog_view' },
   { match: (action) => action.startsWith('rca:'), cap: 'calllog_view' },

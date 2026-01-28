@@ -1,4 +1,13 @@
 import { useCallback, useEffect, useState } from 'react';
+import {
+  Button,
+  Cell,
+  InlineButtons,
+  Input,
+  List,
+  Section,
+  Select,
+} from '@telegram-apps/telegram-ui';
 import { useCalls } from '../state/calls';
 import { navigate } from '../lib/router';
 
@@ -42,76 +51,75 @@ export function Calls() {
   };
 
   return (
-    <section className="stack">
-      <div className="panel">
-        <h2>Call log</h2>
-        <div className="filters">
-          <input
-            type="text"
-            placeholder="Search last4 or label..."
-            value={search}
-            onChange={(event) => setSearch(event.target.value)}
-            onKeyDown={(event) => {
-              if (event.key === 'Enter') {
-                setCursor(0);
-                loadCalls(0);
-              }
-            }}
-          />
-          <select value={statusFilter} onChange={(event) => setStatusFilter(event.target.value)}>
-            <option value="">All statuses</option>
-            <option value="ringing">Ringing</option>
-            <option value="in-progress">In progress</option>
-            <option value="completed">Completed</option>
-            <option value="no-answer">No answer</option>
-            <option value="failed">Failed</option>
-          </select>
-          <button
-            type="button"
-            className="btn"
+    <List>
+      <Section header="Filters">
+        <Input
+          header="Search"
+          placeholder="Last 4 or label"
+          value={search}
+          onChange={(event) => setSearch(event.target.value)}
+          onKeyDown={(event) => {
+            if (event.key === 'Enter') {
+              setCursor(0);
+              loadCalls(0);
+            }
+          }}
+        />
+        <Select
+          header="Status"
+          value={statusFilter}
+          onChange={(event) => setStatusFilter(event.target.value)}
+        >
+          <option value="">All statuses</option>
+          <option value="ringing">Ringing</option>
+          <option value="in-progress">In progress</option>
+          <option value="completed">Completed</option>
+          <option value="no-answer">No answer</option>
+          <option value="failed">Failed</option>
+        </Select>
+        <div className="section-actions">
+          <Button
+            size="s"
+            mode="filled"
             onClick={() => {
               setCursor(0);
               loadCalls(0);
             }}
           >
             Apply
-          </button>
-          <button type="button" className="btn ghost" onClick={handleClear}>
+          </Button>
+          <Button size="s" mode="plain" onClick={handleClear}>
             Clear
-          </button>
+          </Button>
         </div>
-        <p className="muted">
-          Showing {calls.length} calls {cursor ? `from ${cursor + 1}` : ''} {statusFilter ? `| ${statusFilter}` : ''} {search ? `| "${search}"` : ''}
-        </p>
+      </Section>
+
+      <Section
+        header="Call log"
+        footer={`Showing ${calls.length} calls${cursor ? ` from ${cursor + 1}` : ''}${statusFilter ? ` | ${statusFilter}` : ''}${search ? ` | "${search}"` : ''}`}
+      >
         {loading && calls.length === 0 ? (
-          <p className="muted">Loading calls...</p>
+          <Cell subtitle="Loading calls...">Please wait</Cell>
         ) : (
-          <div className="list">
-            {calls.map((call) => (
-              <button
-                type="button"
-                className="list-item clickable"
-                key={call.call_sid}
-                onClick={() => navigate(`/calls/${call.call_sid}`)}
-              >
-                <div>
-                  <strong>{call.phone_number || call.call_sid}</strong>
-                  <p className="muted">{call.status || 'unknown'} - {call.created_at || '-'}</p>
-                </div>
-                <span className={`badge ${call.status || 'unknown'}`}>{call.status || 'unknown'}</span>
-              </button>
-            ))}
-          </div>
+          calls.map((call) => (
+            <Cell
+              key={call.call_sid}
+              subtitle={`${call.status || 'unknown'} • ${call.created_at || '-'}`}
+              description={call.call_sid}
+              onClick={() => navigate(`/calls/${call.call_sid}`)}
+            >
+              {call.phone_number || call.call_sid}
+            </Cell>
+          ))
         )}
-        <div className="pager">
-          <button type="button" className="btn ghost" onClick={handlePrev} disabled={cursor === 0}>
-            Prev
-          </button>
-          <button type="button" className="btn ghost" onClick={handleNext} disabled={nextCursor === null}>
-            Next
-          </button>
-        </div>
-      </div>
-    </section>
+      </Section>
+
+      <Section>
+        <InlineButtons mode="gray">
+          <InlineButtons.Item text="Prev" disabled={cursor === 0} onClick={handlePrev} />
+          <InlineButtons.Item text="Next" disabled={nextCursor === null} onClick={handleNext} />
+        </InlineButtons>
+      </Section>
+    </List>
   );
 }

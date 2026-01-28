@@ -46,9 +46,16 @@ export type CallEvent = {
   sequence_number: number;
 };
 
+export type InboundNotice = {
+  message: string;
+  level?: 'info' | 'warning' | 'danger';
+  pending_count?: number;
+};
+
 type CallsState = {
   calls: CallRecord[];
   inboundQueue: LiveCall[];
+  inboundNotice: InboundNotice | null;
   activeCall: CallRecord | null;
   callEvents: CallEvent[];
   callEventsById: Record<string, CallEvent[]>;
@@ -68,6 +75,7 @@ const CallsContext = createContext<CallsState | null>(null);
 export function CallsProvider({ children }: PropsWithChildren) {
   const [calls, setCalls] = useState<CallRecord[]>([]);
   const [inboundQueue, setInboundQueue] = useState<LiveCall[]>([]);
+  const [inboundNotice, setInboundNotice] = useState<InboundNotice | null>(null);
   const [activeCall, setActiveCall] = useState<CallRecord | null>(null);
   const [callEvents, setCallEvents] = useState<CallEvent[]>([]);
   const [callEventsById, setCallEventsById] = useState<Record<string, CallEvent[]>>({});
@@ -102,8 +110,11 @@ export function CallsProvider({ children }: PropsWithChildren) {
   const fetchInboundQueue = useCallback(async () => {
     setError(null);
     try {
-      const response = await apiFetch<{ ok: boolean; calls: LiveCall[] }>('/webapp/inbound/queue');
+      const response = await apiFetch<{ ok: boolean; calls: LiveCall[]; notice?: InboundNotice | null }>(
+        '/webapp/inbound/queue',
+      );
       setInboundQueue(response.calls || []);
+      setInboundNotice(response.notice ?? null);
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to load inbound queue');
     }
@@ -168,6 +179,7 @@ export function CallsProvider({ children }: PropsWithChildren) {
   const value = useMemo<CallsState>(() => ({
     calls,
     inboundQueue,
+    inboundNotice,
     activeCall,
     callEvents,
     callEventsById,
@@ -183,6 +195,7 @@ export function CallsProvider({ children }: PropsWithChildren) {
   }), [
     calls,
     inboundQueue,
+    inboundNotice,
     activeCall,
     callEvents,
     callEventsById,

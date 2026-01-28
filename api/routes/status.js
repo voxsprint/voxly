@@ -620,9 +620,11 @@ class EnhancedWebhookService {
         || this.isVoicemailAnswer(additionalData.answered_by);
 
       let adjustedStatus = correctedStatus;
+      let inboundGateStatus = null;
       if (callMeta?.inbound) {
         const gate = this.getInboundGate(call_sid);
         const gateStatus = gate?.status || 'pending';
+        inboundGateStatus = gateStatus;
         const pending = gateStatus === 'pending';
         if (pending && ['answered', 'in-progress'].includes(correctedStatus)) {
           adjustedStatus = 'ringing';
@@ -651,6 +653,10 @@ class EnhancedWebhookService {
         this.scheduleDeferredTerminalStatus(call_sid, adjustedStatus, telegram_chat_id, additionalData);
         console.log(`⏳ Deferring terminal status ${adjustedStatus} for call ${call_sid} (recent activity)`);
         return true;
+      }
+
+      if (callMeta?.inbound && inboundGateStatus === 'pending' && !this.isTerminalStatus(adjustedStatus)) {
+        message = `${message}\n\n👉 Answer in the Mini App to start the call.`;
       }
 
       // Check if we should send this status
@@ -1780,12 +1786,17 @@ class EnhancedWebhookService {
       };
     }
     const miniappUrlBase = config.miniapp?.publicUrl;
-    const miniappUrl = miniappUrlBase
-      ? (() => {
-          const joiner = miniappUrlBase.includes('?') ? '&' : '?';
-          return `${miniappUrlBase}${joiner}call=${encodeURIComponent(callSid)}`;
-        })()
-      : null;
+    const miniappBotUsername = config.miniapp?.botUsername;
+    const miniappUrl = (() => {
+      if (miniappUrlBase) {
+        const joiner = miniappUrlBase.includes('?') ? '&' : '?';
+        return `${miniappUrlBase}${joiner}call=${encodeURIComponent(callSid)}`;
+      }
+      if (miniappBotUsername) {
+        return `https://t.me/${miniappBotUsername}?startapp=${encodeURIComponent(`call_${callSid}`)}`;
+      }
+      return null;
+    })();
     const compactLabel = entry?.compact ? '🧭 Full view' : '🧭 Compact view';
     const privacyLabel = entry?.redactPreview ? '🔓 Reveal' : '🔒 Hide';
     if (entry?.inbound) {
@@ -1794,11 +1805,7 @@ class EnhancedWebhookService {
       if (gateStatus !== 'answered' && !isTerminal) {
         return {
           inline_keyboard: [
-            [
-              { text: '✅ Answer', callback_data: `lc:answer:${callSid}` },
-              { text: '❌ Decline', callback_data: `lc:decline:${callSid}` }
-            ],
-            ...(miniappUrl ? [[{ text: '🖥️ Mini App', url: miniappUrl }]] : [])
+            ...(miniappUrl ? [[{ text: '🖥️ Answer in Mini App', url: miniappUrl }]] : [])
           ]
         };
       }
@@ -2167,6 +2174,11 @@ class EnhancedWebhookService {
     const headerLine = entry.inbound
       ? `${signalLine} | 📥 Incoming • ${stripStatusEmoji(entry.status)}`
       : `🎧 Live Call • ${entry.status}`;
+    const gateStatus = entry.inbound ? this.getInboundGate(entry.callSid)?.status : null;
+    const gatePending = !gateStatus || gateStatus === 'pending';
+    const gateLine = entry.inbound && gatePending && !this.isTerminalStatus(entry.statusKey)
+      ? '🖥️ Answer/Decline in Mini App'
+      : null;
     const flagLine = entry.inbound ? this.formatCallerFlagLine(entry) : null;
     const previewUser = this.applyPreviewRedaction(entry, entry.previewTurns.user || '—');
     const previewAgent = this.applyPreviewRedaction(entry, entry.previewTurns.agent || '—');
@@ -2189,6 +2201,7 @@ class EnhancedWebhookService {
           : [];
         return [
           headerLine,
+          gateLine,
           updatedLine,
           fromLine,
           `📍 Phase: ${phaseDisplay}`,
@@ -2225,6 +2238,7 @@ class EnhancedWebhookService {
       const timingLine = this.formatInboundTimingLine(entry, phaseDisplay);
       return [
         headerLine,
+        gateLine,
         updatedLine,
         fromLine,
         toLine,

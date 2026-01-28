@@ -22,12 +22,24 @@ export class ApiError extends Error {
   }
 }
 
+export function createIdempotencyKey() {
+  if (typeof crypto !== 'undefined' && 'randomUUID' in crypto) {
+    return crypto.randomUUID();
+  }
+  return `idem_${Date.now()}_${Math.random().toString(36).slice(2)}`;
+}
+
 type AuthTokenProvider = () => string | null;
 
 let authTokenProvider: AuthTokenProvider = () => null;
+let authRefreshProvider: (() => Promise<void>) | null = null;
 
 export function setAuthTokenProvider(provider: AuthTokenProvider) {
   authTokenProvider = provider;
+}
+
+export function setAuthRefreshProvider(provider: () => Promise<void>) {
+  authRefreshProvider = provider;
 }
 
 const API_BASE = import.meta.env.VITE_API_BASE || '';
@@ -64,6 +76,7 @@ export async function apiFetch<T>(
     timeoutMs?: number;
     retries?: number;
     auth?: boolean;
+    idempotencyKey?: string;
   } = {},
 ): Promise<T> {
   const {
@@ -73,6 +86,7 @@ export async function apiFetch<T>(
     timeoutMs = DEFAULT_TIMEOUT_MS,
     retries = DEFAULT_RETRIES,
     auth = true,
+    idempotencyKey,
   } = options;
 
   const token = auth ? authTokenProvider() : null;
@@ -80,6 +94,9 @@ export async function apiFetch<T>(
     Accept: 'application/json',
     ...headers,
   };
+  if (idempotencyKey) {
+    requestHeaders['Idempotency-Key'] = idempotencyKey;
+  }
   if (body !== undefined) {
     requestHeaders['Content-Type'] = 'application/json';
   }
@@ -88,6 +105,7 @@ export async function apiFetch<T>(
   }
 
   let attempt = 0;
+  let refreshed = false;
   while (true) {
     attempt += 1;
     const controller = new AbortController();
@@ -103,6 +121,15 @@ export async function apiFetch<T>(
       window.clearTimeout(timeout);
 
       if (!response.ok) {
+        if (response.status === 401 && auth && authRefreshProvider && !refreshed) {
+          refreshed = true;
+          try {
+            await authRefreshProvider();
+          } catch {
+            // ignore refresh failures, fall through to error handling
+          }
+          continue;
+        }
         const payload = await readJsonSafely(response);
         const error = new ApiError({
           status: response.status,

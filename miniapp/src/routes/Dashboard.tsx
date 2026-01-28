@@ -1,5 +1,15 @@
 import { useEffect, useMemo } from 'react';
+import {
+  Badge,
+  Button,
+  Cell,
+  Chip,
+  List,
+  Placeholder,
+  Section,
+} from '@telegram-apps/telegram-ui';
 import { useCalls } from '../state/calls';
+import { navigate } from '../lib/router';
 
 export function Dashboard() {
   const { calls, inboundQueue, fetchCalls, fetchInboundQueue, loading } = useCalls();
@@ -17,62 +27,68 @@ export function Dashboard() {
   }, [calls]);
 
   return (
-    <section className="stack">
-      <div className="panel">
-        <h2>Quick stats</h2>
-        <div className="stats-grid">
-          <div className="stat-card">
-            <span>Total (recent)</span>
-            <strong>{stats.total}</strong>
-          </div>
-          <div className="stat-card">
-            <span>Active</span>
-            <strong>{stats.active}</strong>
-          </div>
-          <div className="stat-card">
-            <span>Completed</span>
-            <strong>{stats.completed}</strong>
-          </div>
-        </div>
-      </div>
+    <List>
+      <Section header="Quick stats">
+        <Cell
+          subtitle="Total (recent)"
+          after={<Badge type="number" mode="primary">{stats.total}</Badge>}
+        >
+          Total calls
+        </Cell>
+        <Cell
+          subtitle="Active (ringing / answered)"
+          after={<Badge type="number" mode="secondary">{stats.active}</Badge>}
+        >
+          Active calls
+        </Cell>
+        <Cell
+          subtitle="Completed"
+          after={<Badge type="number" mode="gray">{stats.completed}</Badge>}
+        >
+          Completed calls
+        </Cell>
+      </Section>
 
-      <div className="panel">
-        <h2>Inbound queue</h2>
+      <Section header="Inbound queue">
         {inboundQueue.length === 0 ? (
-          <p className="muted">No inbound calls waiting.</p>
+          <Placeholder
+            header="No inbound calls"
+            description="You're all caught up."
+            action={(
+              <Button size="s" mode="bezeled" onClick={() => navigate('/inbox')}>
+                Open inbox
+              </Button>
+            )}
+          />
         ) : (
-          <div className="list">
-            {inboundQueue.slice(0, 3).map((call) => (
-              <div className="list-item" key={call.call_sid}>
-                <div>
-                  <strong>{call.from || 'Unknown caller'}</strong>
-                  <p className="muted">{call.route_label || call.script || 'Inbound'}</p>
-                </div>
-                <span className={`badge ${call.decision || 'pending'}`}>{call.decision || 'pending'}</span>
-              </div>
-            ))}
-          </div>
+          inboundQueue.slice(0, 3).map((call) => (
+            <Cell
+              key={call.call_sid}
+              subtitle={call.route_label || call.script || 'Inbound'}
+              description={call.from || 'Unknown caller'}
+              after={<Chip mode="mono">{call.decision || 'pending'}</Chip>}
+            >
+              Inbound call
+            </Cell>
+          ))
         )}
-      </div>
+      </Section>
 
-      <div className="panel">
-        <h2>Recent activity</h2>
-        {loading && calls.length === 0 ? (
-          <p className="muted">Loading calls...</p>
-        ) : (
-          <div className="list">
-            {calls.slice(0, 5).map((call) => (
-              <div className="list-item" key={call.call_sid}>
-                <div>
-                  <strong>{call.phone_number || call.call_sid}</strong>
-                  <p className="muted">{call.status || 'unknown'} - {call.created_at || '-'}</p>
-                </div>
-                <span className={`badge ${call.status || 'unknown'}`}>{call.status || 'unknown'}</span>
-              </div>
-            ))}
-          </div>
-        )}
-      </div>
-    </section>
+      <Section
+        header="Recent activity"
+        footer={loading && calls.length === 0 ? 'Loading calls...' : undefined}
+      >
+        {calls.slice(0, 5).map((call) => (
+          <Cell
+            key={call.call_sid}
+            subtitle={call.status || 'unknown'}
+            description={call.created_at || '-'}
+            after={<Chip mode="outline">{call.status || 'unknown'}</Chip>}
+          >
+            {call.phone_number || call.call_sid}
+          </Cell>
+        ))}
+      </Section>
+    </List>
   );
 }

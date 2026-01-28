@@ -1,10 +1,19 @@
 import { useEffect, useState } from 'react';
-import { apiFetch } from '../lib/api';
+import {
+  Button,
+  Banner,
+  Cell,
+  InlineButtons,
+  List,
+  Placeholder,
+  Section,
+} from '@telegram-apps/telegram-ui';
+import { apiFetch, createIdempotencyKey } from '../lib/api';
 import { useCalls } from '../state/calls';
 import { navigate } from '../lib/router';
 
 export function Inbox() {
-  const { inboundQueue, fetchInboundQueue } = useCalls();
+  const { inboundQueue, inboundNotice, fetchInboundQueue } = useCalls();
   const [busyCall, setBusyCall] = useState<string | null>(null);
 
   useEffect(() => {
@@ -16,7 +25,10 @@ export function Inbox() {
   const handleAction = async (callSid: string, action: 'answer' | 'decline') => {
     setBusyCall(callSid);
     try {
-      await apiFetch(`/webapp/inbound/${callSid}/${action}`, { method: 'POST' });
+      await apiFetch(`/webapp/inbound/${callSid}/${action}`, {
+        method: 'POST',
+        idempotencyKey: createIdempotencyKey(),
+      });
       if (action === 'answer') {
         navigate(`/calls/${callSid}`);
       }
@@ -27,43 +39,54 @@ export function Inbox() {
   };
 
   return (
-    <section className="stack">
-      <div className="panel">
-        <h2>Inbound queue</h2>
+    <List>
+      {inboundNotice && (
+        <Banner
+          type="inline"
+          header="Incoming call pending"
+          description={inboundNotice.message}
+        />
+      )}
+      <Section header="Inbound queue">
         {inboundQueue.length === 0 ? (
-          <p className="muted">No inbound calls at the moment.</p>
+          <Placeholder
+            header="No inbound calls"
+            description="Calls will appear here when ringing."
+            action={(
+              <Button size="s" mode="bezeled" onClick={() => fetchInboundQueue()}>
+                Refresh
+              </Button>
+            )}
+          />
         ) : (
-          <div className="list">
-            {inboundQueue.map((call) => (
-              <div className="list-item" key={call.call_sid}>
-                <div>
-                  <strong>{call.from || 'Unknown caller'}</strong>
-                  <p className="muted">{call.route_label || call.script || 'Inbound call'}</p>
-                </div>
-                <div className="actions">
-                  {call.decision && <span className={`badge ${call.decision}`}>{call.decision}</span>}
-                  <button
-                    type="button"
-                    className="btn"
-                    disabled={busyCall === call.call_sid || call.decision === 'answered' || call.decision === 'declined'}
-                    onClick={() => handleAction(call.call_sid, 'answer')}
-                  >
-                    Answer
-                  </button>
-                  <button
-                    type="button"
-                    className="btn danger"
-                    disabled={busyCall === call.call_sid || call.decision === 'answered' || call.decision === 'declined'}
-                    onClick={() => handleAction(call.call_sid, 'decline')}
-                  >
-                    Decline
-                  </button>
-                </div>
-              </div>
-            ))}
-          </div>
+          inboundQueue.map((call) => {
+            const disabled = busyCall === call.call_sid || call.decision === 'answered' || call.decision === 'declined';
+            return (
+              <Cell
+                key={call.call_sid}
+                subtitle={call.route_label || call.script || 'Inbound call'}
+                description={call.from || 'Unknown caller'}
+                after={(
+                  <InlineButtons mode="bezeled">
+                    <InlineButtons.Item
+                      text="Answer"
+                      disabled={disabled}
+                      onClick={() => handleAction(call.call_sid, 'answer')}
+                    />
+                    <InlineButtons.Item
+                      text="Decline"
+                      disabled={disabled}
+                      onClick={() => handleAction(call.call_sid, 'decline')}
+                    />
+                  </InlineButtons>
+                )}
+              >
+                Inbound call
+              </Cell>
+            );
+          })
         )}
-      </div>
-    </section>
+      </Section>
+    </List>
   );
 }

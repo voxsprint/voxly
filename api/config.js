@@ -129,6 +129,8 @@ const inboundCallbackDelayMinutes = Number(readEnv('INBOUND_CALLBACK_DELAY_MIN')
 
 const miniappAllowedOrigins = parseList(readEnv('MINIAPP_ALLOWED_ORIGINS'));
 const miniappPublicUrl = readEnv('MINIAPP_PUBLIC_URL') || readEnv('MINIAPP_URL');
+const miniappBotUsernameRaw = readEnv('MINIAPP_BOT_USERNAME') || readEnv('TELEGRAM_BOT_USERNAME');
+const miniappBotUsername = miniappBotUsernameRaw ? miniappBotUsernameRaw.replace(/^@/, '') : '';
 const miniappSessionTtlMs = Number(readEnv('MINIAPP_SESSION_TTL_MS') || '3600000');
 const miniappRefreshTtlMs = Number(readEnv('MINIAPP_REFRESH_TTL_MS') || String(7 * 24 * 60 * 60 * 1000));
 const miniappRateLimitWindowMs = Number(readEnv('MINIAPP_RATE_LIMIT_WINDOW_MS') || '60000');
@@ -291,7 +293,8 @@ module.exports = {
     },
     brandName: miniappBrandName,
     theme: miniappTheme,
-    publicUrl: miniappPublicUrl
+    publicUrl: miniappPublicUrl,
+    botUsername: miniappBotUsername
   },
   openRouter: {
     apiKey: ensure('OPENROUTER_API_KEY'),

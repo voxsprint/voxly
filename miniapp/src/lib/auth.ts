@@ -1,4 +1,6 @@
-import { apiFetch, setAuthTokenProvider } from './api';
+import { retrieveRawInitData } from '@tma.js/sdk-react';
+
+import { apiFetch, setAuthRefreshProvider, setAuthTokenProvider } from './api';
 
 export type WebappUser = {
   id: string | number;
@@ -100,14 +102,19 @@ export function isTokenValid(bufferSeconds = 30) {
 export function getInitData() {
   const fromEnv = import.meta.env.VITE_TELEGRAM_INITDATA;
   if (fromEnv) return String(fromEnv);
+  try {
+    const raw = retrieveRawInitData();
+    if (raw) return raw;
+  } catch {
+    // fall through to legacy WebApp initData lookup
+  }
   const webapp = (window as Window & { Telegram?: { WebApp?: { initData?: string } } }).Telegram?.WebApp;
   return webapp?.initData || '';
 }
 
 export async function authenticate(initData?: string): Promise<AuthSession> {
-  const payload = {
-    initData: initData || getInitData(),
-  };
+  const rawInitData = initData || getInitData();
+  const headers = rawInitData ? { Authorization: `tma ${rawInitData}` } : undefined;
   const response = await apiFetch<{
     ok: boolean;
     token: string;
@@ -116,7 +123,7 @@ export async function authenticate(initData?: string): Promise<AuthSession> {
     roles: string[];
   }>('/webapp/auth', {
     method: 'POST',
-    body: payload,
+    headers,
     auth: false,
   });
   const session: AuthSession = {
@@ -129,8 +136,12 @@ export async function authenticate(initData?: string): Promise<AuthSession> {
   return session;
 }
 
-export async function ensureAuth(initData?: string): Promise<AuthSession> {
-  if (isTokenValid()) {
+export async function ensureAuth(
+  initData?: string,
+  options: { minValiditySeconds?: number; forceRefresh?: boolean } = {},
+): Promise<AuthSession> {
+  const minValiditySeconds = options.minValiditySeconds ?? 60;
+  if (!options.forceRefresh && isTokenValid(minValiditySeconds)) {
     return {
       token: getStoredToken() || '',
       expiresAt: getTokenExpiry() || '',
@@ -142,3 +153,6 @@ export async function ensureAuth(initData?: string): Promise<AuthSession> {
 }
 
 setAuthTokenProvider(() => getStoredToken());
+setAuthRefreshProvider(async () => {
+  await ensureAuth(undefined, { forceRefresh: true });
+});

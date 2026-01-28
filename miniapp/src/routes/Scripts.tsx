@@ -1,5 +1,14 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
-import { apiFetch } from '../lib/api';
+import {
+  Badge,
+  Button,
+  Cell,
+  Input,
+  List,
+  Section,
+  Textarea,
+} from '@telegram-apps/telegram-ui';
+import { apiFetch, createIdempotencyKey } from '../lib/api';
 import { useUser } from '../state/user';
 
 type Script = {
@@ -52,12 +61,14 @@ export function Scripts() {
         const response = await apiFetch<{ ok: boolean; script: Script }>(`/webapp/scripts/${selected.id}`, {
           method: 'PUT',
           body: draft,
+          idempotencyKey: createIdempotencyKey(),
         });
         setSelected(response.script);
       } else {
         const response = await apiFetch<{ ok: boolean; script: Script }>('/webapp/scripts', {
           method: 'POST',
           body: draft,
+          idempotencyKey: createIdempotencyKey(),
         });
         setSelected(response.script);
       }
@@ -72,7 +83,10 @@ export function Scripts() {
     if (!window.confirm('Delete this script?')) return;
     setSaving(true);
     try {
-      await apiFetch(`/webapp/scripts/${selected.id}`, { method: 'DELETE' });
+      await apiFetch(`/webapp/scripts/${selected.id}`, {
+        method: 'DELETE',
+        idempotencyKey: createIdempotencyKey(),
+      });
       setSelected(null);
       setDraft(emptyDraft);
       await loadScripts();
@@ -82,91 +96,76 @@ export function Scripts() {
   };
 
   return (
-    <section className="grid-two">
-      <div className="panel">
-        <h2>Script library</h2>
-        <div className="list">
-          {scripts.map((script) => (
-            <button
-              key={script.id}
-              type="button"
-              className={`list-item clickable${selected?.id === script.id ? ' active' : ''}`}
-              onClick={() => {
-                setSelected(script);
-                setDraft(script);
-              }}
-            >
-              <div>
-                <strong>{script.name}</strong>
-                <p className="muted">{script.description || 'No description'}</p>
-              </div>
-            </button>
-          ))}
-        </div>
-        {isAdmin && (
-          <button
-            type="button"
-            className="btn"
+    <List>
+      <Section header="Script library">
+        {scripts.map((script) => (
+          <Cell
+            key={script.id}
+            subtitle={script.description || 'No description'}
+            titleBadge={selected?.id === script.id ? <Badge type="dot" mode="primary" /> : undefined}
             onClick={() => {
-              setSelected(null);
-              setDraft(emptyDraft);
+              setSelected(script);
+              setDraft(script);
             }}
           >
-            New script
-          </button>
+            {script.name}
+          </Cell>
+        ))}
+        {isAdmin && (
+          <div className="section-actions">
+            <Button
+              size="s"
+              mode="bezeled"
+              onClick={() => {
+                setSelected(null);
+                setDraft(emptyDraft);
+              }}
+            >
+              New script
+            </Button>
+          </div>
         )}
-      </div>
+      </Section>
 
-      <div className="panel">
-        <h2>{hasSelection ? 'Edit script' : 'Create script'}</h2>
-        <div className="form">
-          <label htmlFor="script-name">Name</label>
-          <input
-            id="script-name"
-            type="text"
-            value={draft.name || ''}
-            onChange={(event) => setDraft((prev) => ({ ...prev, name: event.target.value }))}
-          />
-          <label htmlFor="script-description">Description</label>
-          <input
-            id="script-description"
-            type="text"
-            value={draft.description || ''}
-            onChange={(event) => setDraft((prev) => ({ ...prev, description: event.target.value }))}
-          />
-          <label htmlFor="script-prompt">Prompt</label>
-          <textarea
-            id="script-prompt"
-            rows={4}
-            value={draft.prompt || ''}
-            onChange={(event) => setDraft((prev) => ({ ...prev, prompt: event.target.value }))}
-          />
-          <label htmlFor="script-first-message">First message</label>
-          <textarea
-            id="script-first-message"
-            rows={3}
-            value={draft.first_message || ''}
-            onChange={(event) => setDraft((prev) => ({ ...prev, first_message: event.target.value }))}
-          />
-          <label htmlFor="script-voice">Voice model</label>
-          <input
-            id="script-voice"
-            type="text"
-            value={draft.voice_model || ''}
-            onChange={(event) => setDraft((prev) => ({ ...prev, voice_model: event.target.value }))}
-          />
-        </div>
-        <div className="actions">
-          <button type="button" className="btn" disabled={!isAdmin || saving} onClick={handleSave}>
+      <Section header={hasSelection ? 'Edit script' : 'Create script'}>
+        <Input
+          header="Name"
+          value={draft.name || ''}
+          onChange={(event) => setDraft((prev) => ({ ...prev, name: event.target.value }))}
+        />
+        <Input
+          header="Description"
+          value={draft.description || ''}
+          onChange={(event) => setDraft((prev) => ({ ...prev, description: event.target.value }))}
+        />
+        <Textarea
+          header="Prompt"
+          rows={4}
+          value={draft.prompt || ''}
+          onChange={(event) => setDraft((prev) => ({ ...prev, prompt: event.target.value }))}
+        />
+        <Textarea
+          header="First message"
+          rows={3}
+          value={draft.first_message || ''}
+          onChange={(event) => setDraft((prev) => ({ ...prev, first_message: event.target.value }))}
+        />
+        <Input
+          header="Voice model"
+          value={draft.voice_model || ''}
+          onChange={(event) => setDraft((prev) => ({ ...prev, voice_model: event.target.value }))}
+        />
+        <div className="section-actions">
+          <Button size="s" mode="filled" disabled={!isAdmin || saving} onClick={handleSave}>
             {saving ? 'Saving...' : 'Save'}
-          </button>
+          </Button>
           {hasSelection && (
-            <button type="button" className="btn danger" disabled={!isAdmin || saving} onClick={handleDelete}>
+            <Button size="s" mode="outline" disabled={!isAdmin || saving} onClick={handleDelete}>
               Delete
-            </button>
+            </Button>
           )}
         </div>
-      </div>
-    </section>
+      </Section>
+    </List>
   );
 }

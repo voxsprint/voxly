@@ -7,7 +7,15 @@ import {
   useState,
   type PropsWithChildren,
 } from 'react';
-import { authenticate, clearStoredToken, ensureAuth, getStoredRoles, getStoredUser, type WebappUser } from '../lib/auth';
+import {
+  authenticate,
+  clearStoredToken,
+  ensureAuth,
+  getStoredRoles,
+  getStoredUser,
+  getTokenExpiry,
+  type WebappUser,
+} from '../lib/auth';
 
 type UserState = {
   status: 'idle' | 'loading' | 'ready' | 'error';
@@ -65,6 +73,20 @@ export function UserProvider({ children }: PropsWithChildren) {
   useEffect(() => {
     refresh();
   }, [refresh]);
+
+  useEffect(() => {
+    if (status !== 'ready') return;
+    const expIso = getTokenExpiry();
+    if (!expIso) return;
+    const exp = Date.parse(expIso);
+    if (!Number.isFinite(exp)) return;
+    const bufferMs = 60 * 1000;
+    const delay = Math.max(exp - Date.now() - bufferMs, 5000);
+    const timer = window.setTimeout(() => {
+      refresh().catch(() => {});
+    }, delay);
+    return () => window.clearTimeout(timer);
+  }, [status, refresh]);
 
   const value = useMemo<UserState>(() => ({
     status,

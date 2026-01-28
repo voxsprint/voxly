@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useState } from 'react';
-import { apiFetch } from '../lib/api';
+import { Button, Cell, Chip, List, Placeholder, Section } from '@telegram-apps/telegram-ui';
+import { apiFetch, createIdempotencyKey } from '../lib/api';
 
 type SettingsResponse = {
   ok: boolean;
@@ -13,18 +14,47 @@ type SettingsResponse = {
   };
 };
 
+type AuditLog = {
+  id: number;
+  user_id: string;
+  action: string;
+  call_sid?: string | null;
+  metadata?: Record<string, unknown> | null;
+  created_at: string;
+};
+
 export function Settings() {
   const [settings, setSettings] = useState<SettingsResponse | null>(null);
   const [switching, setSwitching] = useState(false);
+  const [auditLogs, setAuditLogs] = useState<AuditLog[]>([]);
+  const [auditCursor, setAuditCursor] = useState<number | null>(null);
+  const [auditLoading, setAuditLoading] = useState(false);
 
   const loadSettings = useCallback(async () => {
     const response = await apiFetch<SettingsResponse>('/webapp/settings');
     setSettings(response);
   }, []);
 
+  const loadAudit = useCallback(async (cursor = 0, append = false) => {
+    setAuditLoading(true);
+    try {
+      const params = new URLSearchParams();
+      params.set('limit', '20');
+      if (cursor) params.set('cursor', String(cursor));
+      const response = await apiFetch<{ ok: boolean; logs: AuditLog[]; next_cursor: number | null }>(
+        `/webapp/audit?${params.toString()}`,
+      );
+      setAuditLogs((prev) => (append ? [...prev, ...(response.logs || [])] : (response.logs || [])));
+      setAuditCursor(response.next_cursor ?? null);
+    } finally {
+      setAuditLoading(false);
+    }
+  }, []);
+
   useEffect(() => {
     loadSettings();
-  }, [loadSettings]);
+    loadAudit(0, false);
+  }, [loadSettings, loadAudit]);
 
   const switchProvider = async (provider: string) => {
     setSwitching(true);
@@ -32,6 +62,7 @@ export function Settings() {
       await apiFetch('/webapp/settings/provider', {
         method: 'POST',
         body: { provider },
+        idempotencyKey: createIdempotencyKey(),
       });
       await loadSettings();
     } finally {
@@ -40,44 +71,74 @@ export function Settings() {
   };
 
   return (
-    <section className="stack">
-      <div className="panel">
-        <h2>Provider status</h2>
-        {settings ? (
-          <>
-            <p className="muted">Current provider: {settings.provider.current}</p>
-            <div className="list">
-              {settings.provider.supported.map((provider) => (
-                <div className="list-item" key={provider}>
-                  <div>
-                    <strong>{provider}</strong>
-                    <p className="muted">
-                      {settings.provider.readiness[provider] ? 'Ready' : 'Not configured'}
-                    </p>
-                  </div>
-                  <button
-                    type="button"
-                    className="btn"
-                    disabled={!settings.provider.readiness[provider] || switching}
-                    onClick={() => switchProvider(provider)}
-                  >
-                    Switch
-                  </button>
-                </div>
-              ))}
-            </div>
-          </>
+    <List>
+      <Section header="Provider status">
+        {!settings ? (
+          <Placeholder header="Loading settings" description="Fetching provider status." />
         ) : (
-          <p className="muted">Loading settings...</p>
+          <>
+            <Cell subtitle="Current provider">{settings.provider.current}</Cell>
+            {settings.provider.supported.map((provider) => {
+              const ready = settings.provider.readiness[provider];
+              return (
+                <Cell
+                  key={provider}
+                  subtitle={ready ? 'Ready' : 'Not configured'}
+                  after={(
+                    <Button
+                      size="s"
+                      mode="bezeled"
+                      disabled={!ready || switching}
+                      onClick={() => switchProvider(provider)}
+                    >
+                      Switch
+                    </Button>
+                  )}
+                >
+                  {provider}
+                </Cell>
+              );
+            })}
+          </>
         )}
-      </div>
+      </Section>
 
-      <div className="panel">
-        <h2>Webhook health</h2>
-        <p className="muted">
-          Latest event sequence: {settings?.webhook_health?.last_sequence ?? '-'}
-        </p>
-      </div>
-    </section>
+      <Section header="Webhook health">
+        <Cell
+          subtitle="Latest event sequence"
+          after={<Chip mode="mono">{settings?.webhook_health?.last_sequence ?? '-'}</Chip>}
+        >
+          Webhook status
+        </Cell>
+      </Section>
+
+      <Section header="Audit log" footer="Latest admin actions">
+        {auditLogs.length === 0 ? (
+          <Placeholder header="No audit entries" description="Admin actions will appear here." />
+        ) : (
+          auditLogs.map((entry) => (
+            <Cell
+              key={entry.id}
+              subtitle={entry.created_at}
+              description={entry.call_sid || entry.user_id}
+            >
+              {entry.action}
+            </Cell>
+          ))
+        )}
+        {auditCursor && (
+          <div className="section-actions">
+            <Button
+              size="s"
+              mode="bezeled"
+              disabled={auditLoading}
+              onClick={() => loadAudit(auditCursor, true)}
+            >
+              {auditLoading ? 'Loading…' : 'Load more'}
+            </Button>
+          </div>
+        )}
+      </Section>
+    </List>
   );
 }

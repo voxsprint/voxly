@@ -1,5 +1,14 @@
 import { useEffect, useMemo, useState } from 'react';
 import { backButton } from '@tma.js/sdk-react';
+import {
+  Badge,
+  Banner,
+  Button,
+  Cell,
+  List,
+  Navigation,
+  Section,
+} from '@telegram-apps/telegram-ui';
 import { matchRoute, navigate, getHashPath } from '../lib/router';
 import { useUser } from '../state/user';
 import { CallsProvider } from '../state/calls';
@@ -38,18 +47,24 @@ function Nav() {
   }, []);
 
   return (
-    <nav className="nav">
-      {navItems.filter((item) => (item.adminOnly ? isAdmin : true)).map((item) => (
-        <button
-          type="button"
-          key={item.path}
-          className={`nav-link${path === item.path ? ' active' : ''}`}
-          onClick={() => navigate(item.path)}
-        >
-          {item.label}
-        </button>
-      ))}
-    </nav>
+    <List>
+      <Section header="Navigation">
+        {navItems.filter((item) => (item.adminOnly ? isAdmin : true)).map((item) => {
+          const isActive = path === item.path;
+          return (
+            <Cell
+              key={item.path}
+              onClick={() => navigate(item.path)}
+              titleBadge={isActive ? <Badge type="dot" mode="primary" /> : undefined}
+              subtitle={item.adminOnly ? 'Admin only' : undefined}
+              after={<Navigation>Open</Navigation>}
+            >
+              {item.label}
+            </Cell>
+          );
+        })}
+      </Section>
+    </List>
   );
 }
 
@@ -81,6 +96,7 @@ function RouteRenderer() {
 export function AppShell() {
   const { status, user, roles, error, refresh } = useUser();
   const isAdmin = roles.includes('admin');
+  const [isOnline, setIsOnline] = useState(() => (typeof navigator !== 'undefined' ? navigator.onLine : true));
 
   useEffect(() => {
     const handleBack = () => {
@@ -98,6 +114,17 @@ export function AppShell() {
     };
   }, []);
 
+  useEffect(() => {
+    const handleOnline = () => setIsOnline(true);
+    const handleOffline = () => setIsOnline(false);
+    window.addEventListener('online', handleOnline);
+    window.addEventListener('offline', handleOffline);
+    return () => {
+      window.removeEventListener('online', handleOnline);
+      window.removeEventListener('offline', handleOffline);
+    };
+  }, []);
+
   const headerSubtitle = useMemo(() => {
     if (status === 'loading') return 'Authorizing...';
     if (status === 'error') return error || 'Auth failed';
@@ -108,18 +135,24 @@ export function AppShell() {
 
   return (
     <CallsProvider>
-      <div className="app">
-        <header className="app-header">
-          <div>
-            <h1>VOICEDNUT</h1>
-            <p>{headerSubtitle}</p>
-          </div>
-          <div className="header-actions">
-            <button type="button" className="btn ghost" onClick={refresh}>
-              Refresh
-            </button>
-          </div>
-        </header>
+      <div className="app-shell">
+        {!isOnline && (
+          <Banner
+            type="inline"
+            header="You're offline"
+            description="Some data may be outdated. Reconnect to refresh."
+          />
+        )}
+        <Banner
+          type="section"
+          header="VOICEDNUT"
+          subheader="mini app"
+          description={headerSubtitle}
+        >
+          <Button size="s" mode="bezeled" onClick={refresh}>
+            Refresh
+          </Button>
+        </Banner>
         <Nav />
         <main className="content">
           <RouteRenderer />

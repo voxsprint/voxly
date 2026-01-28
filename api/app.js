@@ -93,6 +93,8 @@ const callLifecycleCleanupTimers = new Map();
 const miniappClients = new Set(); // { res, token, userId }
 const miniappEventBuffer = [];
 let miniappSequence = 0;
+const IDEMPOTENCY_TTL_MS = 5 * 60 * 1000;
+const idempotencyCache = new Map(); // key -> { ts, status, body }
 
 const MINIAPP_SESSION_TTL_MS = Number(config.miniapp?.sessionTtlMs || 60 * 60 * 1000);
 const MINIAPP_REFRESH_TTL_MS = Number(config.miniapp?.refreshTtlMs || 7 * 24 * 60 * 60 * 1000);
@@ -105,10 +107,55 @@ const miniappAccessCache = { admins: [], viewers: [], loadedAt: 0 };
 const WEBAPP_JWT_TTL_S = Number(config.miniapp?.jwtTtlSeconds || 900);
 const WEBAPP_INITDATA_MAX_AGE_S = Number(config.miniapp?.initDataMaxAgeS || 120);
 const WEBAPP_JWT_ISSUER = 'voicdnut-webapp';
+const WEBAPP_JWT_AUDIENCE = 'voicednut-miniapp';
+const WEBAPP_JWT_CLOCK_SKEW_S = 60;
 let backgroundWorkersStarted = false;
 
 const CALL_STATUS_DEDUPE_MS = 3000;
 const CALL_STATUS_DEDUPE_MAX = 5000;
+
+function cleanupIdempotencyCache() {
+  const now = Date.now();
+  for (const [key, entry] of idempotencyCache.entries()) {
+    if (!entry || now - entry.ts > IDEMPOTENCY_TTL_MS) {
+      idempotencyCache.delete(key);
+    }
+  }
+}
+
+function getIdempotencyCacheKey(req) {
+  const rawKey = req.headers['idempotency-key'];
+  if (!rawKey) return null;
+  const key = Array.isArray(rawKey) ? rawKey[0] : String(rawKey || '').trim();
+  if (!key) return null;
+  const userId = req.webappSession?.user?.id || req.user?.id || 'anon';
+  return `${req.method}:${req.path}:${userId}:${key}`;
+}
+
+function applyIdempotency(req, res) {
+  const cacheKey = getIdempotencyCacheKey(req);
+  if (!cacheKey) return { handled: false };
+  const cached = idempotencyCache.get(cacheKey);
+  if (cached && Date.now() - cached.ts <= IDEMPOTENCY_TTL_MS) {
+    res.status(cached.status).json(cached.body);
+    return { handled: true };
+  }
+  let statusCode = 200;
+  const originalStatus = res.status.bind(res);
+  res.status = (code) => {
+    statusCode = code;
+    return originalStatus(code);
+  };
+  const originalJson = res.json.bind(res);
+  res.json = (body) => {
+    if (statusCode >= 200 && statusCode < 300) {
+      cleanupIdempotencyCache();
+      idempotencyCache.set(cacheKey, { ts: Date.now(), status: statusCode, body });
+    }
+    return originalJson(body);
+  };
+  return { handled: false };
+}
 
 function stableStringify(value) {
   if (value === null || typeof value !== 'object') {
@@ -174,7 +221,10 @@ function verifyTelegramInitData(raw, maxAgeSeconds = MINIAPP_INITDATA_MAX_AGE_S)
   if (!hash) {
     return { ok: false, reason: 'missing_hash' };
   }
-  const secret = crypto.createHmac('sha256', botToken).update('WebAppData').digest();
+  const secret = crypto
+    .createHmac('sha256', 'WebAppData')
+    .update(String(botToken))
+    .digest();
   const computed = crypto.createHmac('sha256', secret).update(dataCheckString).digest('hex');
   const computedBuf = Buffer.from(computed, 'hex');
   const hashBuf = Buffer.from(hash, 'hex');
@@ -462,6 +512,13 @@ function getWebappJwtSecret() {
   return secret;
 }
 
+function createWebappTokenId() {
+  if (typeof crypto.randomUUID === 'function') {
+    return crypto.randomUUID();
+  }
+  return crypto.randomBytes(16).toString('hex');
+}
+
 function signWebappJwt(payload = {}) {
   const secret = getWebappJwtSecret();
   if (!secret) return null;
@@ -494,6 +551,15 @@ function verifyWebappJwt(token) {
     const now = Math.floor(Date.now() / 1000);
     if (payload.iss && payload.iss !== WEBAPP_JWT_ISSUER) {
       return { ok: false, error: 'invalid_issuer' };
+    }
+    if (payload.aud && payload.aud !== WEBAPP_JWT_AUDIENCE) {
+      return { ok: false, error: 'invalid_audience' };
+    }
+    if (payload.nbf && now + WEBAPP_JWT_CLOCK_SKEW_S < payload.nbf) {
+      return { ok: false, error: 'token_not_active' };
+    }
+    if (payload.iat && payload.iat - now > WEBAPP_JWT_CLOCK_SKEW_S) {
+      return { ok: false, error: 'invalid_issued_at' };
     }
     if (payload.exp && now >= payload.exp) {
       return { ok: false, error: 'token_expired' };
@@ -2398,6 +2464,17 @@ function webappRequestLogger(req, res, next) {
     console.log(JSON.stringify(entry));
   });
   return next();
+}
+
+function logWebappAuthEvent(req, action, metadata = {}, userIdOverride = null) {
+  const userId = userIdOverride || req.miniappInitUser?.id || 'unknown';
+  db?.logMiniappAudit?.({
+    user_id: String(userId),
+    action,
+    metadata,
+    ip: req.ip,
+    user_agent: req.headers['user-agent']
+  }).catch(() => {});
 }
 
 app.use((req, res, next) => {
@@ -5574,58 +5651,8 @@ app.post('/webhook/telegram', async (req, res) => {
     }
 
     if (action === 'answer' || action === 'decline') {
-      if (!callRecord) {
-        webhookService.answerCallbackQuery(cb.id, 'Call not found').catch(() => {});
-        return;
-      }
-      const adminChatId = config.telegram?.adminChatId;
-      if (adminChatId && chatId && String(adminChatId) !== String(chatId)) {
-        webhookService.answerCallbackQuery(cb.id, 'Not authorized').catch(() => {});
-        return;
-      }
-      const gate = webhookService.getInboundGate(callSid);
-      if (gate?.status === 'answered' || gate?.status === 'declined' || gate?.status === 'expired') {
-        webhookService.answerCallbackQuery(cb.id, 'Already handled').catch(() => {});
-        return;
-      }
-      if (action === 'answer') {
-        webhookService.setInboundGate(callSid, 'answered', { chatId });
-        webhookService.setConsoleCompact(callSid, false);
-        webhookService.addLiveEvent(callSid, '✅ Admin answered', { force: true });
-        try {
-          await db.updateCallState(callSid, 'admin_answered', { at: new Date().toISOString(), by: chatId });
-        } catch (stateError) {
-          console.error('Failed to log admin answer:', stateError);
-        }
-        try {
-          await connectInboundCall(callSid);
-          webhookService.answerCallbackQuery(cb.id, 'Answering call…').catch(() => {});
-        } catch (answerError) {
-          console.error('Failed to answer call:', answerError);
-          webhookService.answerCallbackQuery(cb.id, 'Failed to answer').catch(() => {});
-          await webhookService.sendTelegramMessage(chatId, `❌ Failed to answer call: ${answerError.message || answerError}`);
-        }
-        return;
-      }
-      if (action === 'decline') {
-        webhookService.setInboundGate(callSid, 'declined', { chatId });
-        webhookService.addLiveEvent(callSid, '❌ Declined by admin', { force: true });
-        try {
-          await db.updateCallState(callSid, 'admin_declined', { at: new Date().toISOString(), by: chatId });
-        } catch (stateError) {
-          console.error('Failed to log admin decline:', stateError);
-        }
-        try {
-          await endCallForProvider(callSid);
-          webhookService.setLiveCallPhase(callSid, 'ended').catch(() => {});
-          webhookService.answerCallbackQuery(cb.id, 'Call declined').catch(() => {});
-        } catch (endError) {
-          console.error('Failed to decline call:', endError);
-          webhookService.answerCallbackQuery(cb.id, 'Failed to decline').catch(() => {});
-          await webhookService.sendTelegramMessage(chatId, `❌ Failed to decline call: ${endError.message || endError}`);
-        }
-        return;
-      }
+      webhookService.answerCallbackQuery(cb.id, 'Use the Mini App to answer or decline').catch(() => {});
+      return;
     }
 
     if (action === 'privacy') {
@@ -7269,7 +7296,8 @@ app.get('/miniapp/stream', requireMiniappSession, (req, res) => {
 
   const heartbeat = setInterval(() => {
     try {
-      res.write(`: ping ${Date.now()}\n\n`);
+      res.write(`event: heartbeat\n`);
+      res.write(`data: ${JSON.stringify({ ts: new Date().toISOString() })}\n\n`);
     } catch (_) {}
   }, 20000);
 
@@ -7430,34 +7458,34 @@ app.post('/webapp/auth', webappAuthLimiter, requireWebappInitData, async (req, r
   try {
     const user = req.miniappInitUser;
     if (!user?.id) {
+      logWebappAuthEvent(req, 'webapp.auth.failed', { reason: 'missing_user' });
       return res.status(401).json({ ok: false, error: 'missing_user' });
     }
     const roles = await resolveMiniappRoles(user.id);
     if (!roles.length) {
+      logWebappAuthEvent(req, 'webapp.auth.failed', { reason: 'not_authorized' }, user.id);
       return res.status(403).json({ ok: false, error: 'not_authorized' });
     }
     const now = Math.floor(Date.now() / 1000);
+    const tokenId = createWebappTokenId();
     const payload = {
       sub: String(user.id),
       username: user.username || null,
       first_name: user.first_name || null,
       last_name: user.last_name || null,
       roles,
+      aud: WEBAPP_JWT_AUDIENCE,
+      jti: tokenId,
       iat: now,
       exp: now + WEBAPP_JWT_TTL_S,
       iss: WEBAPP_JWT_ISSUER
     };
     const token = signWebappJwt(payload);
     if (!token) {
+      logWebappAuthEvent(req, 'webapp.auth.failed', { reason: 'token_unavailable' }, user.id);
       return res.status(500).json({ ok: false, error: 'token_unavailable' });
     }
-    db?.logMiniappAudit?.({
-      user_id: String(user.id),
-      action: 'webapp.auth',
-      metadata: { roles },
-      ip: req.ip,
-      user_agent: req.headers['user-agent']
-    }).catch(() => {});
+    logWebappAuthEvent(req, 'webapp.auth', { roles, token_id: tokenId }, user.id);
     return res.json({
       ok: true,
       token,
@@ -7553,6 +7581,8 @@ app.get('/webapp/calls/:callSid/events', requireWebappJwt, async (req, res) => {
 });
 
 app.post('/webapp/calls/:callSid/script', requireWebappJwt, requireWebappAdmin, async (req, res) => {
+  const idempotency = applyIdempotency(req, res);
+  if (idempotency.handled) return;
   try {
     const scriptId = Number(req.body?.script_id || req.body?.scriptId);
     if (!Number.isFinite(scriptId)) {
@@ -7570,6 +7600,8 @@ app.post('/webapp/calls/:callSid/script', requireWebappJwt, requireWebappAdmin, 
 });
 
 app.post('/webapp/calls/:callSid/stream/retry', requireWebappJwt, requireWebappAdmin, async (req, res) => {
+  const idempotency = applyIdempotency(req, res);
+  if (idempotency.handled) return;
   try {
     const { callSid } = req.params;
     const host = req.headers.host || config.server?.hostname;
@@ -7592,6 +7624,8 @@ app.post('/webapp/calls/:callSid/stream/retry', requireWebappJwt, requireWebappA
 });
 
 app.post('/webapp/calls/:callSid/stream/fallback', requireWebappJwt, requireWebappAdmin, async (req, res) => {
+  const idempotency = applyIdempotency(req, res);
+  if (idempotency.handled) return;
   try {
     const { callSid } = req.params;
     const callConfig = callConfigurations.get(callSid);
@@ -7608,6 +7642,8 @@ app.post('/webapp/calls/:callSid/stream/fallback', requireWebappJwt, requireWeba
 });
 
 app.post('/webapp/calls/:callSid/end', requireWebappJwt, requireWebappAdmin, async (req, res) => {
+  const idempotency = applyIdempotency(req, res);
+  if (idempotency.handled) return;
   try {
     const { callSid } = req.params;
     await endCallForProvider(callSid);
@@ -7641,7 +7677,14 @@ app.get('/webapp/inbound/queue', requireWebappJwt, async (req, res) => {
       if (decision !== 'pending') return false;
       return ['ringing', 'queued', 'initiated', 'in-progress'].includes(status) || !status;
     });
-    return res.json({ ok: true, calls: queue });
+    const notice = queue.length
+      ? {
+          level: 'info',
+          message: 'Incoming call pending. Answer in the live console to start the call.',
+          pending_count: queue.length
+        }
+      : null;
+    return res.json({ ok: true, calls: queue, notice });
   } catch (error) {
     console.error('Webapp inbound queue error:', error);
     return res.status(500).json({ ok: false, error: 'failed_to_fetch_queue' });
@@ -7649,6 +7692,8 @@ app.get('/webapp/inbound/queue', requireWebappJwt, async (req, res) => {
 });
 
 app.post('/webapp/inbound/:callSid/answer', requireWebappJwt, requireWebappAdmin, async (req, res) => {
+  const idempotency = applyIdempotency(req, res);
+  if (idempotency.handled) return;
   try {
     const { callSid } = req.params;
     const result = await handleInboundAdminDecision(callSid, 'answer', req.webappSession?.user?.id);
@@ -7663,6 +7708,8 @@ app.post('/webapp/inbound/:callSid/answer', requireWebappJwt, requireWebappAdmin
 });
 
 app.post('/webapp/inbound/:callSid/decline', requireWebappJwt, requireWebappAdmin, async (req, res) => {
+  const idempotency = applyIdempotency(req, res);
+  if (idempotency.handled) return;
   try {
     const { callSid } = req.params;
     const result = await handleInboundAdminDecision(callSid, 'decline', req.webappSession?.user?.id);
@@ -7687,6 +7734,8 @@ app.get('/webapp/scripts', requireWebappJwt, async (req, res) => {
 });
 
 app.post('/webapp/scripts', requireWebappJwt, requireWebappAdmin, async (req, res) => {
+  const idempotency = applyIdempotency(req, res);
+  if (idempotency.handled) return;
   try {
     const payload = req.body || {};
     if (!payload?.name) {
@@ -7709,6 +7758,8 @@ app.post('/webapp/scripts', requireWebappJwt, requireWebappAdmin, async (req, re
 });
 
 app.put('/webapp/scripts/:id', requireWebappJwt, requireWebappAdmin, async (req, res) => {
+  const idempotency = applyIdempotency(req, res);
+  if (idempotency.handled) return;
   try {
     const id = Number(req.params.id);
     if (!Number.isFinite(id)) {
@@ -7734,6 +7785,8 @@ app.put('/webapp/scripts/:id', requireWebappJwt, requireWebappAdmin, async (req,
 });
 
 app.delete('/webapp/scripts/:id', requireWebappJwt, requireWebappAdmin, async (req, res) => {
+  const idempotency = applyIdempotency(req, res);
+  if (idempotency.handled) return;
   try {
     const id = Number(req.params.id);
     if (!Number.isFinite(id)) {
@@ -7772,6 +7825,8 @@ app.get('/webapp/users', requireWebappJwt, requireWebappAdmin, async (req, res) 
 });
 
 app.post('/webapp/users', requireWebappJwt, requireWebappAdmin, async (req, res) => {
+  const idempotency = applyIdempotency(req, res);
+  if (idempotency.handled) return;
   try {
     const userId = String(req.body?.user_id || req.body?.id || '').replace(/[^\d]/g, '');
     if (!userId) {
@@ -7805,6 +7860,8 @@ app.post('/webapp/users', requireWebappJwt, requireWebappAdmin, async (req, res)
 });
 
 app.post('/webapp/users/:id/promote', requireWebappJwt, requireWebappAdmin, async (req, res) => {
+  const idempotency = applyIdempotency(req, res);
+  if (idempotency.handled) return;
   try {
     const userId = String(req.params.id || '').replace(/[^\d]/g, '');
     if (!userId) {
@@ -7833,6 +7890,8 @@ app.post('/webapp/users/:id/promote', requireWebappJwt, requireWebappAdmin, asyn
 });
 
 app.delete('/webapp/users/:id', requireWebappJwt, requireWebappAdmin, async (req, res) => {
+  const idempotency = applyIdempotency(req, res);
+  if (idempotency.handled) return;
   try {
     const userId = String(req.params.id || '').replace(/[^\d]/g, '');
     if (!userId) {
@@ -7886,6 +7945,8 @@ app.get('/webapp/settings', requireWebappJwt, requireWebappAdmin, async (req, re
 });
 
 app.post('/webapp/settings/provider', requireWebappJwt, requireWebappAdmin, async (req, res) => {
+  const idempotency = applyIdempotency(req, res);
+  if (idempotency.handled) return;
   try {
     const { provider } = req.body || {};
     if (!provider || !SUPPORTED_PROVIDERS.includes(provider)) {
@@ -7910,6 +7971,29 @@ app.post('/webapp/settings/provider', requireWebappJwt, requireWebappAdmin, asyn
   } catch (error) {
     console.error('Webapp provider switch error:', error);
     return res.status(500).json({ ok: false, error: 'provider_switch_failed' });
+  }
+});
+
+app.get('/webapp/audit', requireWebappJwt, requireWebappAdmin, async (req, res) => {
+  try {
+    const limit = Number(req.query?.limit || 50);
+    const cursor = Number(req.query?.cursor || 0);
+    const response = await db.getMiniappAuditLogs({ limit, cursor });
+    const logs = (response.logs || []).map((row) => {
+      let metadata = null;
+      if (row?.metadata) {
+        try {
+          metadata = JSON.parse(row.metadata);
+        } catch (_) {
+          metadata = row.metadata;
+        }
+      }
+      return { ...row, metadata };
+    });
+    return res.json({ ok: true, logs, next_cursor: response.next_cursor ?? null });
+  } catch (error) {
+    console.error('Webapp audit error:', error);
+    return res.status(500).json({ ok: false, error: 'failed_to_fetch_audit' });
   }
 });
 

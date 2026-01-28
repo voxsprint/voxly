@@ -16,8 +16,9 @@ export function connectEventStream(options: {
   onEvent: (event: WebappEvent) => void;
   onError?: (error: Event) => void;
   onOpen?: () => void;
+  onHeartbeat?: (payload: { ts: string }) => void;
 }): EventStream {
-  const { token, since, onEvent, onError, onOpen } = options;
+  const { token, since, onEvent, onError, onOpen, onHeartbeat } = options;
   const query = new URLSearchParams();
   query.set('token', token);
   if (since && Number.isFinite(since)) {
@@ -38,6 +39,15 @@ export function connectEventStream(options: {
   source.onopen = () => {
     if (onOpen) onOpen();
   };
+  source.addEventListener('heartbeat', (message) => {
+    if (!onHeartbeat) return;
+    try {
+      const payload = JSON.parse((message as MessageEvent).data) as { ts: string };
+      onHeartbeat(payload);
+    } catch {
+      onHeartbeat({ ts: new Date().toISOString() });
+    }
+  });
   return {
     close: () => source.close(),
   };

@@ -1,7 +1,17 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
+import {
+  Button,
+  Cell,
+  Chip,
+  InlineButtons,
+  List,
+  Placeholder,
+  Section,
+  Select,
+} from '@telegram-apps/telegram-ui';
 import { connectEventStream, type WebappEvent } from '../lib/realtime';
 import { ensureAuth } from '../lib/auth';
-import { apiFetch } from '../lib/api';
+import { apiFetch, createIdempotencyKey } from '../lib/api';
 import { useCalls } from '../state/calls';
 import { useUser } from '../state/user';
 
@@ -19,10 +29,14 @@ export function CallConsole({ callSid }: { callSid: string }) {
   const [liveEvents, setLiveEvents] = useState<WebappEvent[]>([]);
   const [transcript, setTranscript] = useState<TranscriptEntry[]>([]);
   const [streamHealth, setStreamHealth] = useState<{ latencyMs?: number; jitterMs?: number; packetLossPct?: number; asrConfidence?: number } | null>(null);
-  const [connectionStatus, setConnectionStatus] = useState<'connecting' | 'open' | 'error'>('connecting');
+  const [connectionStatus, setConnectionStatus] = useState<'connecting' | 'open' | 'error' | 'stale'>('connecting');
   const [actionBusy, setActionBusy] = useState<string | null>(null);
   const [scripts, setScripts] = useState<{ id: number; name: string }[]>([]);
   const [selectedScript, setSelectedScript] = useState<number | null>(null);
+  const lastSequenceRef = useRef(0);
+  const lastSeenRef = useRef(Date.now());
+  const reconnectTimerRef = useRef<number | null>(null);
+  const [streamEpoch, setStreamEpoch] = useState(0);
 
   useEffect(() => {
     fetchCall(callSid);
@@ -30,19 +44,33 @@ export function CallConsole({ callSid }: { callSid: string }) {
     setLiveEvents([]);
     setTranscript([]);
     setStreamHealth(null);
+    lastSequenceRef.current = eventCursorById[callSid] || 0;
+    lastSeenRef.current = Date.now();
   }, [callSid, fetchCall, fetchCallEvents]);
+
+  useEffect(() => {
+    const cursor = eventCursorById[callSid] || 0;
+    if (cursor > lastSequenceRef.current) {
+      lastSequenceRef.current = cursor;
+    }
+  }, [callSid, eventCursorById]);
 
   useEffect(() => {
     let stream: { close: () => void } | null = null;
     let cancelled = false;
+    const since = lastSequenceRef.current;
     ensureAuth()
       .then((session) => {
         if (cancelled) return;
         setConnectionStatus('connecting');
         stream = connectEventStream({
           token: session.token,
+          since,
           onEvent: (event) => {
             if (event.call_sid !== callSid) return;
+            if (event.sequence && event.sequence <= lastSequenceRef.current) return;
+            lastSequenceRef.current = Math.max(lastSequenceRef.current, event.sequence || 0);
+            lastSeenRef.current = Date.now();
             setLiveEvents((prev) => [...prev.slice(-50), event]);
             if (event.type === 'transcript.partial' || event.type === 'transcript.final') {
               const entry: TranscriptEntry = {
@@ -63,8 +91,22 @@ export function CallConsole({ callSid }: { callSid: string }) {
               fetchCall(callSid);
             }
           },
-          onError: () => setConnectionStatus('error'),
-          onOpen: () => setConnectionStatus('open'),
+          onHeartbeat: () => {
+            lastSeenRef.current = Date.now();
+            setConnectionStatus((prev) => (prev === 'stale' ? 'open' : prev));
+          },
+          onError: () => {
+            setConnectionStatus('error');
+            if (reconnectTimerRef.current) return;
+            reconnectTimerRef.current = window.setTimeout(() => {
+              reconnectTimerRef.current = null;
+              setStreamEpoch((prev) => prev + 1);
+            }, 3000);
+          },
+          onOpen: () => {
+            lastSeenRef.current = Date.now();
+            setConnectionStatus('open');
+          },
         });
       })
       .catch(() => {
@@ -73,8 +115,27 @@ export function CallConsole({ callSid }: { callSid: string }) {
     return () => {
       cancelled = true;
       if (stream) stream.close();
+      if (reconnectTimerRef.current) {
+        window.clearTimeout(reconnectTimerRef.current);
+        reconnectTimerRef.current = null;
+      }
     };
-  }, [callSid, fetchCall]);
+  }, [callSid, fetchCall, streamEpoch]);
+
+  useEffect(() => {
+    const timer = window.setInterval(() => {
+      const now = Date.now();
+      if (now - lastSeenRef.current > 45000) {
+        setConnectionStatus((prev) => {
+          if (prev !== 'stale') {
+            setStreamEpoch((epoch) => epoch + 1);
+          }
+          return 'stale';
+        });
+      }
+    }, 15000);
+    return () => window.clearInterval(timer);
+  }, []);
 
   useEffect(() => {
     const interval = window.setInterval(() => {
@@ -101,7 +162,10 @@ export function CallConsole({ callSid }: { callSid: string }) {
   const handleInboundAction = async (action: 'answer' | 'decline') => {
     setActionBusy(action);
     try {
-      await apiFetch(`/webapp/inbound/${callSid}/${action}`, { method: 'POST' });
+      await apiFetch(`/webapp/inbound/${callSid}/${action}`, {
+        method: 'POST',
+        idempotencyKey: createIdempotencyKey(),
+      });
       await fetchCall(callSid);
     } finally {
       setActionBusy(null);
@@ -111,10 +175,11 @@ export function CallConsole({ callSid }: { callSid: string }) {
   const handleStreamAction = async (action: 'retry' | 'fallback' | 'end') => {
     setActionBusy(action);
     try {
+      const idempotencyKey = createIdempotencyKey();
       if (action === 'end') {
-        await apiFetch(`/webapp/calls/${callSid}/end`, { method: 'POST' });
+        await apiFetch(`/webapp/calls/${callSid}/end`, { method: 'POST', idempotencyKey });
       } else {
-        await apiFetch(`/webapp/calls/${callSid}/stream/${action}`, { method: 'POST' });
+        await apiFetch(`/webapp/calls/${callSid}/stream/${action}`, { method: 'POST', idempotencyKey });
       }
       await fetchCall(callSid);
     } finally {
@@ -129,6 +194,7 @@ export function CallConsole({ callSid }: { callSid: string }) {
       await apiFetch(`/webapp/calls/${callSid}/script`, {
         method: 'POST',
         body: { script_id: selectedScript },
+        idempotencyKey: createIdempotencyKey(),
       });
     } finally {
       setActionBusy(null);
@@ -136,51 +202,66 @@ export function CallConsole({ callSid }: { callSid: string }) {
   };
 
   return (
-    <section className="stack">
-      <div className="panel">
-        <h2>Live Call Console</h2>
-        <p className="muted">{callSid}</p>
-        <p className="muted">Status: {statusLine}</p>
-        <p className="muted">Realtime: {connectionStatus}</p>
+    <List>
+      <Section header="Live call console" footer={callSid}>
+        <Cell subtitle="Status" after={<Chip mode="mono">{statusLine}</Chip>}>
+          Call status
+        </Cell>
+        <Cell subtitle="Realtime" after={<Chip mode="outline">{connectionStatus}</Chip>}>
+          Connection
+        </Cell>
         {streamHealth && (
-          <p className="muted">
-            Stream health: latency {streamHealth.latencyMs ?? '-'}ms | jitter {streamHealth.jitterMs ?? '-'}ms | loss {streamHealth.packetLossPct ?? '-'}% | asr {streamHealth.asrConfidence ?? '-'}
-          </p>
+          <Cell
+            subtitle={`latency ${streamHealth.latencyMs ?? '-'}ms • jitter ${streamHealth.jitterMs ?? '-'}ms`}
+            description={`loss ${streamHealth.packetLossPct ?? '-'}% • asr ${streamHealth.asrConfidence ?? '-'}`}
+          >
+            Stream health
+          </Cell>
         )}
-        <div className="actions">
-          <button type="button" className="btn ghost" onClick={() => fetchCallEvents(callSid, 0)}>
+        <div className="section-actions">
+          <Button size="s" mode="bezeled" onClick={() => fetchCallEvents(callSid, 0)}>
             Refresh timeline
-          </button>
+          </Button>
         </div>
-      </div>
+      </Section>
 
       {isAdmin && (
-        <div className="panel">
-          <h3>Actions</h3>
+        <Section header="Actions">
           {activeCall?.inbound_gate?.status === 'pending' && (
-            <div className="actions">
-              <button type="button" className="btn" onClick={() => handleInboundAction('answer')} disabled={!!actionBusy}>
-                Answer
-              </button>
-              <button type="button" className="btn danger" onClick={() => handleInboundAction('decline')} disabled={!!actionBusy}>
-                Decline
-              </button>
-            </div>
+            <InlineButtons mode="bezeled">
+              <InlineButtons.Item
+                text="Answer"
+                disabled={!!actionBusy}
+                onClick={() => handleInboundAction('answer')}
+              />
+              <InlineButtons.Item
+                text="Decline"
+                disabled={!!actionBusy}
+                onClick={() => handleInboundAction('decline')}
+              />
+            </InlineButtons>
           )}
-          <div className="actions">
-            <button type="button" className="btn ghost" onClick={() => handleStreamAction('retry')} disabled={!!actionBusy}>
-              Retry stream
-            </button>
-            <button type="button" className="btn ghost" onClick={() => handleStreamAction('fallback')} disabled={!!actionBusy}>
-              Switch to keypad
-            </button>
-            <button type="button" className="btn danger" onClick={() => handleStreamAction('end')} disabled={!!actionBusy}>
-              End call
-            </button>
-          </div>
+          <InlineButtons mode="gray">
+            <InlineButtons.Item
+              text="Retry stream"
+              disabled={!!actionBusy}
+              onClick={() => handleStreamAction('retry')}
+            />
+            <InlineButtons.Item
+              text="Switch to keypad"
+              disabled={!!actionBusy}
+              onClick={() => handleStreamAction('fallback')}
+            />
+            <InlineButtons.Item
+              text="End call"
+              disabled={!!actionBusy}
+              onClick={() => handleStreamAction('end')}
+            />
+          </InlineButtons>
           {scripts.length > 0 && (
-            <div className="form inline">
-              <select
+            <>
+              <Select
+                header="Inject script"
                 value={selectedScript ?? ''}
                 onChange={(event) => {
                   const value = event.target.value;
@@ -191,69 +272,62 @@ export function CallConsole({ callSid }: { callSid: string }) {
                 {scripts.map((script) => (
                   <option key={script.id} value={script.id}>{script.name}</option>
                 ))}
-              </select>
-              <button type="button" className="btn" onClick={handleScriptInject} disabled={!selectedScript || !!actionBusy}>
+              </Select>
+              <Button
+                size="s"
+                mode="filled"
+                disabled={!selectedScript || !!actionBusy}
+                onClick={handleScriptInject}
+              >
                 Inject script
-              </button>
-            </div>
+              </Button>
+            </>
           )}
-        </div>
+        </Section>
       )}
 
-      <div className="panel">
-        <h3>Timeline</h3>
+      <Section header="Timeline">
         {timeline.length === 0 ? (
-          <p className="muted">No events yet.</p>
+          <Placeholder header="No events yet" description="Waiting for new events." />
         ) : (
-          <div className="list">
-            {timeline.map((evt) => (
-              <div className="list-item" key={`${evt.sequence_number}-${evt.state}`}>
-                <div>
-                  <strong>{evt.state}</strong>
-                  <p className="muted">{evt.timestamp}</p>
-                </div>
-              </div>
-            ))}
-          </div>
+          timeline.map((evt) => (
+            <Cell
+              key={`${evt.sequence_number}-${evt.state}`}
+              subtitle={evt.timestamp}
+            >
+              {evt.state}
+            </Cell>
+          ))
         )}
-      </div>
+      </Section>
 
-      <div className="panel">
-        <h3>Transcript</h3>
+      <Section header="Transcript">
         {transcript.length === 0 ? (
-          <p className="muted">Waiting for transcript...</p>
+          <Placeholder header="Waiting for transcript" description="Live transcript will appear here." />
         ) : (
-          <div className="list">
-            {transcript.map((entry, index) => (
-              <div className="list-item" key={`${entry.ts}-${index}`}>
-                <div>
-                  <strong>{entry.speaker}</strong>
-                  <p className="muted">{entry.message}</p>
-                </div>
-                {entry.partial && <span className="badge partial">partial</span>}
-              </div>
-            ))}
-          </div>
+          transcript.map((entry, index) => (
+            <Cell
+              key={`${entry.ts}-${index}`}
+              subtitle={entry.message}
+              after={entry.partial ? <Chip mode="mono">partial</Chip> : undefined}
+            >
+              {entry.speaker}
+            </Cell>
+          ))
         )}
-      </div>
+      </Section>
 
-      <div className="panel">
-        <h3>Live events</h3>
+      <Section header="Live events">
         {liveEvents.length === 0 ? (
-          <p className="muted">No realtime updates yet.</p>
+          <Placeholder header="No realtime updates" description="Waiting for realtime events." />
         ) : (
-          <div className="list">
-            {liveEvents.slice(-15).map((event) => (
-              <div className="list-item" key={`${event.sequence}-${event.type}`}>
-                <div>
-                  <strong>{event.type}</strong>
-                  <p className="muted">{event.ts}</p>
-                </div>
-              </div>
-            ))}
-          </div>
+          liveEvents.slice(-15).map((event) => (
+            <Cell key={`${event.sequence}-${event.type}`} subtitle={event.ts}>
+              {event.type}
+            </Cell>
+          ))
         )}
-      </div>
-    </section>
+      </Section>
+    </List>
   );
 }

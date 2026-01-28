@@ -1289,6 +1289,34 @@ class EnhancedDatabase {
         });
     }
 
+    async getMiniappAuditLogs(options = {}) {
+        const limit = Number(options.limit || 50);
+        const cursor = Number(options.cursor || 0);
+        const safeLimit = Number.isFinite(limit) ? Math.min(Math.max(limit, 1), 200) : 50;
+        const params = [];
+        let sql = 'SELECT * FROM miniapp_audit_logs';
+        if (Number.isFinite(cursor) && cursor > 0) {
+            sql += ' WHERE id < ?';
+            params.push(cursor);
+        }
+        sql += ' ORDER BY id DESC LIMIT ?';
+        params.push(safeLimit + 1);
+
+        return new Promise((resolve, reject) => {
+            this.db.all(sql, params, (err, rows) => {
+                if (err) {
+                    reject(err);
+                } else {
+                    const list = rows || [];
+                    const hasMore = list.length > safeLimit;
+                    const slice = hasMore ? list.slice(0, safeLimit) : list;
+                    const nextCursor = hasMore ? slice[slice.length - 1]?.id : null;
+                    resolve({ logs: slice, next_cursor: nextCursor });
+                }
+            });
+        });
+    }
+
     async getSetting(key) {
         return new Promise((resolve, reject) => {
             this.db.get('SELECT value FROM app_settings WHERE key = ?', [key], (err, row) => {

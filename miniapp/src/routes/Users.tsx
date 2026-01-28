@@ -1,5 +1,14 @@
 import { useCallback, useEffect, useState } from 'react';
-import { apiFetch } from '../lib/api';
+import {
+  Button,
+  Cell,
+  InlineButtons,
+  Input,
+  List,
+  Section,
+  Select,
+} from '@telegram-apps/telegram-ui';
+import { apiFetch, createIdempotencyKey } from '../lib/api';
 
 type UsersResponse = {
   ok: boolean;
@@ -31,6 +40,7 @@ export function Users() {
       await apiFetch('/webapp/users', {
         method: 'POST',
         body: { user_id: newUserId, role },
+        idempotencyKey: createIdempotencyKey(),
       });
       setNewUserId('');
       await loadUsers();
@@ -42,7 +52,10 @@ export function Users() {
   const handlePromote = async (userId: string) => {
     setLoading(true);
     try {
-      await apiFetch(`/webapp/users/${userId}/promote`, { method: 'POST' });
+      await apiFetch(`/webapp/users/${userId}/promote`, {
+        method: 'POST',
+        idempotencyKey: createIdempotencyKey(),
+      });
       await loadUsers();
     } finally {
       setLoading(false);
@@ -53,7 +66,10 @@ export function Users() {
     if (!window.confirm('Remove user from allowlist?')) return;
     setLoading(true);
     try {
-      await apiFetch(`/webapp/users/${userId}`, { method: 'DELETE' });
+      await apiFetch(`/webapp/users/${userId}`, {
+        method: 'DELETE',
+        idempotencyKey: createIdempotencyKey(),
+      });
       await loadUsers();
     } finally {
       setLoading(false);
@@ -61,64 +77,61 @@ export function Users() {
   };
 
   return (
-    <section className="stack">
-      <div className="panel">
-        <h2>Allowlisted users</h2>
-        <div className="form inline">
-          <input
-            type="text"
-            placeholder="Telegram user id"
-            value={newUserId}
-            onChange={(event) => setNewUserId(event.target.value)}
-          />
-          <select value={role} onChange={(event) => setRole(event.target.value as 'viewer' | 'admin')}>
-            <option value="viewer">Viewer</option>
-            <option value="admin">Admin</option>
-          </select>
-          <button type="button" className="btn" disabled={loading} onClick={handleAdd}>
-            Add
-          </button>
+    <List>
+      <Section header="Allowlisted users">
+        <Input
+          header="Telegram user id"
+          placeholder="123456789"
+          value={newUserId}
+          onChange={(event) => setNewUserId(event.target.value)}
+        />
+        <Select
+          header="Role"
+          value={role}
+          onChange={(event) => setRole(event.target.value as 'viewer' | 'admin')}
+        >
+          <option value="viewer">Viewer</option>
+          <option value="admin">Admin</option>
+        </Select>
+        <div className="section-actions">
+          <Button size="s" mode="filled" disabled={loading} onClick={handleAdd}>
+            Add user
+          </Button>
         </div>
-      </div>
+      </Section>
 
-      <div className="panel">
-        <h3>Admins</h3>
-        <div className="list">
-          {admins.map((id) => (
-            <div className="list-item" key={id}>
-              <div>
-                <strong>{id}</strong>
-                <p className="muted">Admin</p>
-              </div>
-              <button type="button" className="btn danger" disabled={loading} onClick={() => handleRemove(id)}>
+      <Section header="Admins">
+        {admins.map((id) => (
+          <Cell
+            key={id}
+            subtitle="Admin"
+            after={(
+              <Button size="s" mode="outline" disabled={loading} onClick={() => handleRemove(id)}>
                 Remove
-              </button>
-            </div>
-          ))}
-        </div>
-      </div>
+              </Button>
+            )}
+          >
+            {id}
+          </Cell>
+        ))}
+      </Section>
 
-      <div className="panel">
-        <h3>Viewers</h3>
-        <div className="list">
-          {viewers.map((id) => (
-            <div className="list-item" key={id}>
-              <div>
-                <strong>{id}</strong>
-                <p className="muted">Viewer</p>
-              </div>
-              <div className="actions">
-                <button type="button" className="btn" disabled={loading} onClick={() => handlePromote(id)}>
-                  Promote
-                </button>
-                <button type="button" className="btn danger" disabled={loading} onClick={() => handleRemove(id)}>
-                  Remove
-                </button>
-              </div>
-            </div>
-          ))}
-        </div>
-      </div>
-    </section>
+      <Section header="Viewers">
+        {viewers.map((id) => (
+          <Cell
+            key={id}
+            subtitle="Viewer"
+            after={(
+              <InlineButtons mode="bezeled">
+                <InlineButtons.Item text="Promote" disabled={loading} onClick={() => handlePromote(id)} />
+                <InlineButtons.Item text="Remove" disabled={loading} onClick={() => handleRemove(id)} />
+              </InlineButtons>
+            )}
+          >
+            {id}
+          </Cell>
+        ))}
+      </Section>
+    </List>
   );
 }

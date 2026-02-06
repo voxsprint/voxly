@@ -3,7 +3,6 @@ import {
   Banner,
   Button,
   Cell,
-  Chip,
   List,
   Section,
   Placeholder,
@@ -92,7 +91,7 @@ export function Provider() {
     setError(null);
     setSuccess(null);
     try {
-      const response = await apiFetch<SwitchResponse>('/admin/provider', {
+      await apiFetch<SwitchResponse>('/admin/provider', {
         method: 'POST',
         body: { provider },
         idempotencyKey: createIdempotencyKey(),
@@ -113,7 +112,7 @@ export function Provider() {
   if (!isAdmin) {
     return (
       <div className="wallet-page">
-        <Banner type="error" header="Access denied" description="Only administrators can change providers." />
+        <Banner type="inline" header="Access denied" description="Only administrators can change providers." />
       </div>
     );
   }
@@ -129,7 +128,7 @@ export function Provider() {
   if (!status) {
     return (
       <div className="wallet-page">
-        <Banner type="error" header="Error" description="Could not load provider status" />
+        <Banner type="inline" header="Error" description="Could not load provider status" />
       </div>
     );
   }
@@ -151,18 +150,16 @@ export function Provider() {
     <div className="wallet-page">
       {error && (
         <Banner 
-          type="error" 
+          type="inline" 
           header="Error" 
           description={error}
-          onClose={() => setError(null)}
         />
       )}
       {success && (
         <Banner 
-          type="success" 
+          type="inline" 
           header="Success" 
           description={success}
-          onClose={() => setSuccess(null)}
         />
       )}
 

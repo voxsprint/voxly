@@ -11,7 +11,7 @@ import { Users } from '@/routes/Users';
 export interface Route {
   path: string;
   name: string;
-  Component: ComponentType;
+  Component: ComponentType<any>;
   title?: string;
   icon?: JSX.Element;
 }

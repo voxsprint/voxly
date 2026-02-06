@@ -1,3 +1,5 @@
+import { getApiBase } from './api';
+
 export type WebappEvent = {
   sequence: number;
   type: string;
@@ -24,7 +26,9 @@ export function connectEventStream(options: {
   if (since && Number.isFinite(since)) {
     query.set('since', String(since));
   }
-  const source = new EventSource(`/webapp/sse?${query.toString()}`);
+  const apiBase = getApiBase();
+  const url = `${apiBase}/webapp/sse?${query.toString()}`;
+  const source = new EventSource(url);
   source.onmessage = (message) => {
     try {
       const payload = JSON.parse(message.data) as WebappEvent;

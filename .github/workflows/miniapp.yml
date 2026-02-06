@@ -56,9 +56,6 @@ jobs:
             --token=${{ secrets.VERCEL_TOKEN }} \
             --org-id=${{ secrets.VERCEL_ORG_ID }} \
             --project-id=${{ secrets.VERCEL_PROJECT_ID }}
-        env:
-          VITE_API_BASE: ${{ secrets.MINIAPP_API_BASE }}
-          VITE_BASE: /
 
       - name: Deployment Summary
         if: always()

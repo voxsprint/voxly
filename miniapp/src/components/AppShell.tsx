@@ -22,6 +22,11 @@ import { SkeletonPanel } from '../components/Skeleton';
 import { AppBrand } from '../components/AppBrand';
 
 const Scripts = lazy(() => import('../routes/Scripts').then((module) => ({ default: module.Scripts })));
+const Personas = lazy(() => import('../routes/Personas').then((module) => ({ default: module.Personas })));
+const CallerFlags = lazy(() => import('../routes/CallerFlags').then((module) => ({ default: module.CallerFlags })));
+const Sms = lazy(() => import('../routes/Sms').then((module) => ({ default: module.Sms })));
+const Email = lazy(() => import('../routes/Email').then((module) => ({ default: module.Email })));
+const Health = lazy(() => import('../routes/Health').then((module) => ({ default: module.Health })));
 const Users = lazy(() => import('../routes/Users').then((module) => ({ default: module.Users })));
 
 type TabItem = {
@@ -86,6 +91,57 @@ const adminTabs: TabItem[] = [
     ),
   },
   {
+    label: 'Personas',
+    path: '/personas',
+    icon: (
+      <svg className="tab-icon" viewBox="0 0 24 24" aria-hidden="true">
+        <path d="M12 2c5.5 0 10 4.5 10 10s-4.5 10-10 10S2 17.5 2 12 6.5 2 12 2z" fill="none" stroke="currentColor" strokeWidth="1.6" />
+        <path d="M8 10a4 4 0 0 1 8 0" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" />
+        <circle cx="12" cy="7" r="1.5" fill="currentColor" />
+      </svg>
+    ),
+  },
+  {
+    label: 'Flags',
+    path: '/caller-flags',
+    icon: (
+      <svg className="tab-icon" viewBox="0 0 24 24" aria-hidden="true">
+        <path d="M4 4h16v16H4z" fill="none" stroke="currentColor" strokeWidth="1.6" />
+        <path d="M7 8h10M7 12h10M7 16h6" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" />
+      </svg>
+    ),
+  },
+  {
+    label: 'SMS',
+    path: '/sms',
+    icon: (
+      <svg className="tab-icon" viewBox="0 0 24 24" aria-hidden="true">
+        <path d="M3 8a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2v10a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8z" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinejoin="round" />
+        <path d="M3 8l9 6 9-6" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinejoin="round" />
+      </svg>
+    ),
+  },
+  {
+    label: 'Email',
+    path: '/email',
+    icon: (
+      <svg className="tab-icon" viewBox="0 0 24 24" aria-hidden="true">
+        <path d="M4 4h16l-2 8-14 0 2-8z" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinejoin="round" />
+        <path d="M4 4c-2 2-2 8-2 8 0 4 2 6 10 6s10-2 10-6c0 0 0-6-2-8" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" />
+      </svg>
+    ),
+  },
+  {
+    label: 'Health',
+    path: '/health',
+    icon: (
+      <svg className="tab-icon" viewBox="0 0 24 24" aria-hidden="true">
+        <path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2z" fill="none" stroke="currentColor" strokeWidth="1.6" />
+        <path d="M12 6v6M15 12h-6" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" />
+      </svg>
+    ),
+  },
+  {
     label: 'Users',
     path: '/users',
     icon: (
@@ -125,6 +181,36 @@ function RouteRenderer({ route, role }: { route: RouteMatch; role: RoleTier }) {
       return (
         <Suspense fallback={<SkeletonPanel title="Loading scripts" />}>
           <Scripts />
+        </Suspense>
+      );
+    case 'personas':
+      return (
+        <Suspense fallback={<SkeletonPanel title="Loading personas" />}>
+          <Personas />
+        </Suspense>
+      );
+    case 'callerFlags':
+      return (
+        <Suspense fallback={<SkeletonPanel title="Loading caller flags" />}>
+          <CallerFlags />
+        </Suspense>
+      );
+    case 'sms':
+      return (
+        <Suspense fallback={<SkeletonPanel title="Loading SMS center" />}>
+          <Sms />
+        </Suspense>
+      );
+    case 'email':
+      return (
+        <Suspense fallback={<SkeletonPanel title="Loading email center" />}>
+          <Email />
+        </Suspense>
+      );
+    case 'health':
+      return (
+        <Suspense fallback={<SkeletonPanel title="Loading health status" />}>
+          <Health />
         </Suspense>
       );
     case 'users':

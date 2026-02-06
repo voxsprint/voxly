@@ -46,6 +46,11 @@ const API_BASE = import.meta.env.VITE_API_BASE || '';
 const DEFAULT_TIMEOUT_MS = 8000;
 const DEFAULT_RETRIES = 2;
 
+// Validate API base is configured
+if (!API_BASE && typeof window !== 'undefined') {
+  console.warn('⚠️ VITE_API_BASE environment variable is not set. API communication may fail.');
+}
+
 export function getApiBase() {
   return API_BASE;
 }
@@ -142,6 +147,18 @@ export async function apiFetch<T>(
           details: payload,
           retryable: shouldRetry(response.status),
         });
+        
+        // Log API errors for debugging
+        if (import.meta.env.DEV) {
+          console.error(`[API Error] ${method} ${path}:`, {
+            status: response.status,
+            statusText: response.statusText,
+            code: error.code,
+            message: error.message,
+            payload,
+          });
+        }
+        
         if (error.retryable && attempt <= retries) {
           await new Promise((resolve) => window.setTimeout(resolve, 300 * attempt));
           continue;
@@ -150,6 +167,12 @@ export async function apiFetch<T>(
       }
 
       const data = await readJsonSafely(response);
+      
+      // Log successful API calls in development
+      if (import.meta.env.DEV) {
+        console.debug(`[API Success] ${method} ${path}`, data);
+      }
+      
       return data as T;
     } catch (error) {
       window.clearTimeout(timeout);
@@ -189,3 +212,39 @@ export async function apiFetch<T>(
     }
   }
 }
+
+/**
+ * Validation helpers for common field types
+ */
+export const validate = {
+  /** Validate phone number (basic E.164 check) */
+  phoneNumber: (phone: string): boolean => {
+    return /^\+?[1-9]\d{1,14}$/.test(phone.replace(/\D/g, ''));
+  },
+
+  /** Validate email address */
+  email: (email: string): boolean => {
+    return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);
+  },
+
+  /** Validate URL */
+  url: (url: string): boolean => {
+    try {
+      new URL(url);
+      return true;
+    } catch {
+      return false;
+    }
+  },
+
+  /** Validate string length */
+  stringLength: (str: string, min: number, max: number): boolean => {
+    const len = str.trim().length;
+    return len >= min && len <= max;
+  },
+
+  /** Validate not empty string */
+  required: (str: string): boolean => {
+    return str.trim().length > 0;
+  },
+};

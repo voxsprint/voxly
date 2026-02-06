@@ -10,6 +10,11 @@ const routes: { name: string; pattern: RegExp; keys: string[] }[] = [
   { name: 'calls', pattern: /^\/calls$/, keys: [] },
   { name: 'callConsole', pattern: /^\/calls\/([^/]+)$/, keys: ['callSid'] },
   { name: 'scripts', pattern: /^\/scripts$/, keys: [] },
+  { name: 'personas', pattern: /^\/personas$/, keys: [] },
+  { name: 'callerFlags', pattern: /^\/caller-flags$/, keys: [] },
+  { name: 'sms', pattern: /^\/sms$/, keys: [] },
+  { name: 'email', pattern: /^\/email$/, keys: [] },
+  { name: 'health', pattern: /^\/health$/, keys: [] },
   { name: 'users', pattern: /^\/users$/, keys: [] },
   { name: 'settings', pattern: /^\/settings$/, keys: [] },
 ];

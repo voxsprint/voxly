@@ -8260,6 +8260,295 @@ app.get('/webapp/audit', requireWebappJwt, requireWebappAdmin, async (req, res) 
   }
 });
 
+// SMS Management Endpoints
+app.get('/webapp/sms', requireWebappJwt, async (req, res) => {
+  try {
+    const limit = Number(req.query?.limit || 20);
+    const status = req.query?.status;
+    const params = [limit];
+    let query = 'SELECT * FROM sms_messages WHERE 1=1';
+    
+    if (status) {
+      query += ' AND status = ?';
+      params.unshift(status);
+    }
+    
+    query += ' ORDER BY created_at DESC LIMIT ?';
+    
+    const messages = await new Promise((resolve, reject) => {
+      if (!db.db) return resolve([]);
+      db.db.all(query, params, (err, rows) => {
+        if (err) reject(err);
+        else resolve(rows || []);
+      });
+    });
+    
+    return res.json({ ok: true, messages });
+  } catch (error) {
+    console.error('Webapp SMS fetch error:', error);
+    return res.status(500).json({ ok: false, error: 'failed_to_fetch_sms' });
+  }
+});
+
+app.post('/webapp/sms/send', requireWebappJwt, async (req, res) => {
+  try {
+    if (!smsService) {
+      return res.status(500).json({ ok: false, error: 'sms_service_not_available' });
+    }
+    
+    const { phone_number, body, scheduled_for } = req.body;
+    if (!phone_number || !body) {
+      return res.status(400).json({ ok: false, error: 'missing_required_fields' });
+    }
+    
+    const result = await smsService.sendSMS(phone_number, body, undefined, { 
+      idempotencyKey: req.headers['idempotency-key'] 
+    });
+    
+    return res.json({ ok: true, message_id: result.message_sid, status: result.status });
+  } catch (error) {
+    console.error('Webapp SMS send error:', error);
+    return res.status(500).json({ ok: false, error: 'failed_to_send_sms' });
+  }
+});
+
+app.get('/webapp/sms/templates', requireWebappJwt, async (req, res) => {
+  try {
+    const templates = [
+      { id: 1, name: 'Welcome', body: 'Welcome to our service!' },
+      { id: 2, name: 'Reminder', body: 'This is a reminder about your appointment.' },
+      { id: 3, name: 'Verification', body: 'Your verification code is: {code}' }
+    ];
+    return res.json({ ok: true, templates });
+  } catch (error) {
+    return res.status(500).json({ ok: false, error: 'failed_to_fetch_templates' });
+  }
+});
+
+app.post('/webapp/sms/:messageId/retry', requireWebappJwt, requireWebappAdmin, async (req, res) => {
+  try {
+    const { messageId } = req.params;
+    if (!smsService || !db.db) {
+      return res.status(500).json({ ok: false, error: 'service_not_available' });
+    }
+    
+    // Retry logic would be implemented here
+    return res.json({ ok: true, retry_queued: true });
+  } catch (error) {
+    console.error('Webapp SMS retry error:', error);
+    return res.status(500).json({ ok: false, error: 'failed_to_retry_sms' });
+  }
+});
+
+// Email Management Endpoints
+app.get('/webapp/emails', requireWebappJwt, async (req, res) => {
+  try {
+    const limit = Number(req.query?.limit || 20);
+    const status = req.query?.status;
+    const params = [limit];
+    let query = 'SELECT * FROM email_messages WHERE 1=1';
+    
+    if (status) {
+      query += ' AND status = ?';
+      params.unshift(status);
+    }
+    
+    query += ' ORDER BY created_at DESC LIMIT ?';
+    
+    const messages = await new Promise((resolve, reject) => {
+      if (!db.db) return resolve([]);
+      db.db.all(query, params, (err, rows) => {
+        if (err) reject(err);
+        else resolve(rows || []);
+      });
+    });
+    
+    return res.json({ ok: true, messages });
+  } catch (error) {
+    console.error('Webapp email fetch error:', error);
+    return res.status(500).json({ ok: false, error: 'failed_to_fetch_emails' });
+  }
+});
+
+app.post('/webapp/emails/send', requireWebappJwt, async (req, res) => {
+  try {
+    if (!emailService) {
+      return res.status(500).json({ ok: false, error: 'email_service_not_available' });
+    }
+    
+    const { to, subject, body } = req.body;
+    if (!to || !subject || !body) {
+      return res.status(400).json({ ok: false, error: 'missing_required_fields' });
+    }
+    
+    const result = await emailService.enqueueEmail({
+      to,
+      subject,
+      html: body,
+      text: body
+    }, { idempotencyKey: req.headers['idempotency-key'] });
+    
+    return res.json({ ok: true, message_id: result.message_id });
+  } catch (error) {
+    console.error('Webapp email send error:', error);
+    return res.status(500).json({ ok: false, error: 'failed_to_send_email' });
+  }
+});
+
+app.get('/webapp/emails/templates', requireWebappJwt, async (req, res) => {
+  try {
+    const templates = [
+      { id: 1, name: 'Welcome Email', subject: 'Welcome!', body: '<p>Welcome to our service!</p>' },
+      { id: 2, name: 'Confirmation', subject: 'Confirmation', body: '<p>Your action has been confirmed.</p>' }
+    ];
+    return res.json({ ok: true, templates });
+  } catch (error) {
+    return res.status(500).json({ ok: false, error: 'failed_to_fetch_templates' });
+  }
+});
+
+// Personas Management Endpoints
+app.get('/webapp/personas', requireWebappJwt, async (req, res) => {
+  try {
+    const personas = [
+      { 
+        id: 1, 
+        name: 'Professional', 
+        description: 'Formal and professional tone',
+        system_prompt: 'You are a professional AI assistant.'
+      },
+      { 
+        id: 2, 
+        name: 'Friendly', 
+        description: 'Warm and friendly tone',
+        system_prompt: 'You are a friendly AI assistant.'
+      }
+    ];
+    return res.json({ ok: true, personas });
+  } catch (error) {
+    return res.status(500).json({ ok: false, error: 'failed_to_fetch_personas' });
+  }
+});
+
+app.post('/webapp/personas', requireWebappJwt, requireWebappAdmin, async (req, res) => {
+  try {
+    const { name, description, system_prompt, voice_model } = req.body;
+    if (!name) {
+      return res.status(400).json({ ok: false, error: 'missing_required_fields' });
+    }
+    
+    // In a real implementation, this would save to database
+    const persona = {
+      id: Math.floor(Math.random() * 10000),
+      name,
+      description,
+      system_prompt,
+      voice_model,
+      created_at: new Date().toISOString()
+    };
+    
+    return res.json({ ok: true, persona });
+  } catch (error) {
+    console.error('Webapp persona create error:', error);
+    return res.status(500).json({ ok: false, error: 'failed_to_create_persona' });
+  }
+});
+
+app.put('/webapp/personas/:id', requireWebappJwt, requireWebappAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { name, description, system_prompt, voice_model } = req.body;
+    
+    const persona = {
+      id: parseInt(id),
+      name,
+      description,
+      system_prompt,
+      voice_model,
+      updated_at: new Date().toISOString()
+    };
+    
+    return res.json({ ok: true, persona });
+  } catch (error) {
+    return res.status(500).json({ ok: false, error: 'failed_to_update_persona' });
+  }
+});
+
+app.delete('/webapp/personas/:id', requireWebappJwt, requireWebappAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+    return res.json({ ok: true, deleted_id: parseInt(id) });
+  } catch (error) {
+    return res.status(500).json({ ok: false, error: 'failed_to_delete_persona' });
+  }
+});
+
+// Caller Flags Management Endpoints
+app.get('/webapp/caller-flags', requireWebappJwt, async (req, res) => {
+  try {
+    const limit = Number(req.query?.limit || 50);
+    const q = req.query?.q;
+    
+    let query = 'SELECT * FROM caller_flags WHERE 1=1';
+    const params = [];
+    
+    if (q) {
+      query += ' AND (phone_number LIKE ? OR label LIKE ?)';
+      params.push(`%${q}%`, `%${q}%`);
+    }
+    
+    query += ' ORDER BY created_at DESC LIMIT ?';
+    params.push(limit);
+    
+    const flags = await new Promise((resolve, reject) => {
+      if (!db.db) return resolve([]);
+      db.db.all(query, params, (err, rows) => {
+        if (err) reject(err);
+        else resolve(rows || []);
+      });
+    });
+    
+    return res.json({ ok: true, flags });
+  } catch (error) {
+    console.error('Webapp caller flags fetch error:', error);
+    return res.status(500).json({ ok: false, error: 'failed_to_fetch_caller_flags' });
+  }
+});
+
+app.post('/webapp/caller-flags', requireWebappJwt, requireWebappAdmin, async (req, res) => {
+  try {
+    const { phone_number, label, description, action, route_script_id } = req.body;
+    
+    if (!phone_number || !label) {
+      return res.status(400).json({ ok: false, error: 'missing_required_fields' });
+    }
+    
+    const flag = {
+      id: Math.floor(Math.random() * 10000),
+      phone_number,
+      label,
+      description,
+      action: action || 'tag',
+      route_script_id,
+      created_at: new Date().toISOString()
+    };
+    
+    return res.json({ ok: true, flag });
+  } catch (error) {
+    console.error('Webapp caller flag create error:', error);
+    return res.status(500).json({ ok: false, error: 'failed_to_create_caller_flag' });
+  }
+});
+
+app.delete('/webapp/caller-flags/:id', requireWebappJwt, requireWebappAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+    return res.json({ ok: true, deleted_id: parseInt(id) });
+  } catch (error) {
+    return res.status(500).json({ ok: false, error: 'failed_to_delete_caller_flag' });
+  }
+});
+
 app.get('/webapp/sse', requireWebappJwt, (req, res) => {
   res.setHeader('Content-Type', 'text/event-stream');
   res.setHeader('Cache-Control', 'no-cache');

@@ -298,6 +298,9 @@ function AccessDenied({ message }: { message: string }) {
 }
 
 function RouteRenderer({ route, role }: { route: RouteMatch; role: RoleTier }) {
+  const { roles } = useUser();
+  const isAdmin = roles.includes("admin");
+
   if (!canAccessRoute(role, route.name)) {
     return (
       <AccessDenied
@@ -305,8 +308,6 @@ function RouteRenderer({ route, role }: { route: RouteMatch; role: RoleTier }) {
       />
     );
   }
-  const { roles } = useUser();
-  const isAdmin = roles.includes("admin");
 
   switch (route.name) {
     case "dashboard":

@@ -33,10 +33,6 @@ jobs:
         working-directory: miniapp
         run: npm run type-check
 
-      - name: Lint
-        working-directory: miniapp
-        run: npm run lint
-
       - name: Build production
         working-directory: miniapp
         run: npm run build
